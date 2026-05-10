@@ -402,13 +402,21 @@ func buildAssistantPartsWithOpts(m *store.Message, ps []*store.Part, opts ToMode
 // Prune marks old tool outputs as compacted to free context space.
 // Aligned with packages/opencode/src/session/compaction.ts prune().
 //
+// Only runs when cfg.compaction.prune == true (default false).
+// Called as a fire-and-forget goroutine after each successful RunLoop.
+//
 // Algorithm:
 //  1. Walk messages backward
 //  2. Skip first 2 user turns (most recent)
 //  3. Protect the most recent PRUNE_PROTECT tokens of tool output
 //  4. Mark older tool parts as compacted
 //  5. Only commit if we freed > PRUNE_MINIMUM tokens
-func Prune(ctx context.Context, sessionID string, s store.Store) error {
+func Prune(ctx context.Context, sessionID string, s store.Store, cfg *config.Info) error {
+	// Aligned with compaction.ts: if (!cfg.compaction?.prune) return
+	if cfg == nil || cfg.Compaction == nil || cfg.Compaction.Prune == nil || !*cfg.Compaction.Prune {
+		return nil
+	}
+
 	msgs, err := s.ListMessages(ctx, sessionID)
 	if err != nil {
 		return err

@@ -193,7 +193,7 @@ type ToolOutputConfig struct {
 // CompactionConfig matches opencode's compaction config.
 type CompactionConfig struct {
 	Auto                 *bool `json:"auto,omitempty"`                    // default true
-	Prune                *bool `json:"prune,omitempty"`                   // default true
+	Prune                *bool `json:"prune,omitempty"`                   // default false; set true to enable background tool-output pruning
 	TailTurns            *int  `json:"tail_turns,omitempty"`              // default 2
 	PreserveRecentTokens *int  `json:"preserve_recent_tokens,omitempty"`
 	Reserved             *int  `json:"reserved,omitempty"`

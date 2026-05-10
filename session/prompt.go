@@ -96,7 +96,6 @@ func RunLoop(ctx context.Context, s store.Store, input RunInput) (RunResult, err
 
 	processor := NewProcessor(s)
 	compactor := NewCompactor(s, processor)
-
 	step := 0
 	for {
 		if input.MaxSteps > 0 && step >= input.MaxSteps {
@@ -152,6 +151,11 @@ func RunLoop(ctx context.Context, s store.Store, input RunInput) (RunResult, err
 
 		switch result {
 		case ProcessStop:
+			// Aligned with opencode prompt.ts:1625 — run prune as a background
+			// fire-and-forget after the loop ends, only when cfg.compaction.prune=true.
+			go func() {
+				_ = Prune(context.Background(), input.SessionID, s, input.Config)
+			}()
 			return RunResultStop, nil
 
 		case ProcessCompact:
