@@ -62,6 +62,7 @@ import (
 	"github.com/larryhou/llm-go/knowledge"
 	blevesource "github.com/larryhou/llm-go/knowledge/source/bleve"
 	"github.com/larryhou/llm-go/llm"
+	anthropicProv "github.com/larryhou/llm-go/provider/anthropic"
 	openaiProv "github.com/larryhou/llm-go/provider/openai"
 	"github.com/larryhou/llm-go/session"
 	"github.com/larryhou/llm-go/store"
@@ -78,6 +79,7 @@ type serverConfig struct {
 	snippetMax int
 	contentMax int
 	// LLM
+	provider string
 	baseURL  string
 	apiKey   string
 	modelID  string
@@ -91,11 +93,20 @@ func main() {
 	flag.StringVar(&cfg.sourceID, "source", "skills", "source ID prefix for RefIDs")
 	flag.IntVar(&cfg.snippetMax, "snippet-max", 400, "max chars per snippet")
 	flag.IntVar(&cfg.contentMax, "content-max", 8000, "max chars for fetched content")
-	flag.StringVar(&cfg.baseURL, "llm-url", envOr("TIMI_BASE_URL", "http://192.168.3.119:8080/timi-claude/v1"), "LLM base URL")
+	flag.StringVar(&cfg.provider, "provider", envOr("TIMI_PROVIDER", "anthropic"), "LLM provider: anthropic or openai")
+	flag.StringVar(&cfg.baseURL, "llm-url", envOr("TIMI_BASE_URL", ""), "LLM base URL (default depends on provider)")
 	flag.StringVar(&cfg.apiKey, "llm-key", envOr("TIMI_API_KEY", "sk-zzz6FtyLMyuobNNOukwgobP0l1F3TjMO"), "LLM API key")
 	flag.StringVar(&cfg.modelID, "model", envOr("TIMI_MODEL", "claude-sonnet-4.6"), "LLM model ID")
 	flag.IntVar(&cfg.maxSteps, "max-steps", 10, "max LLM steps per turn")
 	flag.Parse()
+
+	if cfg.baseURL == "" {
+		if cfg.provider == "openai" {
+			cfg.baseURL = "http://192.168.3.119:8080/timi-claude/v1"
+		} else {
+			cfg.baseURL = "http://192.168.3.119:8080/claude"
+		}
+	}
 
 	if cfg.skillsDir == "" {
 		flag.Usage()
@@ -307,9 +318,13 @@ func (s *server) handleChat(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx := r.Context()
 	if _, err := s.sessionStore.GetSession(ctx, sessID); err != nil {
+		modelPrefix := "anthropic"
+		if s.cfg.provider == "openai" {
+			modelPrefix = "timi"
+		}
 		_ = s.sessionStore.CreateSession(ctx, &store.Session{
 			ID:    sessID,
-			Model: "timi/" + s.cfg.modelID,
+			Model: modelPrefix + "/" + s.cfg.modelID,
 		})
 		s.sessionCount.Add(1)
 	}
@@ -356,10 +371,22 @@ func (s *server) handleChat(w http.ResponseWriter, r *http.Request) {
 	activeTools = wrappedTools
 
 	// Wrap the provider to intercept streaming events and forward to SSE.
-	prov := openaiProv.New(s.cfg.apiKey, s.cfg.baseURL, "timi", nil)
-	wrappedProv := &sseProvider{inner: prov, send: sendEvent}
+	var innerProv llm.Provider
+	var summaryProv llm.Provider
+	if s.cfg.provider == "openai" {
+		p := openaiProv.New(s.cfg.apiKey, s.cfg.baseURL, "timi", nil)
+		innerProv = p
+		summaryProv = p
+	} else {
+		p := anthropicProv.New(s.cfg.apiKey, s.cfg.baseURL, map[string]string{
+			"Authorization": "Bearer " + s.cfg.apiKey,
+		})
+		innerProv = p
+		summaryProv = p
+	}
+	wrappedProv := &sseProvider{inner: innerProv, send: sendEvent}
 
-	contextLimit := 200_000
+	contextLimit := 128_000
 	if req.ContextLimit > 0 {
 		contextLimit = req.ContextLimit
 	}
@@ -368,9 +395,14 @@ func (s *server) handleChat(w http.ResponseWriter, r *http.Request) {
 		maxSteps = req.MaxSteps
 	}
 
+	providerID := "anthropic"
+	if s.cfg.provider == "openai" {
+		providerID = "timi"
+	}
+
 	model := llm.Model{
 		ID:         s.cfg.modelID,
-		ProviderID: "timi",
+		ProviderID: providerID,
 		APIID:      s.cfg.modelID,
 		Limit:      llm.ModelLimit{Context: contextLimit, Output: 4096},
 	}
@@ -382,7 +414,7 @@ func (s *server) handleChat(w http.ResponseWriter, r *http.Request) {
 		Provider:  wrappedProv,
 		// Use a plain (unwrapped) provider for compaction summary so SSE
 		// middleware does not forward internal summary events to the client.
-		SummaryProvider: prov,
+		SummaryProvider: summaryProv,
 		Tools:           activeTools,
 		ExtraSystem: []string{
 			"You are a helpful assistant with access to a knowledge base of skill documentation and various test tools.",

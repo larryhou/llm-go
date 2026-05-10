@@ -54,9 +54,15 @@ cd /path/to/llm-go
 go build ./cmd/knowledge-api/
 
 # Start — index the skills dir; listen on :7700
+# Default provider is Anthropic. To use OpenAI, pass -provider openai
 go run ./cmd/knowledge-api/ \
   -skills /path/to/.opencode/skills \
-  -addr   127.0.0.1:7700
+  -addr   127.0.0.1:7700 \
+  -provider anthropic
+
+# Optional: Override the default provider endpoint or key
+#   -llm-url "http://custom-endpoint/claude"
+#   -llm-key "sk-custom-key"
 
 # Verify
 curl -s http://127.0.0.1:7700/health

@@ -243,11 +243,7 @@ func assistantBlocks(parts []llm.ContentPart) ([]anthropic.ContentBlockParamUnio
 				blocks = append(blocks, anthropic.NewTextBlock(p.Text))
 			}
 		case llm.PartTypeToolCall:
-			inputBytes, err := json.Marshal(p.Input)
-			if err != nil {
-				return nil, fmt.Errorf("tool call %q: marshal input: %w", p.ToolName, err)
-			}
-			blocks = append(blocks, anthropic.NewToolUseBlock(p.ToolCallID, string(inputBytes), p.ToolName))
+			blocks = append(blocks, anthropic.NewToolUseBlock(p.ToolCallID, p.Input, p.ToolName))
 		case llm.PartTypeReasoning:
 			if p.Text != "" {
 				blocks = append(blocks, anthropic.NewTextBlock(p.Text))

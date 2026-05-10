@@ -216,6 +216,12 @@ Key requirements:
 
 The provider must support `option.WithBaseURL()` or equivalent for custom endpoints.
 
+### SDK BaseURL Quirks
+When configuring custom endpoints (e.g. proxies or OpenAI wrappers), be aware of the underlying SDK routing logic:
+- **Anthropic**: The `anthropic-sdk-go` will automatically append the specific resource paths (like `/v1/messages`) to the `BaseURL`. Therefore, you should NOT include `/v1` or `/v1/messages` in the BaseURL (e.g., use `http://192.168.3.119:8080/claude` instead of `http://192.168.3.119:8080/claude/v1`).
+- **OpenAI**: The `openai-go` SDK (or compatible proxies) usually expects the `/v1` to be part of the BaseURL (e.g., `http://192.168.3.119:8080/timi-claude/v1`).
+- **Tool Use Inputs**: Anthropic natively requires tool arguments to be provided as a proper JSON object. When implementing `Provider.Stream`, do not JSON-marshal `llm.PartTypeToolCall.Input` to a string before passing it into `anthropic.NewToolUseBlock`, as it expects an `any` interface and stringifying it will result in `unexpected EOF` or 400 errors from strict proxy endpoints.
+
 ### Error Classification
 
 Use `llm.ClassifyHTTPError(providerID, statusCode, body, headers)` — it applies all 19 overflow patterns plus HTTP status → `ErrorKind` mapping.
