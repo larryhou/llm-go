@@ -109,7 +109,7 @@ func (m *Manager) peek(ctx context.Context, q Query) ([]Result, error) {
 	sources := append([]Source(nil), m.sources...)
 	m.mu.RUnlock()
 
-	groups := groupByPriority(sources, q, true)
+	groups := groupByPriority(sources, q)
 	var accumulated []Result
 
 	for _, group := range groups {
@@ -158,11 +158,16 @@ func (m *Manager) fetch(ctx context.Context, q Query) ([]Result, error) {
 	}
 
 	// Fallback: first accepting source.
+	// Strip sourceID prefix if present but unmatched so Accepts receives clean input.
+	fallbackQ := q
+	if hasPfx {
+		fallbackQ.Input = internalKey
+	}
 	for _, s := range sources {
-		if !s.Accepts(q) {
+		if !s.Accepts(fallbackQ) {
 			continue
 		}
-		results, err := m.callSource(ctx, s, q, false)
+		results, err := m.callSource(ctx, s, fallbackQ, false)
 		if err != nil {
 			if m.cfg.AllowPartialFailure {
 				continue
@@ -178,7 +183,7 @@ func (m *Manager) fetch(ctx context.Context, q Query) ([]Result, error) {
 
 // groupByPriority partitions sources that Accept q into priority slices.
 // peekMode=true filters by Accepts; false also filters by Accepts (same).
-func groupByPriority(sources []Source, q Query, _ bool) [][]Source {
+func groupByPriority(sources []Source, q Query) [][]Source {
 	var groups [][]Source
 	var cur []Source
 	curPri := -1

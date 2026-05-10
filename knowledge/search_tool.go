@@ -53,8 +53,12 @@ func (t *searchTool) Execute(ctx context.Context, input map[string]any) (tool.Re
 	}
 
 	maxResults := 5
+	const maxResultsCap = 20
 	if v, ok := input["max_results"].(float64); ok && int(v) > 0 {
 		maxResults = int(v)
+		if maxResults > maxResultsCap {
+			maxResults = maxResultsCap
+		}
 	}
 
 	var filters map[string]any

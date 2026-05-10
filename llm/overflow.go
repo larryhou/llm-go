@@ -46,8 +46,16 @@ type ModelCost struct {
 
 // MaxOutputTokens returns the effective max output token count for this model.
 // Mirrors ProviderTransform.maxOutputTokens: min(model.limit.output, 32000).
+// When Output is unset (0), falls back to 4096 to avoid silently disabling
+// compaction and sending 0 as max_tokens to the provider.
 func MaxOutputTokens(m Model) int {
-	const cap = 32_000
+	const (
+		cap      = 32_000
+		fallback = 4_096
+	)
+	if m.Limit.Output <= 0 {
+		return fallback
+	}
 	if m.Limit.Output < cap {
 		return m.Limit.Output
 	}
