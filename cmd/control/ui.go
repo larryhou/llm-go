@@ -34,7 +34,14 @@ const uiHTML = `<!DOCTYPE html>
   .bubble { padding: 10px 14px; border-radius: 12px; white-space: pre-wrap; word-break: break-word; line-height: 1.6; }
   .msg.user .bubble { background: var(--mauve); color: var(--bg); border-bottom-right-radius: 3px; }
   .msg.assistant .bubble { background: var(--surface); border-bottom-left-radius: 3px; }
-  .tool-tag { font-size: 11px; color: var(--yellow); background: var(--overlay); padding: 2px 8px; border-radius: 4px; align-self: flex-start; }
+  /* tool calls */
+  .tool-group { display: flex; flex-direction: column; gap: 2px; align-self: flex-start; }
+  .tool-latest { font-size: 11px; color: var(--yellow); background: var(--overlay); padding: 2px 8px; border-radius: 4px; cursor: default; user-select: none; }
+  .tool-history { display: none; flex-direction: column; gap: 2px; }
+  .tool-history.open { display: flex; }
+  .tool-history-item { font-size: 11px; color: var(--subtext); background: var(--overlay); padding: 2px 8px; border-radius: 4px; }
+  .tool-toggle { font-size: 10px; color: var(--subtext); cursor: pointer; padding: 1px 6px; border-radius: 3px; align-self: flex-start; }
+  .tool-toggle:hover { color: var(--text); }
   .error-tag { font-size: 12px; color: var(--red); }
   .cursor { display: inline-block; width: 8px; height: 14px; background: var(--teal); vertical-align: text-bottom; animation: blink .8s step-end infinite; }
   @keyframes blink { 50% { opacity: 0; } }
@@ -106,12 +113,73 @@ function startAssistantMsg() {
   return { wrap, bubble, cursor };
 }
 
-function appendTool(wrap, toolName) {
-  const tag = document.createElement('div');
-  tag.className = 'tool-tag';
-  tag.textContent = '⚙ ' + toolName;
-  wrap.appendChild(tag);
-  scrollBottom();
+// toolState tracks the collapsible tool-call group for one assistant turn.
+// structure inside wrap:
+//   .tool-group
+//     .tool-history   (hidden by default, expands on toggle click)
+//       .tool-history-item  × N-1  (older calls)
+//     .tool-toggle    ("+N more" / "hide")
+//     .tool-latest    (always visible — most recent call)
+function makeTurnTools(wrap) {
+  const calls = [];          // all label strings so far
+  let group = null;          // .tool-group node, created on first call
+  let historyEl = null;      // .tool-history node
+  let toggleEl = null;       // .tool-toggle node
+  let latestEl = null;       // .tool-latest node
+
+  function rebuild() {
+    const n = calls.length;
+    if (n === 0) return;
+
+    // Create group on first call
+    if (!group) {
+      group = document.createElement('div');
+      group.className = 'tool-group';
+      historyEl = document.createElement('div');
+      historyEl.className = 'tool-history';
+      toggleEl = document.createElement('span');
+      toggleEl.className = 'tool-toggle';
+      latestEl = document.createElement('div');
+      latestEl.className = 'tool-latest';
+      group.appendChild(historyEl);
+      group.appendChild(toggleEl);
+      group.appendChild(latestEl);
+      wrap.appendChild(group);
+    }
+
+    // Latest is always the last call
+    latestEl.textContent = '⚙ ' + calls[n - 1];
+
+    // History = all but the last
+    historyEl.innerHTML = '';
+    for (let i = 0; i < n - 1; i++) {
+      const item = document.createElement('div');
+      item.className = 'tool-history-item';
+      item.textContent = '⚙ ' + calls[i];
+      historyEl.appendChild(item);
+    }
+
+    // Toggle button
+    const hidden = n - 1;
+    if (hidden <= 0) {
+      toggleEl.style.display = 'none';
+    } else {
+      toggleEl.style.display = '';
+      const isOpen = historyEl.classList.contains('open');
+      toggleEl.textContent = isOpen ? '▲ hide' : '▼ +' + hidden + ' more';
+      toggleEl.onclick = () => {
+        const nowOpen = historyEl.classList.toggle('open');
+        toggleEl.textContent = nowOpen ? '▲ hide' : '▼ +' + hidden + ' more';
+        scrollBottom();
+      };
+    }
+
+    scrollBottom();
+  }
+
+  return {
+    add(label) { calls.push(label); rebuild(); }
+  };
 }
 
 function appendError(wrap, msg) {
@@ -137,6 +205,7 @@ async function send() {
   const { wrap, bubble, cursor } = startAssistantMsg();
   let textNode = document.createTextNode('');
   bubble.insertBefore(textNode, cursor);
+  const turnTools = makeTurnTools(wrap);
 
   try {
     const resp = await fetch('/chat', {
@@ -165,8 +234,8 @@ async function send() {
           scrollBottom();
         } else if (ev.type === 'tool_call') {
           const label = ev.input ? ev.tool + ' ' + ev.input : ev.tool;
-          appendTool(wrap, label);
-          // start fresh text node after tool tag
+          turnTools.add(label);
+          // start fresh text node after tool group
           textNode = document.createTextNode('');
           bubble.insertBefore(textNode, cursor);
         } else if (ev.type === 'usage') {
