@@ -394,3 +394,13 @@ clients.
 - An OpenAI-compatible or Anthropic LLM endpoint
 - No CGO required for the core library; Bleve's FAISS backend requires CGO if
   used (the in-memory Bleve index used by `knowledge-api` does not)
+
+---
+
+## Acknowledgements
+
+The session orchestration, context compaction, provider streaming, and
+configuration schemas in this library are derived from and inspired by the
+open-source project [**opencode**](https://github.com/sst/opencode) by
+[SST](https://sst.dev). The original TypeScript implementation can be found at
+`packages/opencode/src/session/` in that repository.
