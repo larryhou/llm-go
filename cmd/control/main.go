@@ -91,6 +91,37 @@ func (p *replProvider) Stream(ctx context.Context, req llm.Request) (<-chan llm.
 
 // ── index helpers (ported from knowledge-api) ─────────────────────────────────
 
+// toolPath extracts a display path suffix from tool input arguments.
+// Returns a string like " path/to/file" for file tools, or "" for others.
+func toolPath(name string, input any) string {
+	m, ok := input.(map[string]any)
+	if !ok {
+		return ""
+	}
+	switch name {
+	case "glob", "grep":
+		// show "pattern  [in path]"
+		pattern, _ := m["pattern"].(string)
+		path, _ := m["path"].(string)
+		if pattern == "" {
+			return ""
+		}
+		if path != "" {
+			return " " + pattern + " in " + path
+		}
+		return " " + pattern
+	case "read", "write", "edit":
+		if v, _ := m["filePath"].(string); v != "" {
+			return " " + v
+		}
+	case "bash":
+		if v, _ := m["command"].(string); v != "" {
+			return " " + v
+		}
+	}
+	return ""
+}
+
 func newSkillsIndex() (bleve.Index, error) {
 	mapping := bleve.NewIndexMapping()
 
@@ -331,7 +362,7 @@ func main() {
 				case llm.EventTextDelta:
 					fmt.Print(ev.Text)
 				case llm.EventToolCall:
-					fmt.Printf("\n[tool: %s]\n", ev.ToolName)
+					fmt.Printf("\n[tool: %s%s]\n", ev.ToolName, toolPath(ev.ToolName, ev.Input))
 				case llm.EventStepFinish:
 					// nothing — newline will come with EventRequestFinish
 				case llm.EventRequestFinish:
