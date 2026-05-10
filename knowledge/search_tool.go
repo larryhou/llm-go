@@ -9,9 +9,9 @@ import (
 )
 
 // searchTool implements tool.Tool and exposes knowledge_search to the LLM.
-// The LLM calls this when it needs to explore a topic or run a structured
-// query across knowledge sources.  Results are compact snippets; the LLM
-// decides whether to follow up with knowledge_fetch for full content.
+// The LLM calls this when it needs to explore a topic across knowledge sources.
+// Results are compact snippets; the LLM decides whether to follow up with
+// knowledge_fetch for full content.
 type searchTool struct{ mgr *Manager }
 
 func (t *searchTool) Name() string { return "knowledge_search" }
@@ -29,11 +29,6 @@ func (t *searchTool) InputSchema() map[string]any {
 			"query": map[string]any{
 				"type":        "string",
 				"description": "The search terms or query expression.",
-			},
-			"type": map[string]any{
-				"type":        "string",
-				"enum":        []string{"search", "query"},
-				"description": "\"search\" for broad exploratory queries (default); \"query\" for structured field-filter queries.",
 			},
 			"max_results": map[string]any{
 				"type":        "integer",
@@ -57,11 +52,6 @@ func (t *searchTool) Execute(ctx context.Context, input map[string]any) (tool.Re
 		return tool.Result{}, tool.Fail("knowledge_search: \"query\" must be a non-empty string")
 	}
 
-	qtype := CallTypeSearch
-	if v, _ := input["type"].(string); v == "query" {
-		qtype = CallTypeQuery
-	}
-
 	maxResults := 5
 	if v, ok := input["max_results"].(float64); ok && int(v) > 0 {
 		maxResults = int(v)
@@ -73,7 +63,7 @@ func (t *searchTool) Execute(ctx context.Context, input map[string]any) (tool.Re
 	}
 
 	q := Query{
-		Type:       qtype,
+		Type:       QueryTypeSearch,
 		Input:      queryStr,
 		Filters:    filters,
 		MaxResults: maxResults,
@@ -88,9 +78,8 @@ func (t *searchTool) Execute(ctx context.Context, input map[string]any) (tool.Re
 		Output: formatSearchResults(results),
 		Title:  fmt.Sprintf("knowledge_search: %d result(s) for %q", len(results), queryStr),
 		Metadata: map[string]any{
-			"query":   queryStr,
-			"count":   len(results),
-		"type":    string(qtype),
+			"query": queryStr,
+			"count": len(results),
 		},
 	}, nil
 }

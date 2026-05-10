@@ -61,7 +61,7 @@ type Source interface {
 	//   - Bleve implementation: Search() + Highlight → fragments as Snippet.
 	//   - DB implementation: SELECT id, title, LEFT(body, N) LIMIT q.MaxResults.
 	//
-	// The Manager calls Peek for CallTypeSearch and CallTypeQuery.
+	// The Manager calls Peek for QueryTypeSearch.
 	// Results are returned to the LLM as a compact list; the LLM decides
 	// whether to call knowledge_fetch for any of them.
 	Peek(ctx context.Context, q Query) ([]Result, error)
@@ -79,8 +79,7 @@ type Source interface {
 	//   - Bleve implementation: index.Document(internalKey) → stored fields.
 	//   - Web implementation: HTTP GET + body extraction.
 	//
-	// The Manager calls Fetch for CallTypeFetch (and for CallTypeQuery when
-	// the source's Peek is not applicable).
+	// The Manager calls Fetch for QueryTypeFetch.
 	// Large Content values are truncated by the Manager before delivery to
 	// the LLM tool result.
 	Fetch(ctx context.Context, q Query) ([]Result, error)

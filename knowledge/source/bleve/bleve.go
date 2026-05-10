@@ -3,9 +3,8 @@
 //
 // Supported call types:
 //
-//	CallTypeSearch → Peek(): QueryStringQuery + Highlight → snippet fragments
-//	CallTypeFetch  → Fetch(): index.Document(id) → stored field content
-//	CallTypeQuery  → Peek(): BooleanQuery built from Query.Filters
+//	QueryTypeSearch → Peek(): QueryStringQuery + Highlight → snippet fragments
+//	QueryTypeFetch  → Fetch(): index.Document(id) → stored field content
 //
 // RefID format: "{sourceID}:{docID}"
 // The sourceID prefix is stripped before passing the internal docID to
@@ -82,15 +81,13 @@ func (s *Source) ID() string { return s.id }
 func (s *Source) Priority() int { return s.priority }
 
 // Accepts implements knowledge.Source.
-// BleveSource handles Search (full-text), Fetch (by doc ID), and Query
-// (structured field filters via BooleanQuery).
+// BleveSource handles Search (full-text) and Fetch (by doc ID).
 func (s *Source) Accepts(q knowledge.Query) bool {
-	return q.Type == knowledge.CallTypeSearch ||
-		q.Type == knowledge.CallTypeFetch ||
-		q.Type == knowledge.CallTypeQuery
+	return q.Type == knowledge.QueryTypeSearch ||
+		q.Type == knowledge.QueryTypeFetch
 }
 
-// Peek implements knowledge.Source for CallTypeSearch and CallTypeQuery.
+// Peek implements knowledge.Source for QueryTypeSearch.
 // It runs a Bleve search with highlighting and returns compact snippets.
 func (s *Source) Peek(ctx context.Context, q knowledge.Query) ([]knowledge.Result, error) {
 	bq, err := s.buildQuery(q)
@@ -134,7 +131,7 @@ func (s *Source) Peek(ctx context.Context, q knowledge.Query) ([]knowledge.Resul
 	return results, nil
 }
 
-// Fetch implements knowledge.Source for CallTypeFetch.
+// Fetch implements knowledge.Source for QueryTypeFetch.
 // It loads the stored document from the Bleve index by doc ID and returns
 // the full content field.
 func (s *Source) Fetch(ctx context.Context, q knowledge.Query) ([]knowledge.Result, error) {
@@ -190,34 +187,15 @@ func (s *Source) refID(docID string) string {
 }
 
 // buildQuery converts a knowledge.Query into a Bleve query.Query.
-//
-//	CallTypeSearch → QueryStringQuery on q.Input
-//	CallTypeQuery  → BooleanQuery built from q.Filters (must-match terms)
-//	                 plus optional QueryStringQuery on q.Input if non-empty
+// Only QueryTypeSearch is supported for Peek; QueryTypeFetch is handled by Fetch.
 func (s *Source) buildQuery(q knowledge.Query) (query.Query, error) {
-	switch q.Type {
-	case knowledge.CallTypeSearch:
-		if strings.TrimSpace(q.Input) == "" {
-			return bleve.NewMatchAllQuery(), nil
-		}
-		return bleve.NewQueryStringQuery(q.Input), nil
-
-	case knowledge.CallTypeQuery:
-		bq := bleve.NewBooleanQuery()
-		if strings.TrimSpace(q.Input) != "" {
-			bq.AddMust(bleve.NewQueryStringQuery(q.Input))
-		}
-		for field, val := range q.Filters {
-			term := fmt.Sprintf("%v", val)
-			tq := bleve.NewTermQuery(term)
-			tq.SetField(field)
-			bq.AddMust(tq)
-		}
-		return bq, nil
-
-	default:
-		return nil, fmt.Errorf("unsupported call type %q for Peek", q.Type)
+	if q.Type != knowledge.QueryTypeSearch {
+		return nil, fmt.Errorf("unsupported query type %q for Peek", q.Type)
 	}
+	if strings.TrimSpace(q.Input) == "" {
+		return bleve.NewMatchAllQuery(), nil
+	}
+	return bleve.NewQueryStringQuery(q.Input), nil
 }
 
 // extractFragments joins the highlighted fragments for a given field.

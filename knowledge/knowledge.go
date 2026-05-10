@@ -13,41 +13,34 @@
 //     sufficient.
 package knowledge
 
-// CallType classifies a knowledge request from the LLM's intent perspective,
+// QueryType classifies a knowledge request from the LLM's intent perspective,
 // not from a technical-operation perspective.
-type CallType string
+type QueryType string
 
 const (
-	// CallTypeSearch is a broad exploratory request: "find information about X".
+	// QueryTypeSearch is a broad exploratory request: "find information about X".
 	// The LLM does not know exactly where the answer lives.
 	// Manager dispatches to Source.Peek(); results are snippets + RefIDs.
 	// Typical backends: full-text index (Bleve), vector DB, web search.
-	CallTypeSearch CallType = "search"
+	QueryTypeSearch QueryType = "search"
 
-	// CallTypeFetch is a precise retrieval request: "get the full content of X".
+	// QueryTypeFetch is a precise retrieval request: "get the full content of X".
 	// The LLM already has a RefID (from a prior Search) or an explicit URL/ID.
 	// Manager dispatches to Source.Fetch(); result is the complete document.
 	// Typical backends: Bleve by doc ID, HTTP GET, DB row by PK.
-	CallTypeFetch CallType = "fetch"
-
-	// CallTypeQuery is a structured conditional request: "find records matching X=Y".
-	// The LLM supplies explicit field filters or a query expression.
-	// Manager dispatches to Source.Peek() or Source.Fetch() depending on the
-	// source implementation (e.g. Bleve BooleanQuery, SQL WHERE clause).
-	// Typical backends: relational DB, Bleve multi-field query.
-	CallTypeQuery CallType = "query"
+	QueryTypeFetch QueryType = "fetch"
 )
 
 // Query is the normalised request the Manager sends to each Source.
 // It is constructed from the LLM tool-call input and passed unchanged to
 // every Source that Accepts it.
 type Query struct {
-	// Type classifies the retrieval intent (see CallType constants).
-	Type CallType
+	// Type classifies the retrieval intent (see QueryType constants).
+	Type QueryType
 
 	// Input is the free-form request body:
-	//   Search / Query → search terms or query expression
-	//   Fetch          → RefID returned by a prior Peek, or a raw URL / doc ID
+	//   Search → search terms or query expression
+	//   Fetch  → RefID returned by a prior Peek, or a raw URL / doc ID
 	Input string
 
 	// Filters holds optional structured constraints (field=value pairs,
@@ -62,7 +55,7 @@ type Query struct {
 }
 
 // Result is a single knowledge item.  Peek and Fetch share this struct;
-// the active fields differ by call type.
+// the active fields differ by query type.
 type Result struct {
 	// RefID is the globally unique reference identifier for this item.
 	// Format: "{sourceID}:{internal-id-or-path}"

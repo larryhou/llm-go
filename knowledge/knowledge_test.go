@@ -301,10 +301,10 @@ func TestManager_FetchContentTruncation(t *testing.T) {
 func TestManager_AcceptsFiltersOutIncompatibleSources(t *testing.T) {
 	called := false
 	s := &stubSource{
-		id:       "db",
+		id:       "fetch-only",
 		priority: 0,
 		accepts: func(q knowledge.Query) bool {
-			return q.Type == knowledge.CallTypeQuery // only handles structured queries
+			return q.Type == knowledge.QueryTypeFetch // only handles fetch, not search
 		},
 		peekFn: func(_ context.Context, _ knowledge.Query) ([]knowledge.Result, error) {
 			called = true
@@ -313,10 +313,10 @@ func TestManager_AcceptsFiltersOutIncompatibleSources(t *testing.T) {
 	}
 	m := newManager(knowledge.ManagerConfig{}, s)
 	ctx := context.Background()
-	// knowledge_search defaults to CallTypeSearch → source should be skipped
+	// knowledge_search issues QueryTypeSearch → fetch-only source should be skipped
 	_, _ = m.Tools()[0].Execute(ctx, map[string]any{"query": "anything"})
 	if called {
-		t.Error("source with Accepts(Search)=false should not have been called")
+		t.Error("fetch-only source should not have been called for a search query")
 	}
 }
 

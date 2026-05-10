@@ -29,11 +29,6 @@ func (t *fetchTool) InputSchema() map[string]any {
 				"type":        "string",
 				"description": "The ref_id of the item to fetch, as returned by knowledge_search.",
 			},
-			"type": map[string]any{
-				"type":        "string",
-				"enum":        []string{"fetch", "query"},
-				"description": "\"fetch\" for a single document by ID/URL (default); \"query\" for a structured lookup.",
-			},
 		},
 		"required": []string{"ref_id"},
 	}
@@ -45,17 +40,7 @@ func (t *fetchTool) Execute(ctx context.Context, input map[string]any) (tool.Res
 		return tool.Result{}, tool.Fail("knowledge_fetch: \"ref_id\" must be a non-empty string")
 	}
 
-	qtype := CallTypeFetch
-	if v, _ := input["type"].(string); v == "query" {
-		qtype = CallTypeQuery
-	}
-
-	q := Query{
-		Type:  qtype,
-		Input: refID,
-	}
-
-	results, err := t.mgr.fetch(ctx, q)
+	results, err := t.mgr.fetch(ctx, Query{Type: QueryTypeFetch, Input: refID})
 	if err != nil {
 		return tool.Result{}, tool.Fail(fmt.Sprintf("knowledge_fetch failed: %v", err))
 	}
