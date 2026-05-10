@@ -96,6 +96,11 @@ func (p *Provider) Stream(ctx context.Context, req llm.Request) (<-chan llm.Even
 func buildParams(req llm.Request) (openai.ChatCompletionNewParams, error) {
 	params := openai.ChatCompletionNewParams{
 		Model: openai.ChatModel(req.Model.APIID),
+		// Request usage statistics in the final stream chunk (OpenAI spec).
+		// Providers that don't support this simply ignore the field.
+		StreamOptions: openai.ChatCompletionStreamOptionsParam{
+			IncludeUsage: openai.Bool(true),
+		},
 	}
 
 	if req.Options.MaxTokens > 0 {
