@@ -1,3 +1,7 @@
 vendor/
 *.test
 *.out
+
+# compiled binaries
+knowledge-api
+control
