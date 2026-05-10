@@ -146,9 +146,9 @@ func classifyStatus(statusCode int, body string) (ErrorKind, bool) {
 		return ErrRateLimit, true
 	case statusCode == 400 || statusCode == 404 || statusCode == 422:
 		return ErrInvalidRequest, false
-	case statusCode >= 500:
+	case statusCode == 529: // Anthropic overloaded — must precede >= 500
 		return ErrProviderInternal, true
-	case statusCode == 529: // Anthropic overloaded
+	case statusCode >= 500:
 		return ErrProviderInternal, true
 	}
 	return ErrUnknown, false

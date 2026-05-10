@@ -169,9 +169,6 @@ func (m *Manager) fetch(ctx context.Context, q Query) ([]Result, error) {
 		}
 		results, err := m.callSource(ctx, s, fallbackQ, false)
 		if err != nil {
-			if m.cfg.AllowPartialFailure {
-				continue
-			}
 			return nil, err
 		}
 		return m.truncateContent(results), nil
@@ -240,10 +237,8 @@ func (m *Manager) dispatchGroup(ctx context.Context, group []Source, q Query, pe
 		return all[i].Score > all[j].Score
 	})
 
-	if firstErr != nil && !m.cfg.AllowPartialFailure {
-		return nil, firstErr
-	}
-	return all, nil
+	// Always return partial results plus error; caller decides based on AllowPartialFailure.
+	return all, firstErr
 }
 
 // callSource calls Peek or Fetch on a single source with optional timeout.
