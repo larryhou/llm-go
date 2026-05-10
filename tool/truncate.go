@@ -121,6 +121,12 @@ func buildHint(outputPath string) string {
 	return fmt.Sprintf("Full output saved to: %s\nUse Read (with offset/limit) or Grep to search the full content.", outputPath)
 }
 
+// WriteTruncFile writes content to a temp truncation file and returns the path.
+// Exported for use by sub-packages (e.g. tool/builtin).
+func WriteTruncFile(toolName, content string) string {
+	return writeTruncationFile(toolName, content)
+}
+
 func writeTruncationFile(toolName, content string) string {
 	if err := os.MkdirAll(truncDir, 0o750); err != nil {
 		return ""
