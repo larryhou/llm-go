@@ -47,6 +47,7 @@ type appConfig struct {
 	contextLimit int
 	skillsDir    string
 	web          bool
+	debug        bool
 }
 
 // timeNano returns current unix nanoseconds; shared with web.go.
@@ -223,6 +224,7 @@ func main() {
 	flag.IntVar(&cfg.contextLimit, "context-limit", 128000, "context window token limit")
 	flag.StringVar(&cfg.skillsDir, "skills", ".opencode", "skills root directory to index")
 	flag.BoolVar(&cfg.web, "web", false, "start web UI instead of REPL (port chosen automatically)")
+	flag.BoolVar(&cfg.debug, "debug", false, "record each turn to <session-id>/chat-<ts>.json")
 	flag.Parse()
 
 	// ── provider ──────────────────────────────────────────────────────────────
@@ -356,6 +358,7 @@ func main() {
 			model:       model,
 			prov:        prov,
 			cfg:         sessionCfg,
+			debug:       cfg.debug,
 		}
 		if err := runWebServer(app); err != nil {
 			fmt.Fprintf(os.Stderr, "web server: %v\n", err)
