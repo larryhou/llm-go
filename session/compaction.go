@@ -154,13 +154,16 @@ func Select(msgs []*store.Message, model llm.Model, cfg *config.Info) SelectResu
 }
 
 // estimateTurnTokens estimates the token count for a slice of messages.
-// Uses a rough heuristic: 1 token ≈ 4 characters.
+// Uses stored token counts when available, falling back to a character heuristic.
 func estimateTurnTokens(msgs []*store.Message) int {
 	total := 0
 	for _, m := range msgs {
-		_ = m
-		// Without actual token counts from the provider, use message size heuristic
-		total += 100 // placeholder; in practice use stored token counts
+		t := m.Tokens
+		if n := t.Input + t.Output + t.CacheRead + t.CacheWrite; n > 0 {
+			total += n
+		} else {
+			total += 100 // fallback for messages without stored usage data
+		}
 	}
 	return total
 }
