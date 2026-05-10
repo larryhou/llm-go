@@ -3,6 +3,7 @@ package session
 import (
 	"context"
 	"fmt"
+	"log"
 	"strings"
 	"time"
 
@@ -96,6 +97,8 @@ func RunLoop(ctx context.Context, s store.Store, input RunInput) (RunResult, err
 
 	processor := NewProcessor(s)
 	compactor := NewCompactor(s, processor)
+
+	var lastInputTokens int // tracks cross-turn input token count to detect drops
 	step := 0
 	for {
 		if input.MaxSteps > 0 && step >= input.MaxSteps {
@@ -149,16 +152,34 @@ func RunLoop(ctx context.Context, s store.Store, input RunInput) (RunResult, err
 			return RunResultStop, err
 		}
 
+		// Log input token drops across turns for observability.
+		if am, err := s.GetMessage(ctx, assistantMsgID); err == nil {
+			cur := am.Tokens.Input
+			if lastInputTokens > 0 && cur < lastInputTokens {
+				log.Printf("[session] input tokens dropped: %d → %d (delta=%d)",
+					lastInputTokens, cur, cur-lastInputTokens)
+			}
+			if cur > 0 {
+				lastInputTokens = cur
+			}
+		}
+
 		switch result {
 		case ProcessStop:
 			// Aligned with opencode prompt.ts:1625 — run prune as a background
 			// fire-and-forget after the loop ends, only when cfg.compaction.prune=true.
 			go func() {
-				_ = Prune(context.Background(), input.SessionID, s, input.Config)
+				log.Printf("[session] prune triggered: input=%d", lastInputTokens)
+				if err := Prune(context.Background(), input.SessionID, s, input.Config); err != nil {
+					log.Printf("[session] prune skipped: %v", err)
+				} else {
+					log.Printf("[session] prune done")
+				}
 			}()
 			return RunResultStop, nil
 
 		case ProcessCompact:
+			log.Printf("[session] compact triggered: input=%d", lastInputTokens)
 			// Run compaction, then continue the loop
 			_, err := compactor.Compact(ctx, input.SessionID, ProcessInput{
 				SessionID:       input.SessionID,
@@ -168,8 +189,10 @@ func RunLoop(ctx context.Context, s store.Store, input RunInput) (RunResult, err
 				Config:          input.Config,
 			})
 			if err != nil {
+				log.Printf("[session] compact failed: %v", err)
 				return RunResultStop, fmt.Errorf("runloop: compaction failed: %w", err)
 			}
+			log.Printf("[session] compact done")
 			continue
 
 		case ProcessContinue:
