@@ -210,13 +210,15 @@ func RunLoop(ctx context.Context, s store.Store, input RunInput) (RunResult, err
 			continue
 
 		case ProcessContinue:
-			// Check if the last assistant message finished with tool calls
-			// If so, continue the loop to let the LLM process tool results
-			lastMsg, lastParts, err := loadLastAssistantMessage(ctx, s, input.SessionID)
-			if err != nil || lastMsg == nil {
-				return RunResultStop, nil
+			// Check if the last assistant message finished with tool calls.
+			// If so, continue the loop to let the LLM process tool results.
+			// Note: allParts was loaded before assistantMsgID was created, so
+			// fetch parts for this message directly from the store.
+			assistantParts, err := s.ListParts(ctx, assistantMsgID)
+			if err != nil {
+				return RunResultStop, fmt.Errorf("runloop: list parts for assistant message: %w", err)
 			}
-			if !hasToolCalls(lastParts) {
+			if !hasToolCalls(assistantParts) {
 				return RunResultContinue, nil
 			}
 			// Continue loop to let LLM see tool results
@@ -293,16 +295,3 @@ func loadMessages(ctx context.Context, s store.Store, sessionID string) ([]*stor
 	return msgs, allParts, nil
 }
 
-// loadLastAssistantMessage returns the most recent assistant message and its parts.
-func loadLastAssistantMessage(ctx context.Context, s store.Store, sessionID string) (*store.Message, []*store.Part, error) {
-	msgs, allParts, err := loadMessages(ctx, s, sessionID)
-	if err != nil {
-		return nil, nil, err
-	}
-	for i := len(msgs) - 1; i >= 0; i-- {
-		if msgs[i].Role == store.RoleAssistant {
-			return msgs[i], allParts[msgs[i].ID], nil
-		}
-	}
-	return nil, nil, nil
-}

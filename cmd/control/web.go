@@ -129,14 +129,15 @@ func (s *webServer) handleChat(w http.ResponseWriter, r *http.Request) {
 
 	// Debug recording: collect all raw LLM events for this turn.
 	type eventRecord struct {
-		TS       int64  `json:"ts_ms"`
-		Type     string `json:"type"`
-		Text     string `json:"text,omitempty"`
-		ToolName string `json:"tool_name,omitempty"`
-		ToolID   string `json:"tool_id,omitempty"`
-		Input    any    `json:"input,omitempty"`
-		Usage    any    `json:"usage,omitempty"`
-		Error    string `json:"error,omitempty"`
+		TS           int64  `json:"ts_ms"`
+		Type         string `json:"type"`
+		Text         string `json:"text,omitempty"`
+		ToolName     string `json:"tool_name,omitempty"`
+		ToolID       string `json:"tool_id,omitempty"`
+		Input        any    `json:"input,omitempty"`
+		Usage        any    `json:"usage,omitempty"`
+		FinishReason string `json:"finish_reason,omitempty"`
+		Error        string `json:"error,omitempty"`
 	}
 	type turnRecord struct {
 		SessionID string        `json:"session_id"`
@@ -166,12 +167,13 @@ func (s *webServer) handleChat(w http.ResponseWriter, r *http.Request) {
 					er.ToolName = ev.ToolName
 					er.ToolID = ev.ToolCallID
 					er.Input = ev.Input
-				case llm.EventStepFinish:
-					er.Usage = map[string]int{
-						"input":  ev.Usage.Input,
-						"output": ev.Usage.Output,
-						"total":  ev.Usage.Effective(),
-					}
+			case llm.EventStepFinish:
+				er.Usage = map[string]int{
+					"input":  ev.Usage.Input,
+					"output": ev.Usage.Output,
+					"total":  ev.Usage.Effective(),
+				}
+				er.FinishReason = string(ev.FinishReason)
 				case llm.EventError:
 					if ev.Err != nil {
 						er.Error = ev.Err.Error()
