@@ -19,8 +19,10 @@ import (
 // ── web server ────────────────────────────────────────────────────────────────
 
 type webServer struct {
-	app *appState
-	mu  sync.Mutex // serialise concurrent /chat requests
+	app      *appState
+	mu       sync.Mutex        // serialise concurrent /chat requests
+	sessMu   sync.Mutex        // protect sessions map
+	sessions map[string]store.Store // session_id → store (persistent across requests)
 }
 
 // appState holds shared state initialised once in main.
@@ -44,7 +46,7 @@ func runWebServer(app *appState) error {
 	addr := ln.Addr().(*net.TCPAddr)
 	url := fmt.Sprintf("http://127.0.0.1:%d", addr.Port)
 
-	srv := &webServer{app: app}
+	srv := &webServer{app: app, sessions: make(map[string]store.Store)}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", srv.handleUI)
 	mux.HandleFunc("/chat", srv.handleChat)
@@ -98,20 +100,28 @@ func (s *webServer) handleChat(w http.ResponseWriter, r *http.Request) {
 		flusher.Flush()
 	}
 
-	// Each web request gets its own isolated session store + session.
-	sessStore := memory.New()
+	// Resolve or create a persistent session store for this session_id.
 	ctx := r.Context()
 	sessID := req.SessionID
 	if sessID == "" {
 		sessID = fmt.Sprintf("web-%d", timeNano())
 	}
-	if err := sessStore.CreateSession(ctx, &store.Session{
-		ID:    sessID,
-		Model: s.app.model.ProviderID + "/" + s.app.model.ID,
-	}); err != nil {
-		sendEvent(map[string]any{"type": "error", "error": err.Error()})
-		return
+
+	s.sessMu.Lock()
+	sessStore, exists := s.sessions[sessID]
+	if !exists {
+		sessStore = memory.New()
+		s.sessions[sessID] = sessStore
+		if err := sessStore.CreateSession(ctx, &store.Session{
+			ID:    sessID,
+			Model: s.app.model.ProviderID + "/" + s.app.model.ID,
+		}); err != nil {
+			s.sessMu.Unlock()
+			sendEvent(map[string]any{"type": "error", "error": err.Error()})
+			return
+		}
 	}
+	s.sessMu.Unlock()
 
 	// Per-request event channel.
 	evCh := make(chan llm.Event, 128)

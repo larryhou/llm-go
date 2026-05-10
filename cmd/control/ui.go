@@ -78,7 +78,6 @@ const tokOut   = document.getElementById('tok-out');
 const tokTotal = document.getElementById('tok-total');
 
 let sessionId = '';
-let totalIn = 0, totalOut = 0, totalTok = 0;
 
 function scrollBottom() {
   messages.scrollTop = messages.scrollHeight;
@@ -170,12 +169,9 @@ async function send() {
           textNode = document.createTextNode('');
           bubble.insertBefore(textNode, cursor);
         } else if (ev.type === 'usage') {
-          totalIn    += ev.input  || 0;
-          totalOut   += ev.output || 0;
-          totalTok   += ev.total  || 0;
-          tokIn.textContent    = totalIn.toLocaleString();
-          tokOut.textContent   = totalOut.toLocaleString();
-          tokTotal.textContent = totalTok.toLocaleString();
+          tokIn.textContent    = (ev.input  || 0).toLocaleString();
+          tokOut.textContent   = (ev.output || 0).toLocaleString();
+          tokTotal.textContent = (ev.total  || 0).toLocaleString();
         } else if (ev.type === 'error') {
           appendError(wrap, ev.error);
         } else if (ev.type === 'done') {
