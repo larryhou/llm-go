@@ -4,6 +4,8 @@ package session
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"time"
@@ -489,7 +491,9 @@ func toInputMap(v any) map[string]any {
 	return m
 }
 
-// newID generates a simple time-based unique ID.
+// newID generates a cryptographically random 16-byte hex ID.
 func newID() string {
-	return fmt.Sprintf("%d", time.Now().UnixNano())
+	b := make([]byte, 16)
+	_, _ = rand.Read(b)
+	return hex.EncodeToString(b)
 }
