@@ -66,6 +66,7 @@ import (
 	"github.com/larryhou/llm-go/session"
 	"github.com/larryhou/llm-go/store"
 	"github.com/larryhou/llm-go/store/memory"
+	"github.com/larryhou/llm-go/tool"
 )
 
 // ── config ────────────────────────────────────────────────────────────────────
@@ -131,16 +132,18 @@ func main() {
 		km:           km,
 		sessionStore: sessionStore,
 		sessionCount: &sessionCount,
+		testTools:    buildTestTools(),
 	}
 
-	tools := km.Tools()
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", srv.handleHealth)
 	mux.HandleFunc("/search", srv.handleSearch)
 	mux.HandleFunc("/fetch", srv.handleFetch)
 	mux.HandleFunc("/chat", srv.handleChat)
-	mux.HandleFunc("/schema/search", handleSchema(tools[0]))
-	mux.HandleFunc("/schema/fetch", handleSchema(tools[1]))
+	mux.HandleFunc("/sessions/", srv.handleSession)
+	kmTools := km.Tools()
+	mux.HandleFunc("/schema/search", handleSchema(kmTools[0]))
+	mux.HandleFunc("/schema/fetch", handleSchema(kmTools[1]))
 
 	log.Printf("knowledge-api listening on %s", cfg.addr)
 	if err := http.ListenAndServe(cfg.addr, logMiddleware(mux)); err != nil {
@@ -160,6 +163,9 @@ type server struct {
 	// active sessions: sessionID -> *chatSession
 	mu       sync.Mutex
 	sessions map[string]*chatSession
+
+	// test tools (registered once at startup)
+	testTools []tool.Tool
 }
 
 type chatSession struct {
@@ -279,8 +285,11 @@ func (s *server) handleChat(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req struct {
-		Message   string `json:"message"`
-		SessionID string `json:"session_id"`
+		Message      string   `json:"message"`
+		SessionID    string   `json:"session_id"`
+		ContextLimit int      `json:"context_limit"` // override model context window (for compaction testing)
+		MaxSteps     int      `json:"max_steps"`     // override server default
+		Tools        []string `json:"tools"`         // subset of tools to enable; empty = all
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeErr(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
@@ -298,7 +307,6 @@ func (s *server) handleChat(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx := r.Context()
 	if _, err := s.sessionStore.GetSession(ctx, sessID); err != nil {
-		// New session.
 		_ = s.sessionStore.CreateSession(ctx, &store.Session{
 			ID:    sessID,
 			Model: "timi/" + s.cfg.modelID,
@@ -322,15 +330,49 @@ func (s *server) handleChat(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Build tool list: knowledge tools + test tools, then filter by request.
+	allTools := append(s.km.Tools(), s.testTools...)
+	activeTools := allTools
+	if len(req.Tools) > 0 {
+		allowed := make(map[string]bool, len(req.Tools))
+		for _, name := range req.Tools {
+			allowed[name] = true
+		}
+		activeTools = activeTools[:0:0]
+		for _, t := range allTools {
+			if allowed[t.Name()] {
+				activeTools = append(activeTools, t)
+			}
+		}
+	}
+
+	// Wrap each tool to emit tool_result SSE events after execution.
+	// (The provider stream only carries tool_call events; results are
+	//  produced asynchronously by the processor, so we intercept here.)
+	wrappedTools := make([]tool.Tool, len(activeTools))
+	for i, t := range activeTools {
+		wrappedTools[i] = &sseToolWrapper{inner: t, send: sendEvent}
+	}
+	activeTools = wrappedTools
+
 	// Wrap the provider to intercept streaming events and forward to SSE.
 	prov := openaiProv.New(s.cfg.apiKey, s.cfg.baseURL, "timi", nil)
 	wrappedProv := &sseProvider{inner: prov, send: sendEvent}
+
+	contextLimit := 200_000
+	if req.ContextLimit > 0 {
+		contextLimit = req.ContextLimit
+	}
+	maxSteps := s.cfg.maxSteps
+	if req.MaxSteps > 0 {
+		maxSteps = req.MaxSteps
+	}
 
 	model := llm.Model{
 		ID:         s.cfg.modelID,
 		ProviderID: "timi",
 		APIID:      s.cfg.modelID,
-		Limit:      llm.ModelLimit{Context: 200_000, Output: 4096},
+		Limit:      llm.ModelLimit{Context: contextLimit, Output: 4096},
 	}
 
 	_, err := session.RunLoop(ctx, s.sessionStore, session.RunInput{
@@ -338,14 +380,17 @@ func (s *server) handleChat(w http.ResponseWriter, r *http.Request) {
 		UserMsg:   req.Message,
 		Model:     model,
 		Provider:  wrappedProv,
-		Tools:     s.km.Tools(),
+		// Use a plain (unwrapped) provider for compaction summary so SSE
+		// middleware does not forward internal summary events to the client.
+		SummaryProvider: prov,
+		Tools:           activeTools,
 		ExtraSystem: []string{
-			"You are a helpful assistant with access to a knowledge base of skill documentation.",
+			"You are a helpful assistant with access to a knowledge base of skill documentation and various test tools.",
 			"When asked about skills, architecture, or development guides, use knowledge_search to find relevant documents.",
 			"Use knowledge_fetch to retrieve the full content of a document when you need details.",
 		},
 		DisableProviderPrompt: true,
-		MaxSteps:              s.cfg.maxSteps,
+		MaxSteps:              maxSteps,
 	})
 	if err != nil {
 		sendEvent(map[string]any{"type": "error", "error": err.Error()})
@@ -355,6 +400,73 @@ func (s *server) handleChat(w http.ResponseWriter, r *http.Request) {
 	sendEvent(map[string]any{
 		"type":       "done",
 		"session_id": sessID,
+	})
+}
+
+// ── /sessions/{id}/messages — session inspection endpoint ────────────────────
+
+func (s *server) handleSession(w http.ResponseWriter, r *http.Request) {
+	// Pattern: /sessions/{id}/messages
+	parts := strings.Split(strings.TrimPrefix(r.URL.Path, "/sessions/"), "/")
+	if len(parts) < 2 || parts[1] != "messages" {
+		writeErr(w, http.StatusNotFound, "use /sessions/{id}/messages")
+		return
+	}
+	sessID := parts[0]
+	ctx := r.Context()
+
+	msgs, err := s.sessionStore.ListMessages(ctx, sessID)
+	if err != nil {
+		writeErr(w, http.StatusNotFound, err.Error())
+		return
+	}
+
+	type partSummary struct {
+		ID      string `json:"id"`
+		Type    string `json:"type"`
+		Summary string `json:"summary,omitempty"`
+	}
+	type msgSummary struct {
+		ID      string        `json:"id"`
+		Role    string        `json:"role"`
+		Summary bool          `json:"summary,omitempty"`
+		Parts   []partSummary `json:"parts"`
+	}
+
+	out := make([]msgSummary, 0, len(msgs))
+	for _, m := range msgs {
+		ps, _ := s.sessionStore.ListParts(ctx, m.ID)
+		pss := make([]partSummary, 0, len(ps))
+		for _, p := range ps {
+			ps2 := partSummary{ID: p.ID, Type: p.Type}
+			switch d := p.Data.(type) {
+			case *store.TextPartData:
+				if len(d.Text) > 120 {
+					ps2.Summary = d.Text[:120] + "…"
+				} else {
+					ps2.Summary = d.Text
+				}
+			case *store.ToolPartData:
+				ps2.Summary = fmt.Sprintf("tool=%s status=%s", d.Tool, d.Status)
+			case *store.StepFinishData:
+				ps2.Summary = fmt.Sprintf("finish=%s input=%d output=%d", d.FinishReason, d.Usage.Input, d.Usage.Output)
+			case *store.CompactionPartData:
+				ps2.Summary = "compaction boundary"
+			}
+			pss = append(pss, ps2)
+		}
+		out = append(out, msgSummary{
+			ID:      m.ID,
+			Role:    m.Role,
+			Summary: m.Summary,
+			Parts:   pss,
+		})
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"session_id":    sessID,
+		"message_count": len(out),
+		"messages":      out,
 	})
 }
 
@@ -388,12 +500,6 @@ func (p *sseProvider) Stream(ctx context.Context, req llm.Request) (<-chan llm.E
 					"tool":  ev.ToolName,
 					"input": ev.Input,
 				})
-			case llm.EventToolResult:
-				p.send(map[string]any{
-					"type":   "tool_result",
-					"tool":   ev.ToolName,
-					"output": ev.Output,
-				})
 			}
 			select {
 			case out <- ev:
@@ -403,6 +509,270 @@ func (p *sseProvider) Stream(ctx context.Context, req llm.Request) (<-chan llm.E
 		}
 	}()
 	return out, nil
+}
+
+// ── sseToolWrapper — wraps a Tool and emits tool_result SSE events ────────────
+
+// sseToolWrapper wraps a tool.Tool and forwards execution results to the SSE
+// client. This is necessary because tool results are produced asynchronously by
+// the processor, not through the provider event stream, so they cannot be
+// intercepted in sseProvider.
+type sseToolWrapper struct {
+	inner tool.Tool
+	send  func(any)
+}
+
+func (w *sseToolWrapper) Name() string            { return w.inner.Name() }
+func (w *sseToolWrapper) Description() string     { return w.inner.Description() }
+func (w *sseToolWrapper) InputSchema() map[string]any { return w.inner.InputSchema() }
+
+func (w *sseToolWrapper) Execute(ctx context.Context, input map[string]any) (tool.Result, error) {
+	result, err := w.inner.Execute(ctx, input)
+	if err != nil {
+		if tf, ok := tool.IsToolFailure(err); ok {
+			w.send(map[string]any{
+				"type":   "tool_result",
+				"tool":   w.inner.Name(),
+				"output": "[tool failure] " + tf.Message,
+				"error":  true,
+			})
+		}
+		return result, err
+	}
+	// Truncate long outputs in the SSE event for readability.
+	out := result.Output
+	if len(out) > 500 {
+		out = out[:500] + "…"
+	}
+	w.send(map[string]any{
+		"type":   "tool_result",
+		"tool":   w.inner.Name(),
+		"output": out,
+	})
+	return result, nil
+}
+
+// ── test tools ────────────────────────────────────────────────────────────────
+
+// buildTestTools creates a set of purpose-built tools for live feature testing:
+//
+//   - calc:          arithmetic (exercises normal tool execution + multi-turn)
+//   - slow_calc:     same but sleeps 2s (exercises async tool + concurrent dispatch)
+//   - counter:       stateful incrementing counter (multi-turn state accumulation)
+//   - tool_failure:  always returns a ToolFailure (exercises recoverable error path)
+//   - doom_bait:     echoes its input unchanged (LLM tends to call it repeatedly → doom-loop)
+func buildTestTools() []tool.Tool {
+	var mu sync.Mutex
+	counters := map[string]int{}
+
+	return []tool.Tool{
+		&simpleTool{
+			name:        "calc",
+			description: "Evaluate a simple arithmetic expression. Supported operators: + - * /. Example: {\"expr\": \"123 * 456\"}",
+			schema: map[string]any{
+				"type":     "object",
+				"required": []string{"expr"},
+				"properties": map[string]any{
+					"expr": map[string]any{"type": "string", "description": "arithmetic expression like '2 + 3 * 4'"},
+				},
+			},
+			fn: func(_ context.Context, input map[string]any) (tool.Result, error) {
+				expr, _ := input["expr"].(string)
+				result, err := evalExpr(expr)
+				if err != nil {
+					return tool.Result{}, tool.Fail("invalid expression: " + err.Error())
+				}
+				return tool.Result{Output: fmt.Sprintf("%g", result), Title: "calc"}, nil
+			},
+		},
+		&simpleTool{
+			name:        "slow_calc",
+			description: "Like calc but deliberately slow (2-second delay). Use to test concurrent/async tool execution.",
+			schema: map[string]any{
+				"type":     "object",
+				"required": []string{"expr"},
+				"properties": map[string]any{
+					"expr": map[string]any{"type": "string"},
+				},
+			},
+			fn: func(ctx context.Context, input map[string]any) (tool.Result, error) {
+				select {
+				case <-time.After(2 * time.Second):
+				case <-ctx.Done():
+					return tool.Result{}, ctx.Err()
+				}
+				expr, _ := input["expr"].(string)
+				result, err := evalExpr(expr)
+				if err != nil {
+					return tool.Result{}, tool.Fail("invalid expression: " + err.Error())
+				}
+				return tool.Result{Output: fmt.Sprintf("%g (slow)", result), Title: "slow_calc"}, nil
+			},
+		},
+		&simpleTool{
+			name:        "counter",
+			description: "Increment a named counter by a given amount and return the new value. Use key 'default' when no specific key needed.",
+			schema: map[string]any{
+				"type":     "object",
+				"required": []string{"key", "delta"},
+				"properties": map[string]any{
+					"key":   map[string]any{"type": "string", "description": "counter name"},
+					"delta": map[string]any{"type": "integer", "description": "amount to add (can be negative)"},
+				},
+			},
+			fn: func(_ context.Context, input map[string]any) (tool.Result, error) {
+				key, _ := input["key"].(string)
+				if key == "" {
+					key = "default"
+				}
+				delta := 0
+				switch v := input["delta"].(type) {
+				case float64:
+					delta = int(v)
+				case int:
+					delta = v
+				}
+				mu.Lock()
+				counters[key] += delta
+				val := counters[key]
+				mu.Unlock()
+				return tool.Result{
+					Output:   fmt.Sprintf("counter[%s] = %d (delta %+d)", key, val, delta),
+					Title:    "counter",
+					Metadata: map[string]any{"key": key, "value": val},
+				}, nil
+			},
+		},
+		&simpleTool{
+			name:        "tool_failure",
+			description: "Always returns a recoverable ToolFailure error. Use to test how the session handles tool errors without crashing.",
+			schema: map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"message": map[string]any{"type": "string", "description": "custom failure message"},
+				},
+			},
+			fn: func(_ context.Context, input map[string]any) (tool.Result, error) {
+				msg, _ := input["message"].(string)
+				if msg == "" {
+					msg = "intentional tool failure for testing"
+				}
+				return tool.Result{}, tool.Fail(msg)
+			},
+		},
+		&simpleTool{
+			name:        "doom_bait",
+			description: "Echoes the input value back unchanged. Do NOT call this tool more than once with the same input.",
+			schema: map[string]any{
+				"type":     "object",
+				"required": []string{"value"},
+				"properties": map[string]any{
+					"value": map[string]any{"type": "string", "description": "any string value"},
+				},
+			},
+			fn: func(_ context.Context, input map[string]any) (tool.Result, error) {
+				v, _ := input["value"].(string)
+				return tool.Result{Output: v, Title: "doom_bait"}, nil
+			},
+		},
+	}
+}
+
+// simpleTool is a lightweight tool.Tool implementation backed by a closure.
+type simpleTool struct {
+	name        string
+	description string
+	schema      map[string]any
+	fn          func(context.Context, map[string]any) (tool.Result, error)
+}
+
+func (t *simpleTool) Name() string                    { return t.name }
+func (t *simpleTool) Description() string             { return t.description }
+func (t *simpleTool) InputSchema() map[string]any     { return t.schema }
+func (t *simpleTool) Execute(ctx context.Context, input map[string]any) (tool.Result, error) {
+	return t.fn(ctx, input)
+}
+
+// evalExpr evaluates a simple two-operand arithmetic expression.
+// Supports: +, -, *, /
+// Also accepts multi-operand left-to-right evaluation.
+func evalExpr(expr string) (float64, error) {
+	expr = strings.TrimSpace(expr)
+	// Simple recursive descent for + - * /
+	return parseAddSub(expr)
+}
+
+func parseAddSub(expr string) (float64, error) {
+	left, rest, err := parseMulDiv(expr)
+	if err != nil {
+		return 0, err
+	}
+	for {
+		rest = strings.TrimSpace(rest)
+		if len(rest) == 0 {
+			return left, nil
+		}
+		op := rest[0]
+		if op != '+' && op != '-' {
+			return left, nil
+		}
+		right, tail, err := parseMulDiv(strings.TrimSpace(rest[1:]))
+		if err != nil {
+			return 0, err
+		}
+		if op == '+' {
+			left += right
+		} else {
+			left -= right
+		}
+		rest = tail
+	}
+}
+
+func parseMulDiv(expr string) (float64, string, error) {
+	left, rest, err := parseNumber(expr)
+	if err != nil {
+		return 0, rest, err
+	}
+	for {
+		rest = strings.TrimSpace(rest)
+		if len(rest) == 0 {
+			return left, rest, nil
+		}
+		op := rest[0]
+		if op != '*' && op != '/' {
+			return left, rest, nil
+		}
+		right, tail, err := parseNumber(strings.TrimSpace(rest[1:]))
+		if err != nil {
+			return 0, tail, err
+		}
+		if op == '*' {
+			left *= right
+		} else {
+			if right == 0 {
+				return 0, tail, fmt.Errorf("division by zero")
+			}
+			left /= right
+		}
+		rest = tail
+	}
+}
+
+func parseNumber(expr string) (float64, string, error) {
+	expr = strings.TrimSpace(expr)
+	i := 0
+	if i < len(expr) && (expr[i] == '-' || expr[i] == '+') {
+		i++
+	}
+	for i < len(expr) && (expr[i] >= '0' && expr[i] <= '9' || expr[i] == '.') {
+		i++
+	}
+	if i == 0 {
+		return 0, expr, fmt.Errorf("expected number, got %q", expr)
+	}
+	f, err := strconv.ParseFloat(expr[:i], 64)
+	return f, expr[i:], err
 }
 
 // ── index building ────────────────────────────────────────────────────────────
