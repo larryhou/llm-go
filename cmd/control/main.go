@@ -2,14 +2,14 @@
 // llm-go session loop, builtin file tools, and an in-memory Bleve index of
 // skill documentation for knowledge lookup.
 //
-// Usage:
+// REPL mode (default):
 //
-//	go run ./cmd/control \
-//	    -provider openai \
-//	    -llm-url  http://host/v1 \
-//	    -llm-key  sk-... \
-//	    -model    claude-sonnet-4.6 \
-//	    -skills   .opencode
+//	go run ./cmd/control -provider openai -llm-key sk-...
+//
+// Web mode:
+//
+//	go run ./cmd/control -web
+//	# opens browser automatically; port is chosen dynamically
 package main
 
 import (
@@ -35,7 +35,6 @@ import (
 	"github.com/larryhou/llm-go/tool"
 	"github.com/larryhou/llm-go/tool/builtin"
 )
-
 // ── config ────────────────────────────────────────────────────────────────────
 
 type config struct {
@@ -46,7 +45,11 @@ type config struct {
 	maxSteps     int
 	contextLimit int
 	skillsDir    string
+	web          bool
 }
+
+// timeNano returns current unix nanoseconds; shared with web.go.
+func timeNano() int64 { return time.Now().UnixNano() }
 
 func envOr(key, fallback string) string {
 	if v := os.Getenv(key); v != "" {

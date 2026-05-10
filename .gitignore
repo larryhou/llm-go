@@ -2,6 +2,6 @@ vendor/
 *.test
 *.out
 
-# compiled binaries
-knowledge-api
-control
+# compiled binaries (root level only)
+/knowledge-api
+/control
