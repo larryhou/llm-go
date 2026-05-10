@@ -273,8 +273,10 @@ func main() {
 
 	extraSystem := []string{fmt.Sprintf(
 		"You are an interactive coding assistant running in directory: %s\n"+
-			"You have file tools (glob, grep, read, write, edit, bash) to explore and modify the codebase freely.\n"+
-			"You also have knowledge_search and knowledge_fetch to look up skill documentation.\n"+
+			"Tool usage priority:\n"+
+			"1. Always call knowledge_search first to look up relevant documentation, architecture, and design guides.\n"+
+			"2. If the search results are insufficient or no relevant knowledge is found, then use file tools (glob, grep, read, write, edit, bash) to explore the codebase directly.\n"+
+			"Never skip the knowledge lookup step when answering questions about the codebase.\n"+
 			"Always work within %s unless explicitly instructed otherwise.",
 		cwd, cwd,
 	)}
