@@ -35,7 +35,11 @@ type ProcessInput struct {
 	Messages  []llm.Message
 	Tools     []tool.Tool
 	Provider  llm.Provider
-	Config    *config.Info
+	// SummaryProvider, when set, is used for compaction summary generation
+	// instead of Provider. This allows using an unwrapped provider for the
+	// compaction call (e.g. without usage-injection middleware).
+	SummaryProvider llm.Provider
+	Config          *config.Info
 }
 
 // Processor handles one LLM streaming turn, managing the lifecycle of

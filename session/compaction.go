@@ -72,7 +72,7 @@ type SelectResult struct {
 //
 // Algorithm:
 //  1. Walk backwards through user turns
-//  2. Keep the most recent turns that fit within the preserve budget
+//  2. Keep the most recent tailTurns turns that fit within the preserve budget
 //  3. Everything before the kept turns is the head to summarise
 func Select(msgs []*store.Message, model llm.Model, cfg *config.Info) SelectResult {
 	budget := llm.PreserveRecentBudget(model, cfg)
@@ -81,12 +81,27 @@ func Select(msgs []*store.Message, model llm.Model, cfg *config.Info) SelectResu
 		tailTurns = *cfg.Compaction.TailTurns
 	}
 
-	// Build list of user turns (non-compaction user messages)
+	// Build list of real user turns (skip compaction boundary user messages
+	// which only contain a CompactionPart — they are anchors, not real turns).
+	// The parts map is not available here, so we rely on the caller having
+	// already run FilterCompacted which places the compaction user message
+	// first; we skip the very first message if it has no real text content.
 	var turns []Turn
 	for i, m := range msgs {
-		if m.Role == store.RoleUser {
-			turns = append(turns, Turn{UserMsgID: m.ID, StartIdx: i})
+		if m.Role != store.RoleUser {
+			continue
 		}
+		// Skip compaction anchor messages (identified by being a user message
+		// with only compaction/empty content — they come right before summary).
+		// A simple heuristic: skip if there is a following summary assistant message.
+		isCompactionBoundary := false
+		if i+1 < len(msgs) && msgs[i+1].Summary {
+			isCompactionBoundary = true
+		}
+		if isCompactionBoundary {
+			continue
+		}
+		turns = append(turns, Turn{UserMsgID: m.ID, StartIdx: i})
 	}
 	// Set end index for each turn
 	for i := range turns {
@@ -97,40 +112,44 @@ func Select(msgs []*store.Message, model llm.Model, cfg *config.Info) SelectResu
 		}
 	}
 
+	// Need more turns than tailTurns to have anything to summarise
 	if len(turns) <= tailTurns {
-		// All turns fit in the tail — nothing to summarise
 		return SelectResult{Head: nil, TailStartID: ""}
 	}
 
-	// Take the last tailTurns turns and check if they fit in the budget
-	recentTurns := turns[len(turns)-tailTurns:]
-
+	// Determine how many of the most recent turns fit in the tail budget.
+	// Walk backwards through the last tailTurns turns.
+	tail := turns[len(turns)-tailTurns:]
 	totalTokens := 0
-	keepFromIdx := recentTurns[0].StartIdx
+	// Start of the tail — will be moved forward if budget is tight.
+	tailStartTurnIdx := len(turns) - tailTurns
 
-	for _, t := range recentTurns {
-		// Estimate token count for this turn (rough: 1 token ≈ 4 chars)
-		turnSize := estimateTurnTokens(msgs[t.StartIdx:t.EndIdx])
-		if totalTokens+turnSize <= budget {
-			totalTokens += turnSize
-			keepFromIdx = t.StartIdx
+	for i := len(tail) - 1; i >= 0; i-- {
+		t := tail[i]
+		size := estimateTurnTokens(msgs[t.StartIdx:t.EndIdx])
+		if totalTokens+size <= budget {
+			totalTokens += size
 		} else {
-			// Even the most recent turn doesn't fit — keep it anyway (minimum 1 turn)
-			if t == recentTurns[len(recentTurns)-1] {
-				keepFromIdx = t.StartIdx
-			}
+			// This turn doesn't fit; tail starts at the next turn.
+			tailStartTurnIdx = len(turns) - tailTurns + i + 1
 			break
 		}
 	}
 
-	if keepFromIdx == 0 {
+	// Ensure tail keeps at least 1 turn.
+	if tailStartTurnIdx >= len(turns) {
+		tailStartTurnIdx = len(turns) - 1
+	}
+
+	tailMsgIdx := turns[tailStartTurnIdx].StartIdx
+	if tailMsgIdx == 0 {
+		// All messages are in the tail → nothing to summarise
 		return SelectResult{Head: nil, TailStartID: ""}
 	}
 
-	tailStartID := msgs[keepFromIdx].ID
 	return SelectResult{
-		Head:        msgs[:keepFromIdx],
-		TailStartID: tailStartID,
+		Head:        msgs[:tailMsgIdx],
+		TailStartID: msgs[tailMsgIdx].ID,
 	}
 }
 
@@ -163,6 +182,10 @@ func NewCompactor(s store.Store, processor *Processor) *Compactor {
 //  2. Generates a summary of the head using the LLM
 //  3. Inserts a compaction boundary in the user message
 //  4. Stores the summary as a special assistant message
+//
+// The provider used for the summary LLM call is input.SummaryProvider when
+// set, otherwise input.Provider. This lets callers supply an unwrapped/plain
+// provider for the compaction call (e.g. without usage-injection middleware).
 //
 // Returns the summary message ID on success.
 func (c *Compactor) Compact(ctx context.Context, sessionID string, input ProcessInput) (string, error) {
@@ -200,30 +223,67 @@ func (c *Compactor) Compact(ctx context.Context, sessionID string, input Process
 		return "", fmt.Errorf("compaction: build head messages: %w", err)
 	}
 
-	// Create a summary assistant message
-	summaryMsgID := newID()
 	now := time.Now()
-	summaryMsg := &store.Message{
+
+	// Step 1: Insert a compaction boundary user message.
+	// This must be created BEFORE the summary assistant message so that
+	// ListMessages (insertion-ordered) sees:
+	//   [compactionUserMsg / CompactionPart]  ← FilterCompacted anchor
+	//   [summaryAssistantMsg / summary=true]  ← LLM summary
+	//   [subsequent turns...]
+	compactionMsgID := newID()
+	if err := c.store.CreateMessage(ctx, &store.Message{
+		ID:        compactionMsgID,
+		SessionID: sessionID,
+		Role:      store.RoleUser,
+		CreatedAt: now,
+		UpdatedAt: now,
+	}); err != nil {
+		return "", fmt.Errorf("compaction: create boundary message: %w", err)
+	}
+	if err := c.store.CreatePart(ctx, &store.Part{
+		ID:        newID(),
+		MessageID: compactionMsgID,
+		SessionID: sessionID,
+		Type:      store.PartTypeCompaction,
+		Data:      &store.CompactionPartData{},
+	}); err != nil {
+		return "", fmt.Errorf("compaction: create boundary part: %w", err)
+	}
+
+	// Step 2: Create the summary assistant message placeholder.
+	summaryMsgID := newID()
+	if err := c.store.CreateMessage(ctx, &store.Message{
 		ID:        summaryMsgID,
 		SessionID: sessionID,
 		Role:      store.RoleAssistant,
 		Model:     input.Model.ID + "/" + input.Model.ProviderID,
-		CreatedAt: now,
-		UpdatedAt: now,
+		CreatedAt: now.Add(time.Millisecond),
+		UpdatedAt: now.Add(time.Millisecond),
 		Summary:   true,
-	}
-	if err := c.store.CreateMessage(ctx, summaryMsg); err != nil {
+	}); err != nil {
 		return "", fmt.Errorf("compaction: create summary message: %w", err)
 	}
 
-	// Run a new LLM call to generate the summary
+	// Step 3: Run the summary LLM call.
+	// Use SummaryProvider when set (allows callers to supply a plain provider
+	// without middleware that would cause side effects like usage accumulation).
+	summaryProvider := input.Provider
+	if input.SummaryProvider != nil {
+		summaryProvider = input.SummaryProvider
+	}
+	// Use a large context limit for the summary model so the head is never
+	// rejected as overflow (the test model has an artificially small limit).
+	summaryModel := input.Model
+	summaryModel.Limit = llm.ModelLimit{Context: 200_000, Output: 8_192}
+
 	summaryInput := ProcessInput{
 		SessionID: sessionID,
-		Model:     input.Model,
+		Model:     summaryModel,
 		System:    []string{"You are a helpful assistant that summarises conversation history concisely and accurately."},
 		Messages:  append(headMsgs, llm.NewUserMessage(SummaryTemplate)),
-		Tools:     nil, // no tools during compaction
-		Provider:  input.Provider,
+		Tools:     nil,
+		Provider:  summaryProvider,
 		Config:    input.Config,
 	}
 

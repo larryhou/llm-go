@@ -247,10 +247,8 @@ func TestIntegration_MultiTurn(t *testing.T) {
 	}
 }
 
-// TestIntegration_ContextOverflow verifies IsOverflow logic.
-// It sends a real request, collects any usage the provider returns, then
-// independently verifies the overflow calculation with synthetic token counts
-// since some proxies don't return usage in streaming responses.
+// TestIntegration_ContextOverflow verifies that IsOverflow correctly detects
+// when real provider-reported usage exceeds a model's context limit.
 func TestIntegration_ContextOverflow(t *testing.T) {
 	prov, model := setup(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -263,39 +261,39 @@ func TestIntegration_ContextOverflow(t *testing.T) {
 		Options:  llm.GenerationOptions{MaxTokens: 10},
 	}
 
-	var streamOK bool
+	var gotUsage llm.TokenUsage
 	for ev := range client.Stream(ctx, req) {
-		if ev.Type == llm.EventTextDelta && ev.Text != "" {
-			streamOK = true
+		if ev.Type == llm.EventStepFinish {
+			gotUsage = ev.Usage
 		}
 		if ev.Type == llm.EventError {
 			t.Fatalf("stream error: %v", ev.Err)
 		}
 	}
-	if !streamOK {
-		t.Error("expected at least one text delta from the stream")
+
+	t.Logf("real usage from provider: input=%d output=%d total=%d",
+		gotUsage.Input, gotUsage.Output, gotUsage.Total)
+
+	// Should have real token counts now (include_usage is supported).
+	if gotUsage.Effective() == 0 {
+		t.Error("expected non-zero token usage from provider (include_usage not working?)")
 	}
 
-	// Verify IsOverflow arithmetic with synthetic usage (provider-agnostic).
-	// A model with context=10, output=5 → usable = 10-5 = 5.
-	// Any usage >= 5 tokens should overflow.
-	tinyModel := llm.Model{
-		APIID: model.APIID,
-		Limit: llm.ModelLimit{Context: 10, Output: 5},
+	// IsOverflow with a tiny model limit — real usage must exceed it.
+	// context=50, output=10 → usable = 50−10 = 40; real usage is well above 40.
+	tinyModel := model
+	tinyModel.Limit = llm.ModelLimit{Context: 50, Output: 10}
+	if !llm.IsOverflow(gotUsage, tinyModel, nil) {
+		t.Errorf("IsOverflow should be true for context=50 with real usage %+v", gotUsage)
 	}
-	bigUsage := llm.TokenUsage{Total: 100}
-	smallUsage := llm.TokenUsage{Total: 4}
 
-	if !llm.IsOverflow(bigUsage, tinyModel, nil) {
-		t.Error("IsOverflow(total=100, tiny model) should be true")
+	// Normal 200K model should NOT overflow.
+	if llm.IsOverflow(gotUsage, model, nil) {
+		t.Errorf("IsOverflow should be false for full model with usage %+v", gotUsage)
 	}
-	if llm.IsOverflow(smallUsage, tinyModel, nil) {
-		t.Error("IsOverflow(total=4, tiny model) should be false (4 < usable=5)")
-	}
-	if llm.IsOverflow(bigUsage, model, nil) {
-		t.Error("IsOverflow(total=100, full model) should be false")
-	}
-	t.Logf("IsOverflow arithmetic verified (stream was %v)", streamOK)
+
+	t.Logf("PASS: IsOverflow correctly detects real usage=%d vs tiny limit=%d / full limit=%d",
+		gotUsage.Effective(), llm.Usable(tinyModel, nil), llm.Usable(model, nil))
 }
 
 // TestIntegration_ErrorClassification verifies that a bad API key produces

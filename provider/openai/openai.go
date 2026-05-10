@@ -230,13 +230,17 @@ func extractText(parts []llm.ContentPart) string {
 }
 
 // runStream processes the OpenAI streaming response and emits canonical events.
+//
+// Usage handling: with stream_options.include_usage=true, the provider sends
+// a final chunk with choices=[] and usage={...} AFTER the finish_reason chunk.
+// We defer EventStepFinish until we've seen that usage chunk (or the stream ends),
+// so that usage is always populated when the event is emitted.
 func runStream(ctx context.Context, providerID string, stream *ssestream.Stream[openai.ChatCompletionChunk], out chan<- llm.Event) {
 	defer stream.Close()
 
 	out <- llm.Event{Type: llm.EventRequestStart}
 	out <- llm.Event{Type: llm.EventStepStart}
 
-	// Per-index tool state accumulator
 	type toolState struct {
 		id   string
 		name string
@@ -247,16 +251,31 @@ func runStream(ctx context.Context, providerID string, stream *ssestream.Stream[
 
 	var usage llm.TokenUsage
 
+	// pendingFinish holds a StepFinish event whose usage may still be arriving.
+	// It is flushed when the usage chunk arrives or the stream ends.
+	var pendingFinish *llm.Event
+
+	flushPending := func() {
+		if pendingFinish != nil {
+			pendingFinish.Usage = usage
+			out <- *pendingFinish
+			pendingFinish = nil
+		}
+	}
+
 	for stream.Next() {
 		chunk := stream.Current()
 
-		// Some providers send usage in a chunk with no choices
+		// Usage-only chunk (choices=[]) — sent by providers after the finish chunk
+		// when stream_options.include_usage=true is set.
 		if len(chunk.Choices) == 0 {
-			if chunk.Usage.TotalTokens > 0 {
+			if chunk.Usage.TotalTokens > 0 || chunk.JSON.Usage.Valid() {
 				usage.Input = int(chunk.Usage.PromptTokens)
 				usage.Output = int(chunk.Usage.CompletionTokens)
 				usage.Total = int(chunk.Usage.TotalTokens)
 			}
+			// Now that we have usage, flush the deferred StepFinish.
+			flushPending()
 			continue
 		}
 
@@ -269,6 +288,13 @@ func runStream(ctx context.Context, providerID string, stream *ssestream.Stream[
 				inText = true
 			}
 			out <- llm.Event{Type: llm.EventTextDelta, Text: delta.Content}
+		}
+
+		// Also capture inline usage if the provider sends it alongside choices.
+		if chunk.Usage.TotalTokens > 0 {
+			usage.Input = int(chunk.Usage.PromptTokens)
+			usage.Output = int(chunk.Usage.CompletionTokens)
+			usage.Total = int(chunk.Usage.TotalTokens)
 		}
 
 		for _, tc := range delta.ToolCalls {
@@ -308,7 +334,7 @@ func runStream(ctx context.Context, providerID string, stream *ssestream.Stream[
 				inText = false
 			}
 
-			// Finalise all tool calls
+			// Finalise all tool calls.
 			for _, ts := range toolByIndex {
 				var input any
 				if len(ts.args) > 0 {
@@ -323,11 +349,13 @@ func runStream(ctx context.Context, providerID string, stream *ssestream.Stream[
 			}
 			toolByIndex = map[int64]*toolState{}
 
-			out <- llm.Event{
+			// Defer StepFinish: usage may arrive in the next chunk.
+			ev := llm.Event{
 				Type:         llm.EventStepFinish,
-				Usage:        usage,
+				Usage:        usage, // may be zero; updated when usage chunk arrives
 				FinishReason: mapFinishReason(string(choice.FinishReason)),
 			}
+			pendingFinish = &ev
 		}
 
 		select {
@@ -342,6 +370,9 @@ func runStream(ctx context.Context, providerID string, stream *ssestream.Stream[
 		out <- llm.Event{Type: llm.EventError, Err: classifyError(providerID, err)}
 		return
 	}
+
+	// Flush any deferred StepFinish (usage chunk may have been last or absent).
+	flushPending()
 
 	out <- llm.Event{
 		Type:         llm.EventRequestFinish,

@@ -29,6 +29,11 @@ type RunInput struct {
 	Provider  llm.Provider
 	Config    *config.Info
 
+	// SummaryProvider, when set, is used for compaction summary generation
+	// instead of Provider. Useful when Provider has middleware (e.g. usage
+	// injection) that should not apply to the compaction LLM call.
+	SummaryProvider llm.Provider
+
 	// System prompt control — aligned with opencode session/llm.ts assembly order:
 	//
 	//   1. AgentPrompt  (if non-empty, replaces the per-provider prompt entirely)
@@ -152,10 +157,11 @@ func RunLoop(ctx context.Context, s store.Store, input RunInput) (RunResult, err
 		case ProcessCompact:
 			// Run compaction, then continue the loop
 			_, err := compactor.Compact(ctx, input.SessionID, ProcessInput{
-				SessionID: input.SessionID,
-				Model:     input.Model,
-				Provider:  input.Provider,
-				Config:    input.Config,
+				SessionID:       input.SessionID,
+				Model:           input.Model,
+				Provider:        input.Provider,
+				SummaryProvider: input.SummaryProvider,
+				Config:          input.Config,
 			})
 			if err != nil {
 				return RunResultStop, fmt.Errorf("runloop: compaction failed: %w", err)
