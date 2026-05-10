@@ -24,6 +24,7 @@ import (
 
 	bleve "github.com/blevesearch/bleve/v2"
 
+	llmconfig "github.com/larryhou/llm-go/config"
 	"github.com/larryhou/llm-go/knowledge"
 	blevesource "github.com/larryhou/llm-go/knowledge/source/bleve"
 	"github.com/larryhou/llm-go/llm"
@@ -37,7 +38,7 @@ import (
 )
 // ── config ────────────────────────────────────────────────────────────────────
 
-type config struct {
+type appConfig struct {
 	provider     string
 	baseURL      string
 	apiKey       string
@@ -213,7 +214,7 @@ func buildSkillsIndex(skillsDir string) (bleve.Index, int, error) {
 // ── main ──────────────────────────────────────────────────────────────────────
 
 func main() {
-	cfg := config{}
+	cfg := appConfig{}
 	flag.StringVar(&cfg.provider, "provider", envOr("TIMI_PROVIDER", "openai"), "LLM provider: openai or anthropic")
 	flag.StringVar(&cfg.baseURL, "llm-url", envOr("TIMI_BASE_URL", "http://192.168.3.119:8080/timi-claude/v1"), "LLM base URL")
 	flag.StringVar(&cfg.apiKey, "llm-key", envOr("TIMI_API_KEY", "sk-zzz6FtyLMyuobNNOukwgobP0l1F3TjMO"), "LLM API key")
@@ -326,6 +327,15 @@ func main() {
 		},
 	}
 
+	// ── default session config (prune enabled) ────────────────────────────────
+
+	pruneEnabled := true
+	sessionCfg := &llmconfig.Info{
+		Compaction: &llmconfig.CompactionConfig{
+			Prune: &pruneEnabled,
+		},
+	}
+
 	// ── startup banner ────────────────────────────────────────────────────────
 
 	fmt.Println("Control — interactive coding assistant")
@@ -345,6 +355,7 @@ func main() {
 			extraSystem: extraSystem,
 			model:       model,
 			prov:        prov,
+			cfg:         sessionCfg,
 		}
 		if err := runWebServer(app); err != nil {
 			fmt.Fprintf(os.Stderr, "web server: %v\n", err)
@@ -403,6 +414,7 @@ func main() {
 			Tools:       tools,
 			ExtraSystem: extraSystem,
 			MaxSteps:    cfg.maxSteps,
+			Config:      sessionCfg,
 		})
 
 		// Signal printer to drain and exit.

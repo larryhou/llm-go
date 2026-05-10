@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"sync"
 
+	"github.com/larryhou/llm-go/config"
 	"github.com/larryhou/llm-go/llm"
 	"github.com/larryhou/llm-go/session"
 	"github.com/larryhou/llm-go/store"
@@ -31,6 +32,7 @@ type appState struct {
 	extraSystem []string
 	model       llm.Model
 	prov        *replProvider
+	cfg         *config.Info
 }
 
 // ── web server ────────────────────────────────────────────────────────────────
@@ -148,6 +150,7 @@ func (s *webServer) handleChat(w http.ResponseWriter, r *http.Request) {
 		Tools:       s.app.tools,
 		ExtraSystem: s.app.extraSystem,
 		MaxSteps:    20,
+		Config:      s.app.cfg,
 	})
 	s.mu.Unlock()
 
