@@ -197,37 +197,33 @@ func hasRealContent(ps []*store.Part) bool {
 // FilterCompacted returns only the messages that are visible after compaction.
 // Aligned with message-v2.ts filterCompacted().
 //
-// Rule: find the most recent completed compaction boundary.
-// Return [compactionUserMsg, summarySummaryMsg] + everything after.
+// Rule: find the most recent *complete* compaction pair (boundary user message
+// + summary assistant message). Walking backward avoids mis-pairing a boundary
+// from one round with a summary from another on partial failures.
 func FilterCompacted(msgs []*store.Message, parts map[string][]*store.Part) []*store.Message {
-	// Find the last compaction user message index
-	compactionIdx := -1
-	summaryIdx := -1
-	for i, m := range msgs {
-		if m.Role == store.RoleUser {
-			ps := parts[m.ID]
+	for i := len(msgs) - 1; i >= 1; i-- {
+		if msgs[i].Role != store.RoleAssistant || !msgs[i].Summary {
+			continue
+		}
+		// Found a summary — look for its boundary user message just before it.
+		for j := i - 1; j >= 0; j-- {
+			if msgs[j].Role != store.RoleUser {
+				continue
+			}
+			ps := parts[msgs[j].ID]
 			for _, p := range ps {
 				if p.Type == store.PartTypeCompaction {
-					compactionIdx = i
-					break
+					out := make([]*store.Message, 0, len(msgs)-j)
+					out = append(out, msgs[j])    // compaction boundary user msg
+					out = append(out, msgs[i:]...) // summary + tail
+					return out
 				}
 			}
-		}
-		if m.Role == store.RoleAssistant && m.Summary {
-			summaryIdx = i
+			// A real user message between summary and boundary — no match, stop.
+			break
 		}
 	}
-
-	if compactionIdx < 0 || summaryIdx < 0 {
-		return msgs
-	}
-
-	// Return: compactionMsg + summaryMsg + everything after summaryMsg
-	var out []*store.Message
-	out = append(out, msgs[compactionIdx])   // the "What did we do so far?" user message
-	out = append(out, msgs[summaryIdx])      // the summary assistant message
-	out = append(out, msgs[summaryIdx+1:]...) // tail
-	return out
+	return msgs
 }
 
 // Message role constants (reused from store for convenience).
