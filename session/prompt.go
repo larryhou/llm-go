@@ -28,11 +28,30 @@ type RunInput struct {
 	Tools     []tool.Tool
 	Provider  llm.Provider
 	Config    *config.Info
-	// AgentID optionally identifies which agent is running (affects system prompt)
-	AgentID string
-	// ExtraSystem provides additional system instructions
+
+	// System prompt control — aligned with opencode session/llm.ts assembly order:
+	//
+	//   1. AgentPrompt  (if non-empty, replaces the per-provider prompt entirely)
+	//   2. per-provider prompt  (injected only when AgentPrompt == "" and DisableProviderPrompt == false)
+	//   3. ExtraSystem  (always appended after the base prompt)
+	//
+	// This mirrors opencode's logic:
+	//   input.agent.prompt ? [input.agent.prompt] : SystemPrompt.provider(input.model)
+
+	// AgentPrompt overrides the embedded per-provider system prompt.
+	// When non-empty the provider prompt is NOT injected (same as opencode's agent.prompt behaviour).
+	AgentPrompt string
+
+	// DisableProviderPrompt suppresses the embedded per-provider prompt even when
+	// AgentPrompt is empty. Use this when you want to supply a fully custom system
+	// via ExtraSystem without any built-in preamble.
+	DisableProviderPrompt bool
+
+	// ExtraSystem provides additional system instructions appended after the base prompt.
+	// Corresponds to input.system in opencode's llm.ts.
 	ExtraSystem []string
-	// MaxSteps prevents infinite agentic loops (default 0 = unlimited)
+
+	// MaxSteps prevents infinite agentic loops (0 = unlimited).
 	MaxSteps int
 }
 
@@ -160,20 +179,36 @@ func RunLoop(ctx context.Context, s store.Store, input RunInput) (RunResult, err
 }
 
 // buildSystem constructs the system prompt array for a request.
-// Aligned with session/llm.ts system prompt assembly.
+// Aligned with session/llm.ts system prompt assembly (lines 103-128):
+//
+//	system = [
+//	  agentPrompt || providerPrompt,  // base — exactly one of these
+//	  ...input.system,                // ExtraSystem
+//	].filter(Boolean).join("\n")
+//
+// Priority:
+//  1. AgentPrompt — if set, used as the sole base; provider prompt is skipped
+//  2. Provider prompt — used when AgentPrompt is empty AND DisableProviderPrompt is false
+//  3. ExtraSystem — always appended after the base
 func buildSystem(input RunInput) []string {
 	var parts []string
 
-	// Provider-specific base prompt (from embedded files)
-	base := SystemPromptForModel(input.Model)
-	if base != "" {
-		parts = append(parts, base)
+	switch {
+	case input.AgentPrompt != "":
+		// Agent has a custom prompt → use it, skip provider prompt entirely
+		parts = append(parts, input.AgentPrompt)
+	case !input.DisableProviderPrompt:
+		// No agent prompt → inject the embedded per-provider prompt
+		if base := SystemPromptForModel(input.Model); base != "" {
+			parts = append(parts, base)
+		}
+	// else: DisableProviderPrompt=true, AgentPrompt="" → no base prompt at all
 	}
 
-	// Extra system instructions from caller
+	// Always append caller-supplied extra instructions
 	parts = append(parts, input.ExtraSystem...)
 
-	// Join non-empty parts
+	// Filter empty strings
 	var out []string
 	for _, p := range parts {
 		if s := strings.TrimSpace(p); s != "" {

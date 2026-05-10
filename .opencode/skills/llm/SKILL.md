@@ -356,6 +356,43 @@ func main() {
 }
 ```
 
+### System prompt control
+
+`RunInput` exposes three fields that mirror opencode's `session/llm.ts` prompt assembly:
+
+```
+agentPrompt || providerPrompt  ← exactly one base prompt
++ ExtraSystem[]                ← always appended
+```
+
+| Field | Type | Behaviour |
+|---|---|---|
+| `AgentPrompt` | `string` | When non-empty, replaces the embedded provider prompt entirely (same as `agent.prompt` in opencode) |
+| `DisableProviderPrompt` | `bool` | When `true` and `AgentPrompt` is empty, suppresses the embedded provider prompt; only `ExtraSystem` is sent |
+| `ExtraSystem` | `[]string` | Always appended after the base prompt (corresponds to `input.system` in opencode) |
+
+```go
+// Use a custom agent prompt (provider prompt suppressed automatically)
+session.RunLoop(ctx, s, session.RunInput{
+    AgentPrompt: "You are a specialist Go code reviewer. Be concise.",
+    ExtraSystem: []string{"Focus on performance issues."},
+    ...
+})
+
+// Suppress the provider prompt, provide everything yourself
+session.RunLoop(ctx, s, session.RunInput{
+    DisableProviderPrompt: true,
+    ExtraSystem: []string{"You are a helpful assistant."},
+    ...
+})
+
+// Default: embedded per-provider prompt + your extra instructions
+session.RunLoop(ctx, s, session.RunInput{
+    ExtraSystem: []string{"Always respond in Chinese."},
+    ...
+})
+```
+
 ### Full agentic loop with tools and persistence
 
 ```go
