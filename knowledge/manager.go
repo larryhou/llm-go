@@ -86,6 +86,22 @@ func (m *Manager) Tools() []tool.Tool {
 	}
 }
 
+// Search is the public entry point for a QueryTypeSearch or QueryTypeQuery
+// request.  It dispatches to all eligible sources via priority-grouped
+// concurrent Peek calls.  Callers such as the HTTP API use this directly
+// to obtain structured []Result values instead of formatted Markdown.
+func (m *Manager) Search(ctx context.Context, q Query) ([]Result, error) {
+	return m.peek(ctx, q)
+}
+
+// Fetch is the public entry point for a QueryTypeFetch request.
+// It routes to the correct source via the "{sourceID}:" prefix in q.Input
+// and returns the full-content result.  Callers such as the HTTP API use
+// this directly to obtain a structured Result instead of formatted Markdown.
+func (m *Manager) Fetch(ctx context.Context, q Query) ([]Result, error) {
+	return m.fetch(ctx, q)
+}
+
 // peek dispatches a Peek call across all eligible sources using priority
 // grouping and concurrent execution within each group.
 func (m *Manager) peek(ctx context.Context, q Query) ([]Result, error) {
