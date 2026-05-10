@@ -86,17 +86,121 @@ sequenceDiagram
 
 ### Context Compaction
 
+Compaction is triggered when `IsOverflow()` returns true after a step, or when the provider returns a context-overflow error. It replaces old history with an LLM-generated summary, keeping only the most recent turns verbatim.
+
+```mermaid
+flowchart TD
+    StepFinish["EventStepFinish\nev.Usage.Input"] --> IsOverflow{"IsOverflow(usage, model, cfg)\ninput ≥ Usable limit?"}
+    ProviderError["EventError\nIsContextOverflow()"] --> IsOverflow
+    IsOverflow -- No --> Continue["ProcessContinue"]
+    IsOverflow -- Yes --> ProcessCompact["ProcessCompact\n→ RunLoop calls Compact()"]
+
+    ProcessCompact --> ListMsgs["ListMessages + ListParts\nfor session"]
+    ListMsgs --> FilterCompacted["FilterCompacted()\nskip pre-compaction history"]
+    FilterCompacted --> Select["Select(msgs, model, cfg)\nhead / tail split"]
+
+    Select --> NothingToSummarise{"len(head) == 0?"}
+    NothingToSummarise -- Yes --> CompactFail["Compact() returns error\nRunLoop returns error"]
+    NothingToSummarise -- No --> BuildHead["Build head messages\nstripMedia=true\ntoolOutputMaxChars=2000"]
+
+    BuildHead --> SummaryLLM["LLM call (summaryModel)\ncontext=200000, output=8192\nSummaryTemplate prompt"]
+    SummaryLLM --> SummaryMsg["store.Message\nsummary=true"]
+
+    Select --> Tail["Tail messages\n~25% of Usable\nmin 2000 / max 8000 tokens\n≥ 1 user turn always kept"]
+
+    SummaryMsg --> NextTurn["Next RunLoop iteration\nFilterCompacted skips head\nonly summary + tail sent to LLM"]
+    Tail --> NextTurn
+```
+
+#### Usable limit calculation (`llm/overflow.go`)
+
+```
+MaxOutputTokens = min(model.limit.output, 32000)
+reserved        = cfg.compaction.reserved ?? min(CompactionBuffer=20000, MaxOutputTokens)
+
+if model.limit.input set:
+    Usable = model.limit.input  - reserved
+else:
+    Usable = model.limit.context - MaxOutputTokens
+```
+
+Example with `-context-limit 128000` and `output=8192`:
+```
+MaxOutputTokens = 8192
+reserved        = min(20000, 8192) = 8192
+Usable          = 128000 - 8192   = 119,808  ← compact triggers here
+```
+
+#### head / tail split (`session/compaction.go Select()`)
+
 ```mermaid
 flowchart LR
-    Overflow["IsOverflow(usage, model, cfg)\ntokens ≥ usable limit"] --> Select["Select(msgs)\nhead / tail split"]
-    Select --> Head["Head messages\nstripMedia=true\ntoolOutputMaxChars=2000"]
-    Select --> Tail["Tail messages\npreserve verbatim\n~25% of context\nmin 2000 / max 8000 tokens"]
-    Head --> SummaryLLM["LLM call\nSummaryTemplate prompt"]
-    SummaryLLM --> SummaryMsg["store.Message\nsummary=true"]
-    SummaryMsg --> FilterCompacted["FilterCompacted()\nskip pre-compaction history"]
-    Tail --> FilterCompacted
-    FilterCompacted --> NextTurn["Next RunLoop turn"]
+    Msgs["All messages\n(post-FilterCompacted)"] --> Turns["Identify user turns\nskip compaction-boundary turns"]
+    Turns --> Enough{"len(turns) > tailTurns\n(default 2)?"}
+    Enough -- No --> NoSplit["SelectResult{Head:nil}\nnothing to summarise"]
+    Enough -- Yes --> WalkBack["Walk last tailTurns turns backward\nestimate token size per turn"]
+    WalkBack --> Budget{"fits in PreserveRecentBudget?"}
+    Budget -- Yes --> KeepInTail["Keep turn in tail"]
+    Budget -- No --> PushForward["tailStartTurnIdx moves forward\n(drop turn from tail)"]
+    KeepInTail --> TailStart["tail = msgs[tailStartTurnIdx:]"]
+    PushForward --> TailStart
+    TailStart --> Head["head = msgs[:tailStartIdx]\n→ summarised by LLM"]
+    TailStart --> Tail["tail → preserved verbatim"]
 ```
+
+### Prune — tool output trimming
+
+Prune is a lighter alternative to full compaction: instead of replacing history with a summary, it **clears old tool output content** in-place, freeing context without changing the message structure.
+
+> **Current status**: `Prune()` is implemented in `session/compaction.go` but is **not called anywhere** in the current codebase. It is available for future use as a pre-compaction or degraded-compaction strategy.
+
+```mermaid
+flowchart TD
+    Start["Prune(ctx, sessionID, store)"] --> ListMsgs["ListMessages for session"]
+    ListMsgs --> WalkBack["Walk messages backward\n(newest → oldest)"]
+
+    WalkBack --> SummaryCheck{"msg.Summary == true?"}
+    SummaryCheck -- Yes --> Stop["Stop — do not cross\ncompaction boundary"]
+
+    SummaryCheck -- No --> UserCheck{"msg.Role == user?"}
+    UserCheck -- Yes --> TurnCount["turnsSkipped++"]
+    TurnCount --> RecentTurn{"turnsSkipped ≤ 2?"}
+    RecentTurn -- Yes --> Skip["Skip (protect recent 2 turns)"]
+    RecentTurn -- No --> AssistantCheck{"msg.Role == assistant?"}
+
+    AssistantCheck -- No --> Next["Next message"]
+    AssistantCheck -- Yes --> ToolParts["ListParts for message\nfilter: PartTypeTool, completed, not already compacted"]
+
+    ToolParts --> ProtectCheck{"tokensProtected < PruneProtect\n(40,000 tokens)?"}
+    ProtectCheck -- Yes --> Protect["tokensProtected += outputTokens\nSkip (protect recent tool output)"]
+    ProtectCheck -- No --> MarkCompacted["part.Data.Compacted = now\nUpdatePart()\ntotalPruned += outputTokens"]
+
+    MarkCompacted --> MinCheck{"totalPruned ≥ PruneMinimum/4\n(5,000 est. tokens)?"}
+    MinCheck -- No --> Fail["return error: not enough pruned"]
+    MinCheck -- Yes --> OK["return nil"]
+```
+
+#### What happens to pruned tool outputs
+
+After `Prune()`, when `ToModelMessages()` builds the next request, any part with `Compacted > 0` emits:
+
+```
+[Old tool result content cleared]
+```
+
+instead of the original output. The tool call itself (name + input) is preserved in the assistant message — only the result content is replaced.
+
+#### Prune vs Compact comparison
+
+| | Prune | Compact |
+|---|---|---|
+| Trigger | manual / future strategy | `IsOverflow()` or provider overflow error |
+| Currently called | no (dead code) | yes, via `RunLoop` → `Compactor.Compact()` |
+| Message count | unchanged | large reduction (head → 1 summary message) |
+| History structure | intact | head replaced by summary + compaction boundary |
+| input token drop | small (tool outputs only) | large |
+| LLM call required | no | yes (summary generation) |
+| Crosses summary boundary | no (stops at summary) | creates new summary |
 
 ---
 
