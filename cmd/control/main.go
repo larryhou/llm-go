@@ -221,6 +221,7 @@ func main() {
 	flag.IntVar(&cfg.maxSteps, "max-steps", 20, "max agentic steps per turn")
 	flag.IntVar(&cfg.contextLimit, "context-limit", 128000, "context window token limit")
 	flag.StringVar(&cfg.skillsDir, "skills", ".opencode", "skills root directory to index")
+	flag.BoolVar(&cfg.web, "web", false, "start web UI instead of REPL (port chosen automatically)")
 	flag.Parse()
 
 	// ── provider ──────────────────────────────────────────────────────────────
@@ -334,6 +335,24 @@ func main() {
 	} else {
 		fmt.Println("Skills indexed: none")
 	}
+
+	// ── web mode ──────────────────────────────────────────────────────────────
+
+	if cfg.web {
+		app := &appState{
+			cwd:         cwd,
+			tools:       tools,
+			extraSystem: extraSystem,
+			model:       model,
+			prov:        prov,
+		}
+		if err := runWebServer(app); err != nil {
+			fmt.Fprintf(os.Stderr, "web server: %v\n", err)
+			os.Exit(1)
+		}
+		return
+	}
+
 	fmt.Println("Type 'exit' or Ctrl-D to quit.")
 	fmt.Println()
 
