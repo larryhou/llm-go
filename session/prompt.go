@@ -218,15 +218,12 @@ func buildSystem(input RunInput) []string {
 	return out
 }
 
-// hasToolCalls returns true if any part in the message is a pending/running tool call.
+// hasToolCalls returns true if any part in the message is a tool call part
+// (regardless of status — even pending means the LLM emitted a tool call).
 func hasToolCalls(ps []*store.Part) bool {
 	for _, p := range ps {
 		if p.Type == store.PartTypeTool {
-			if d, ok := p.Data.(*store.ToolPartData); ok {
-				if d.Status == store.ToolStatusCompleted || d.Status == store.ToolStatusRunning {
-					return true
-				}
-			}
+			return true
 		}
 	}
 	return false
