@@ -239,9 +239,9 @@ async function send() {
           textNode = document.createTextNode('');
           bubble.insertBefore(textNode, cursor);
         } else if (ev.type === 'usage') {
-          tokIn.textContent    = (ev.input  || 0).toLocaleString();
-          tokOut.textContent   = (ev.output || 0).toLocaleString();
-          tokTotal.textContent = (ev.total  || 0).toLocaleString();
+          if (ev.input  > 0) tokIn.textContent    = ev.input.toLocaleString();
+          if (ev.output > 0) tokOut.textContent   = ev.output.toLocaleString();
+          if (ev.total  > 0) tokTotal.textContent = ev.total.toLocaleString();
         } else if (ev.type === 'error') {
           appendError(wrap, ev.error);
         } else if (ev.type === 'done') {
