@@ -16,22 +16,26 @@ Single file: `cmd/control/main.go`
 
 ## Architecture
 
-```
-User input (stdin)
-      │
-      ▼
-  bufio.Scanner  ──────── "exit"/"quit"/EOF → quit
-      │
-      ▼
-session.RunLoop(ctx, store, RunInput)
-      │
-      ├── replProvider.Stream()   ← wraps real Provider
-      │       │  tee goroutine
-      │       ├── evCh ──────────► printer goroutine  → stdout/stderr
-      │       └── inner ch ──────► session Processor
-      │
-      ├── builtin tools  (glob, grep, read, write, edit, bash)
-      └── knowledge tools (knowledge_search, knowledge_fetch)  [optional]
+```mermaid
+flowchart TD
+    stdin["User input (stdin)"]
+    scanner["bufio.Scanner"]
+    quit["quit"]
+    runloop["session.RunLoop(ctx, store, RunInput)"]
+    replprov["replProvider.Stream()\ntee goroutine"]
+    printer["printer goroutine\nstdout / stderr"]
+    processor["session.Processor"]
+    builtin["builtin tools\nglob · grep · read · write · edit · bash"]
+    knowledge["knowledge tools\nknowledge_search · knowledge_fetch\n(optional)"]
+
+    stdin --> scanner
+    scanner -->|"exit/quit/EOF"| quit
+    scanner --> runloop
+    runloop --> replprov
+    replprov -->|evCh| printer
+    replprov -->|inner ch| processor
+    runloop --> builtin
+    runloop --> knowledge
 ```
 
 ### replProvider — event tee
@@ -43,13 +47,22 @@ event to a local `chan llm.Event` (`evCh`).
 
 Per-turn lifecycle:
 
-```
-1. start printer goroutine  (reads evCh)
-2. session.RunLoop(...)     (blocks; tees events into evCh via replProvider)
-3. close(evCh)              (signals printer to drain and exit)
-4. <-done                   (wait for printer goroutine)
-5. evCh = make(...)         (reset for next turn)
-   prov.out = evCh
+```mermaid
+sequenceDiagram
+    participant REPL
+    participant printer as printer goroutine
+    participant RunLoop as session.RunLoop
+    participant replProv as replProvider
+
+    REPL->>printer: go func() { for ev := range evCh }
+    REPL->>RunLoop: RunLoop(...) [blocks]
+    RunLoop->>replProv: Stream(ctx, req)
+    replProv-->>printer: evCh ← ev (tee)
+    replProv-->>RunLoop: inner ch ← ev (pass-through)
+    RunLoop-->>REPL: return (RunResult, error)
+    REPL->>printer: close(evCh)
+    REPL->>REPL: <-done (drain)
+    REPL->>REPL: evCh = make(...); prov.out = evCh
 ```
 
 ### Skills index
