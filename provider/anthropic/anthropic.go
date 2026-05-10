@@ -98,13 +98,15 @@ func buildParams(req llm.Request) (anthropic.MessageNewParams, error) {
 		MaxTokens: int64(effectiveMaxTokens(req)),
 	}
 
-	// System prompt
+	// System prompt — keep as separate blocks to preserve per-entry cache granularity.
 	if len(req.System) > 0 {
-		system := ""
+		sysBlocks := make([]anthropic.TextBlockParam, 0, len(req.System))
 		for _, s := range req.System {
-			system += s + "\n"
+			if s != "" {
+				sysBlocks = append(sysBlocks, anthropic.TextBlockParam{Text: s})
+			}
 		}
-		params.System = []anthropic.TextBlockParam{{Text: system}}
+		params.System = sysBlocks
 	}
 
 	// Temperature
