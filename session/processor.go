@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"log"
 	"time"
 
 	"github.com/larryhou/llm-go/config"
@@ -239,8 +240,11 @@ func (s *processorState) handleEvent(ctx context.Context, ev llm.Event) (Process
 		go s.executeTool(ctx, ev.ToolCallID, ev.ToolName, partID, inputMap)
 
 	case llm.EventToolResult:
-		// Tool results are handled asynchronously via executeTool goroutines
-		// This event is emitted after our own tool execution completes
+		// Tool results are normally handled asynchronously via executeTool goroutines.
+		// Some OpenAI-compatible proxies emit tool_result events directly in the stream;
+		// log a warning so unexpected providers are visible rather than silently ignored.
+		log.Printf("[session] unexpected EventToolResult for tool %q (id=%s) — provider may be emitting tool results directly in stream",
+			ev.ToolName, ev.ToolCallID)
 
 	case llm.EventToolError:
 		partID, ok := s.activeToolParts[ev.ToolCallID]
