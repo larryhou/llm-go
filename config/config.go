@@ -1,9 +1,10 @@
-// Package config defines the configuration schema for llm-go, aligned with
-// opencode's opencode.json / opencode.jsonc format.
+// Package config defines the configuration schema for llm-go.
+// Config file location: ~/.config/llm/llm.json (or $XDG_CONFIG_HOME/llm/llm.json).
 package config
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 )
@@ -250,11 +251,11 @@ const (
 	DefaultProviderTimeout               = 300_000 // 5 minutes in ms
 )
 
-// Load reads the opencode config from standard locations.
-// Search order (same as opencode):
-//  1. $XDG_CONFIG_HOME/opencode/opencode.json
-//  2. ~/.config/opencode/opencode.json
-//  3. .opencode/opencode.json (project-local)
+// Load reads the llm-go config from standard locations.
+// Search order (later files merge/override earlier ones):
+//  1. $XDG_CONFIG_HOME/llm/llm.json   (global user config)
+//  2. ~/.config/llm/llm.json           (fallback when XDG_CONFIG_HOME is unset)
+//  3. .llm/llm.json                    (project-local override)
 func Load() (*Info, error) {
 	paths := configPaths()
 	cfg := &Info{}
@@ -267,32 +268,28 @@ func Load() (*Info, error) {
 			return nil, err
 		}
 		if err := json.Unmarshal(data, cfg); err != nil {
-			return nil, err
+			return nil, fmt.Errorf("config: parse %s: %w", p, err)
 		}
 	}
 	return cfg, nil
 }
 
-func configPaths() []string {
-	var paths []string
-
-	// XDG_CONFIG_HOME or ~/.config
+// ConfigDir returns the global llm-go config directory.
+// Value: $XDG_CONFIG_HOME/llm or ~/.config/llm
+func ConfigDir() string {
 	cfgHome := os.Getenv("XDG_CONFIG_HOME")
 	if cfgHome == "" {
 		home, _ := os.UserHomeDir()
 		cfgHome = filepath.Join(home, ".config")
 	}
-	paths = append(paths,
-		filepath.Join(cfgHome, "opencode", "opencode.json"),
-		filepath.Join(cfgHome, "opencode", "opencode.jsonc"),
-	)
+	return filepath.Join(cfgHome, "llm")
+}
 
-	// project-local
-	paths = append(paths,
-		filepath.Join(".opencode", "opencode.json"),
-		filepath.Join(".opencode", "opencode.jsonc"),
-	)
-	return paths
+func configPaths() []string {
+	return []string{
+		filepath.Join(ConfigDir(), "llm.json"),
+		filepath.Join(".llm", "llm.json"),
+	}
 }
 
 // GetCompactionAuto returns the effective auto-compaction setting (default true).

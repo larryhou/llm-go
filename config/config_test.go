@@ -151,7 +151,6 @@ func TestInterleaved_roundtrip(t *testing.T) {
 }
 
 func TestLoad_missingFile(t *testing.T) {
-	// Point config search at a temp dir with no config files
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 	cfg, err := config.Load()
 	if err != nil {
@@ -166,15 +165,15 @@ func TestLoad_parsesFile(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("XDG_CONFIG_HOME", dir)
 
-	opencodeDir := filepath.Join(dir, "opencode")
-	if err := os.MkdirAll(opencodeDir, 0o750); err != nil {
+	llmDir := filepath.Join(dir, "llm")
+	if err := os.MkdirAll(llmDir, 0o750); err != nil {
 		t.Fatal(err)
 	}
 	content := `{
 		"model": "anthropic/claude-sonnet-4-5",
 		"compaction": {"auto": false, "tail_turns": 3}
 	}`
-	if err := os.WriteFile(filepath.Join(opencodeDir, "opencode.json"), []byte(content), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(llmDir, "llm.json"), []byte(content), 0o600); err != nil {
 		t.Fatal(err)
 	}
 
@@ -190,6 +189,16 @@ func TestLoad_parsesFile(t *testing.T) {
 	}
 	if cfg.GetCompactionTailTurns() != 3 {
 		t.Errorf("tail_turns = %d, want 3", cfg.GetCompactionTailTurns())
+	}
+}
+
+func TestConfigDir(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", dir)
+	got := config.ConfigDir()
+	want := filepath.Join(dir, "llm")
+	if got != want {
+		t.Errorf("ConfigDir = %q, want %q", got, want)
 	}
 }
 

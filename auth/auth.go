@@ -1,13 +1,14 @@
-// Package auth handles reading and writing opencode's auth.json.
-// Aligned with packages/opencode/src/auth/index.ts.
-//
-// Storage location: $XDG_DATA_HOME/opencode/auth.json (chmod 0600)
+// Package auth handles reading and writing llm-go's auth.json.
+// Storage location: ~/.config/llm/auth.json (or $XDG_CONFIG_HOME/llm/auth.json, chmod 0600).
+// The format is Record<providerID, Info> where Info is Oauth | Api | WellKnown.
 package auth
 
 import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+
+	"github.com/larryhou/llm-go/config"
 )
 
 const fileMode = 0o600
@@ -125,15 +126,9 @@ func (s *Store) save() error {
 	return os.WriteFile(s.path, data, fileMode)
 }
 
-// storePath returns the auth.json path.
-// $XDG_DATA_HOME/opencode/auth.json or ~/.local/share/opencode/auth.json
+// storePath returns the auth.json path: ~/.config/llm/auth.json
 func storePath() string {
-	dataHome := os.Getenv("XDG_DATA_HOME")
-	if dataHome == "" {
-		home, _ := os.UserHomeDir()
-		dataHome = filepath.Join(home, ".local", "share")
-	}
-	return filepath.Join(dataHome, "opencode", "auth.json")
+	return filepath.Join(config.ConfigDir(), "auth.json")
 }
 
 // ResolveKey looks up the API key for a provider using the standard priority order:

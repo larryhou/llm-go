@@ -251,19 +251,23 @@ These are all aligned with opencode's `overflow.ts` and `compaction.ts`:
 
 ## Configuration
 
-`llm-go` reads the same `opencode.json` as opencode. Config is loaded from (in order, later files merge/override):
+`llm-go` uses its own config path, separate from opencode.
 
-1. `$XDG_CONFIG_HOME/opencode/opencode.json`
-2. `~/.config/opencode/opencode.json`
-3. `.opencode/opencode.json` (project-local)
+| File | Path |
+|---|---|
+| Global config | `~/.config/llm/llm.json` (or `$XDG_CONFIG_HOME/llm/llm.json`) |
+| Project-local config | `.llm/llm.json` (in the working directory) |
+| Auth tokens / API keys | `~/.config/llm/auth.json` |
 
-Auth is read from `$XDG_DATA_HOME/opencode/auth.json` (default: `~/.local/share/opencode/auth.json`).
+Both files are loaded in order; the project-local file overrides the global one.
+
+`config.ConfigDir()` returns the effective config directory (`$XDG_CONFIG_HOME/llm` or `~/.config/llm`).
 
 ### Minimal Config Example
 
 ```jsonc
+// ~/.config/llm/llm.json
 {
-  "$schema": "https://opencode.ai/config.json",
   "model": "anthropic/claude-sonnet-4-5",
   "provider": {
     "anthropic": {
@@ -278,6 +282,7 @@ Auth is read from `$XDG_DATA_HOME/opencode/auth.json` (default: `~/.local/share/
 ### Custom Endpoint (OpenAI-compatible)
 
 ```jsonc
+// ~/.config/llm/llm.json
 {
   "provider": {
     "ollama": {
@@ -298,6 +303,7 @@ Auth is read from `$XDG_DATA_HOME/opencode/auth.json` (default: `~/.local/share/
 ### Compaction Tuning
 
 ```jsonc
+// ~/.config/llm/llm.json
 {
   "compaction": {
     "auto": true,
