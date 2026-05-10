@@ -98,7 +98,21 @@ func RunLoop(ctx context.Context, s store.Store, input RunInput) (RunResult, err
 	processor := NewProcessor(s)
 	compactor := NewCompactor(s, processor)
 
-	var lastInputTokens int // tracks cross-turn input token count to detect drops
+	// Initialise lastInputTokens from the most recent assistant message in the
+	// store so that cross-turn drops (e.g. compact between two user messages)
+	// are detected even though each RunLoop call starts fresh.
+	var lastInputTokens int
+	if msgs, allParts, err := loadMessages(ctx, s, input.SessionID); err == nil {
+		filtered := FilterCompacted(msgs, allParts)
+		for i := len(filtered) - 1; i >= 0; i-- {
+			if filtered[i].Role == store.RoleAssistant && !filtered[i].Summary {
+				if n := filtered[i].Tokens.Input; n > 0 {
+					lastInputTokens = n
+				}
+				break
+			}
+		}
+	}
 	step := 0
 	for {
 		if input.MaxSteps > 0 && step >= input.MaxSteps {
