@@ -401,6 +401,6 @@ clients.
 
 The session orchestration, context compaction, provider streaming, and
 configuration schemas in this library are derived from and inspired by the
-open-source project [**opencode**](https://github.com/sst/opencode) by
-[SST](https://sst.dev). The original TypeScript implementation can be found at
+open-source project [**opencode**](https://github.com/anomalyco/opencode).
+The original TypeScript implementation can be found at
 `packages/opencode/src/session/` in that repository.
