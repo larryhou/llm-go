@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net"
@@ -14,15 +15,13 @@ import (
 	"github.com/larryhou/llm-go/tool"
 )
 
-// ── free port ─────────────────────────────────────────────────────────────────
-
 // ── web server ────────────────────────────────────────────────────────────────
 
 type webServer struct {
-	app      *appState
-	mu       sync.Mutex        // serialise concurrent /chat requests
-	sessMu   sync.Mutex        // protect sessions map
-	sessions map[string]store.Store // session_id → store (persistent across requests)
+	app       *appState
+	mu        sync.Mutex // serialise concurrent /chat requests
+	sessStore store.Store
+	sessID    string
 }
 
 // appState holds shared state initialised once in main.
@@ -31,9 +30,7 @@ type appState struct {
 	tools       []tool.Tool
 	extraSystem []string
 	model       llm.Model
-	sessionStore store.Store
-	sessionID    string
-	prov         *replProvider
+	prov        *replProvider
 }
 
 // ── web server ────────────────────────────────────────────────────────────────
@@ -46,7 +43,17 @@ func runWebServer(app *appState) error {
 	addr := ln.Addr().(*net.TCPAddr)
 	url := fmt.Sprintf("http://127.0.0.1:%d", addr.Port)
 
-	srv := &webServer{app: app, sessions: make(map[string]store.Store)}
+	// Port is unique per process — use it as the session seed.
+	sessID := fmt.Sprintf("web-%d", addr.Port)
+	sessStore := memory.New()
+	if err := sessStore.CreateSession(context.Background(), &store.Session{
+		ID:    sessID,
+		Model: app.model.ProviderID + "/" + app.model.ID,
+	}); err != nil {
+		return fmt.Errorf("create session: %w", err)
+	}
+
+	srv := &webServer{app: app, sessStore: sessStore, sessID: sessID}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", srv.handleUI)
 	mux.HandleFunc("/chat", srv.handleChat)
@@ -71,8 +78,7 @@ func (s *webServer) handleChat(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req struct {
-		Message   string `json:"message"`
-		SessionID string `json:"session_id"`
+		Message string `json:"message"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, "invalid JSON", http.StatusBadRequest)
@@ -99,29 +105,6 @@ func (s *webServer) handleChat(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprintf(w, "data: %s\n\n", b)
 		flusher.Flush()
 	}
-
-	// Resolve or create a persistent session store for this session_id.
-	ctx := r.Context()
-	sessID := req.SessionID
-	if sessID == "" {
-		sessID = fmt.Sprintf("web-%d", timeNano())
-	}
-
-	s.sessMu.Lock()
-	sessStore, exists := s.sessions[sessID]
-	if !exists {
-		sessStore = memory.New()
-		s.sessions[sessID] = sessStore
-		if err := sessStore.CreateSession(ctx, &store.Session{
-			ID:    sessID,
-			Model: s.app.model.ProviderID + "/" + s.app.model.ID,
-		}); err != nil {
-			s.sessMu.Unlock()
-			sendEvent(map[string]any{"type": "error", "error": err.Error()})
-			return
-		}
-	}
-	s.sessMu.Unlock()
 
 	// Per-request event channel.
 	evCh := make(chan llm.Event, 128)
@@ -157,8 +140,8 @@ func (s *webServer) handleChat(w http.ResponseWriter, r *http.Request) {
 	}()
 
 	s.mu.Lock()
-	_, runErr := session.RunLoop(ctx, sessStore, session.RunInput{
-		SessionID:   sessID,
+	_, runErr := session.RunLoop(r.Context(), s.sessStore, session.RunInput{
+		SessionID:   s.sessID,
 		UserMsg:     req.Message,
 		Model:       s.app.model,
 		Provider:    prov,
@@ -174,5 +157,6 @@ func (s *webServer) handleChat(w http.ResponseWriter, r *http.Request) {
 	if runErr != nil {
 		sendEvent(map[string]any{"type": "error", "error": runErr.Error()})
 	}
-	sendEvent(map[string]any{"type": "done", "session_id": sessID})
+	sendEvent(map[string]any{"type": "done"})
 }
+

@@ -79,6 +79,7 @@ const tokTotal = document.getElementById('tok-total');
 
 let sessionId = '';
 
+
 function scrollBottom() {
   messages.scrollTop = messages.scrollHeight;
 }
@@ -141,7 +142,7 @@ async function send() {
     const resp = await fetch('/chat', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ message: text, session_id: sessionId }),
+      body: JSON.stringify({ message: text }),
     });
 
     const reader = resp.body.getReader();
@@ -175,7 +176,7 @@ async function send() {
         } else if (ev.type === 'error') {
           appendError(wrap, ev.error);
         } else if (ev.type === 'done') {
-          sessionId = ev.session_id || sessionId;
+          // session managed server-side
         }
       }
     }
