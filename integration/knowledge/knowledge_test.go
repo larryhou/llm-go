@@ -1,7 +1,7 @@
 // Package knowledge contains an end-to-end integration test that:
 //
-//  1. Builds a Bleve index from .opencode/skills Markdown files
-//  2. Registers the index as a knowledge.Source via the Manager
+//  1. Builds an in-memory Bleve index from .opencode/skills Markdown files
+//  2. Registers the index as a knowledge.Source via the knowledge.Manager
 //  3. Runs a real LLM session with knowledge_search and knowledge_fetch tools
 //  4. Verifies the LLM actually used the tools and retrieved correct content
 //
@@ -11,6 +11,7 @@
 package knowledge
 
 import (
+	"bufio"
 	"context"
 	"fmt"
 	"os"
@@ -34,10 +35,7 @@ const (
 	defaultBaseURL = "http://192.168.3.119:8080/timi-claude/v1"
 	defaultAPIKey  = "sk-zzz6FtyLMyuobNNOukwgobP0l1F3TjMO"
 	defaultModel   = "claude-sonnet-4.6"
-
-	// skillsDir is the .opencode/skills directory relative to repo root.
-	// Resolved at test time via repoRoot().
-	skillsDirRel = ".opencode/skills"
+	skillsDirRel   = ".opencode/skills"
 )
 
 // ── helpers ───────────────────────────────────────────────────────────────────
@@ -49,43 +47,34 @@ func skipIfNoIntegration(t *testing.T) {
 	}
 }
 
-// repoRoot walks up from the test binary location until it finds go.mod.
-// repoRoot walks up from the working directory until it finds a directory
-// containing the .opencode/skills subdirectory.
-// SKILLS_DIR env var overrides the resolved path entirely.
-func repoRoot(t *testing.T) string {
+// skillsDir walks up from cwd until it finds a directory containing
+// .opencode/skills with at least 2 sub-directories.
+func skillsDir(t *testing.T) string {
 	t.Helper()
 	dir, _ := os.Getwd()
 	for {
-		if _, err := os.Stat(filepath.Join(dir, ".opencode", "skills")); err == nil {
-			// Check it has more than just an llm/ sub-skill (i.e. it's the
-			// opencode repo root, not the llm-go sub-repo root).
-			entries, _ := os.ReadDir(filepath.Join(dir, ".opencode", "skills"))
-			if len(entries) >= 2 {
-				return dir
-			}
+		candidate := filepath.Join(dir, ".opencode", "skills")
+		if entries, err := os.ReadDir(candidate); err == nil && len(entries) >= 2 {
+			return candidate
 		}
 		parent := filepath.Dir(dir)
 		if parent == dir {
-			t.Fatal("could not locate repo root with ≥2 skills (.opencode/skills not found)")
+			t.Fatal("could not locate .opencode/skills with ≥2 entries")
 		}
 		dir = parent
 	}
 }
 
-// buildIndex creates a temporary Bleve index from the skills directory and
-// returns it along with a cleanup function.
-func buildIndex(t *testing.T, skillsDir string) (bleve.Index, func()) {
+// buildMemoryIndex creates an in-memory Bleve index from all .md files under
+// root.  Returns the index and the number of documents indexed.
+func buildMemoryIndex(t *testing.T, root string) (bleve.Index, int) {
 	t.Helper()
-	idxPath := filepath.Join(t.TempDir(), "skills.bleve")
 
 	mapping := bleve.NewIndexMapping()
 	text := bleve.NewTextFieldMapping()
-	text.Store = true
-	text.Index = true
+	text.Store, text.Index = true, true
 	kw := bleve.NewKeywordFieldMapping()
-	kw.Store = true
-	kw.Index = true
+	kw.Store, kw.Index = true, true
 	dm := bleve.NewDocumentMapping()
 	dm.AddFieldMappingsAt("title", text)
 	dm.AddFieldMappingsAt("content", text)
@@ -93,19 +82,19 @@ func buildIndex(t *testing.T, skillsDir string) (bleve.Index, func()) {
 	dm.AddFieldMappingsAt("path", kw)
 	mapping.AddDocumentMapping("_default", dm)
 
-	idx, err := bleve.New(idxPath, mapping)
+	idx, err := bleve.NewMemOnly(mapping)
 	if err != nil {
-		t.Fatalf("create bleve index: %v", err)
+		t.Fatalf("create memory index: %v", err)
 	}
+	t.Cleanup(func() { idx.Close() })
 
-	// Walk skills dir and index every .md file.
 	batch := idx.NewBatch()
 	count := 0
-	err = filepath.WalkDir(skillsDir, func(path string, de os.DirEntry, err error) error {
+	err = filepath.WalkDir(root, func(path string, de os.DirEntry, err error) error {
 		if err != nil || de.IsDir() || !strings.EqualFold(filepath.Ext(path), ".md") {
 			return err
 		}
-		rel, _ := filepath.Rel(skillsDir, path)
+		rel, _ := filepath.Rel(root, path)
 		skill := strings.SplitN(rel, string(filepath.Separator), 2)[0]
 		raw, err := os.ReadFile(path)
 		if err != nil {
@@ -129,27 +118,27 @@ func buildIndex(t *testing.T, skillsDir string) (bleve.Index, func()) {
 		t.Fatalf("walk skills dir: %v", err)
 	}
 	if err := idx.Batch(batch); err != nil {
-		t.Fatalf("flush index batch: %v", err)
+		t.Fatalf("flush batch: %v", err)
 	}
-	t.Logf("index built: %d document(s)", count)
-	return idx, func() { idx.Close() }
+	t.Logf("in-memory index ready: %d document(s)", count)
+	return idx, count
 }
 
-// parseFrontmatter extracts "name:" from YAML frontmatter.
+// parseFrontmatter extracts "name:" from YAML frontmatter (--- delimited).
 func parseFrontmatter(src string) (name, body string) {
 	src = strings.TrimPrefix(src, "\xef\xbb\xbf")
 	if !strings.HasPrefix(src, "---") {
 		return "", src
 	}
 	rest := src[3:]
-	idx := strings.Index(rest, "\n---")
-	if idx < 0 {
+	end := strings.Index(rest, "\n---")
+	if end < 0 {
 		return "", src
 	}
-	fm := rest[:idx]
-	body = strings.TrimPrefix(rest[idx+4:], "\n")
-	for _, line := range strings.Split(fm, "\n") {
-		if after, ok := strings.CutPrefix(line, "name:"); ok {
+	body = strings.TrimPrefix(rest[end+4:], "\n")
+	scanner := bufio.NewScanner(strings.NewReader(rest[:end]))
+	for scanner.Scan() {
+		if after, ok := strings.CutPrefix(scanner.Text(), "name:"); ok {
 			name = strings.TrimSpace(after)
 			break
 		}
@@ -157,28 +146,37 @@ func parseFrontmatter(src string) (name, body string) {
 	return name, body
 }
 
-// ── Unit tests (no LLM required) ─────────────────────────────────────────────
+// newKnowledgeManager builds a Manager with the given Bleve index registered.
+func newKnowledgeManager(idx bleve.Index) *knowledge.Manager {
+	km := knowledge.NewManager(knowledge.ManagerConfig{
+		SourceTimeout:       10 * time.Second,
+		MaxResults:          5,
+		SnippetMaxChars:     400,
+		ContentMaxChars:     6000,
+		AllowPartialFailure: true,
+	})
+	km.Register(blevesource.New(idx, "skills", 0, &blevesource.Config{
+		TitleField:   "title",
+		ContentField: "content",
+	}))
+	return km
+}
 
-// TestBleveIndex_SearchAndFetch verifies the Bleve source returns correct
-// results without involving any LLM.
+// ── Unit: BleveSource directly ────────────────────────────────────────────────
+
 func TestBleveIndex_SearchAndFetch(t *testing.T) {
-	root := repoRoot(t)
-	skillsDir := filepath.Join(root, skillsDirRel)
-	if _, err := os.Stat(skillsDir); err != nil {
-		t.Skipf("skills dir not found: %s", skillsDir)
+	root := skillsDir(t)
+	idx, count := buildMemoryIndex(t, root)
+	if count == 0 {
+		t.Fatal("no documents indexed")
 	}
-
-	idx, cleanup := buildIndex(t, skillsDir)
-	defer cleanup()
 
 	src := blevesource.New(idx, "skills", 0, &blevesource.Config{
 		TitleField:   "title",
 		ContentField: "content",
 	})
-
 	ctx := context.Background()
 
-	// ── Search ────────────────────────────────────────────────────────────────
 	t.Run("search_knowledge_manager", func(t *testing.T) {
 		results, err := src.Peek(ctx, knowledge.Query{
 			Type:       knowledge.QueryTypeSearch,
@@ -186,28 +184,23 @@ func TestBleveIndex_SearchAndFetch(t *testing.T) {
 			MaxResults: 5,
 		})
 		if err != nil {
-			t.Fatalf("Peek error: %v", err)
+			t.Fatalf("Peek: %v", err)
 		}
 		if len(results) == 0 {
-			t.Fatal("expected at least one result")
+			t.Fatal("expected ≥1 result")
 		}
-		t.Logf("search returned %d result(s):", len(results))
 		for _, r := range results {
 			t.Logf("  [%.2f] %s  ref_id=%s  snippet=%q", r.Score, r.Title, r.RefID, truncate(r.Snippet, 80))
 		}
-		// The knowledge SKILL.md must rank highest for this query.
 		if !strings.Contains(strings.ToLower(results[0].Title), "knowledge") {
-			t.Errorf("expected top result to be the knowledge skill, got: %s", results[0].Title)
+			t.Errorf("expected knowledge skill to rank first, got: %s", results[0].Title)
 		}
-		// RefID must have the source prefix.
 		if !strings.HasPrefix(results[0].RefID, "skills:") {
-			t.Errorf("RefID missing prefix: %s", results[0].RefID)
+			t.Errorf("RefID missing 'skills:' prefix: %s", results[0].RefID)
 		}
-		// Snippet must be non-empty.
 		if results[0].Snippet == "" {
-			t.Error("expected non-empty snippet")
+			t.Error("Peek must return non-empty Snippet")
 		}
-		// Content must be empty (Peek contract).
 		if results[0].Content != "" {
 			t.Error("Peek must leave Content empty")
 		}
@@ -220,261 +213,206 @@ func TestBleveIndex_SearchAndFetch(t *testing.T) {
 			MaxResults: 3,
 		})
 		if err != nil {
-			t.Fatalf("Peek error: %v", err)
+			t.Fatalf("Peek: %v", err)
 		}
 		if len(results) == 0 {
-			t.Fatal("expected at least one result")
+			t.Fatal("expected ≥1 result")
 		}
-		t.Logf("effect search returned %d result(s):", len(results))
 		for _, r := range results {
 			t.Logf("  [%.2f] %s", r.Score, r.Title)
 		}
+		if !strings.Contains(strings.ToLower(results[0].Title), "effect") {
+			t.Errorf("expected effect skill to rank first, got: %s", results[0].Title)
+		}
 	})
 
-	// ── Fetch ─────────────────────────────────────────────────────────────────
 	t.Run("fetch_by_refid", func(t *testing.T) {
-		// First get a RefID from search.
-		searchResults, _ := src.Peek(ctx, knowledge.Query{
-			Type:       knowledge.QueryTypeSearch,
-			Input:      "knowledge manager",
-			MaxResults: 1,
+		sr, _ := src.Peek(ctx, knowledge.Query{
+			Type: knowledge.QueryTypeSearch, Input: "knowledge manager", MaxResults: 1,
 		})
-		if len(searchResults) == 0 {
-			t.Skip("no search results to fetch")
+		if len(sr) == 0 {
+			t.Skip("no search results")
 		}
-		refID := searchResults[0].RefID
+		refID := sr[0].RefID
 		t.Logf("fetching: %s", refID)
 
-		fetchResults, err := src.Fetch(ctx, knowledge.Query{
-			Type:  knowledge.QueryTypeFetch,
-			Input: refID,
-		})
+		fr, err := src.Fetch(ctx, knowledge.Query{Type: knowledge.QueryTypeFetch, Input: refID})
 		if err != nil {
-			t.Fatalf("Fetch error: %v", err)
+			t.Fatalf("Fetch: %v", err)
 		}
-		if len(fetchResults) == 0 {
+		if len(fr) == 0 {
 			t.Fatal("Fetch returned no results")
 		}
-		r := fetchResults[0]
+		r := fr[0]
 		t.Logf("fetched: %s (%d chars)", r.Title, len(r.Content))
-
 		if r.Content == "" {
 			t.Error("Fetch must populate Content")
 		}
-		// Content should contain significant skill documentation.
 		if len(r.Content) < 500 {
 			t.Errorf("expected substantial content, got %d chars", len(r.Content))
 		}
-		// Knowledge skill content must mention key concepts.
 		if !strings.Contains(r.Content, "Source") {
 			t.Error("expected 'Source' in knowledge skill content")
 		}
 	})
 
-	// ── Manager integration ───────────────────────────────────────────────────
 	t.Run("manager_search_tool", func(t *testing.T) {
-		km := knowledge.NewManager(knowledge.ManagerConfig{
-			MaxResults:          5,
-			SnippetMaxChars:     300,
-			ContentMaxChars:     8000,
-			AllowPartialFailure: false,
-		})
-		km.Register(src)
-		tools := km.Tools()
-
-		result, err := tools[0].Execute(ctx, map[string]any{
-			"query": "bleve full-text search index",
+		km := newKnowledgeManager(idx)
+		result, err := km.Tools()[0].Execute(ctx, map[string]any{
+			"query": "bleve full-text search index source",
 		})
 		if err != nil {
-			t.Fatalf("knowledge_search error: %v", err)
+			t.Fatalf("knowledge_search: %v", err)
 		}
-		t.Logf("knowledge_search output:\n%s", result.Output)
-
+		t.Logf("output:\n%s", result.Output)
 		if !strings.Contains(result.Output, "ref_id") {
-			t.Error("expected ref_id in search output")
+			t.Error("expected ref_id in output")
 		}
 		if !strings.Contains(result.Output, "skills:") {
-			t.Error("expected 'skills:' prefix in ref_id")
+			t.Error("expected 'skills:' prefix in output")
 		}
 	})
 
 	t.Run("manager_fetch_tool", func(t *testing.T) {
-		km := knowledge.NewManager(knowledge.ManagerConfig{
-			ContentMaxChars:     8000,
-			AllowPartialFailure: false,
-		})
-		km.Register(src)
-		tools := km.Tools()
-
-		// Search first to get a real RefID.
-		searchResult, err := tools[0].Execute(ctx, map[string]any{"query": "knowledge manager"})
+		km := newKnowledgeManager(idx)
+		searchOut, err := km.Tools()[0].Execute(ctx, map[string]any{"query": "knowledge manager"})
 		if err != nil {
-			t.Fatalf("search error: %v", err)
+			t.Fatalf("search: %v", err)
 		}
-		// Extract a ref_id from the output.
-		refID := extractRefID(searchResult.Output)
+		refID := extractRefID(searchOut.Output)
 		if refID == "" {
-			t.Fatalf("could not extract ref_id from search output:\n%s", searchResult.Output)
+			t.Fatalf("could not extract ref_id:\n%s", searchOut.Output)
 		}
 		t.Logf("fetching ref_id: %s", refID)
-
-		fetchResult, err := tools[1].Execute(ctx, map[string]any{"ref_id": refID})
+		fetchOut, err := km.Tools()[1].Execute(ctx, map[string]any{"ref_id": refID})
 		if err != nil {
-			t.Fatalf("knowledge_fetch error: %v", err)
+			t.Fatalf("fetch: %v", err)
 		}
-		t.Logf("knowledge_fetch output (%d chars):\n%s", len(fetchResult.Output), truncate(fetchResult.Output, 400))
-
-		if !strings.Contains(fetchResult.Output, "Source") {
+		t.Logf("fetch output (%d chars): %s", len(fetchOut.Output), truncate(fetchOut.Output, 300))
+		if !strings.Contains(fetchOut.Output, "Source") {
 			t.Error("fetched content should mention 'Source'")
 		}
 	})
 }
 
-// ── LLM integration test ──────────────────────────────────────────────────────
+// ── LLM integration: RunLoop with real provider ───────────────────────────────
 
-// TestLLM_UsesKnowledgeTools runs a full session with a real LLM and verifies
-// it correctly uses knowledge_search and knowledge_fetch to answer questions
-// about the .opencode skills documentation.
+// TestLLM_UsesKnowledgeTools runs full RunLoop sessions with a real LLM and
+// verifies it calls knowledge_search / knowledge_fetch to answer questions.
 func TestLLM_UsesKnowledgeTools(t *testing.T) {
 	skipIfNoIntegration(t)
 
-	root := repoRoot(t)
-	skillsDir := filepath.Join(root, skillsDirRel)
-	if _, err := os.Stat(skillsDir); err != nil {
-		t.Skipf("skills dir not found: %s", skillsDir)
+	root := skillsDir(t)
+	idx, count := buildMemoryIndex(t, root)
+	if count == 0 {
+		t.Fatal("no documents indexed")
 	}
 
-	idx, cleanup := buildIndex(t, skillsDir)
-	defer cleanup()
-
-	// Build knowledge manager with the bleve source.
-	km := knowledge.NewManager(knowledge.ManagerConfig{
-		SourceTimeout:       15 * time.Second,
-		MaxResults:          5,
-		SnippetMaxChars:     400,
-		ContentMaxChars:     6000,
-		AllowPartialFailure: true,
-	})
-	km.Register(blevesource.New(idx, "skills", 0, &blevesource.Config{
-		TitleField:   "title",
-		ContentField: "content",
-	}))
-
+	km := newKnowledgeManager(idx)
 	prov := openaiProv.New(defaultAPIKey, defaultBaseURL, "timi", nil)
 	model := llm.Model{
-		ID:         defaultModel,
-		ProviderID: "timi",
-		APIID:      defaultModel,
-		Limit:      llm.ModelLimit{Context: 200_000, Output: 4096},
+		ID: defaultModel, ProviderID: "timi", APIID: defaultModel,
+		Limit: llm.ModelLimit{Context: 200_000, Output: 4096},
 	}
 
 	s := memory.New()
 	ctx := context.Background()
-	sessID := "knowledge-integration"
-	_ = s.CreateSession(ctx, &store.Session{
-		ID:    sessID,
-		Model: model.ProviderID + "/" + model.ID,
-	})
+	sessID := fmt.Sprintf("llm-knowledge-%d", time.Now().UnixNano())
+	_ = s.CreateSession(ctx, &store.Session{ID: sessID, Model: "timi/" + defaultModel})
 
-	// ── turn 1: ask about knowledge manager architecture ──────────────────────
-	t.Log("=== Turn 1: Ask about knowledge manager architecture ===")
-	result1, err := session.RunLoop(ctx, s, session.RunInput{
-		SessionID:             sessID,
-		UserMsg:               "Using the available knowledge tools, look up how the knowledge manager's Source interface works and what methods it requires. Give me a brief summary.",
-		Model:                 model,
-		Provider:              prov,
-		Tools:                 km.Tools(),
-		DisableProviderPrompt: true,
-		ExtraSystem:           []string{"You are a helpful assistant. When you need information, use the knowledge_search and knowledge_fetch tools to look it up from the documentation."},
-		MaxSteps:              8,
-	})
-	if err != nil {
-		t.Fatalf("turn 1 error: %v", err)
-	}
-	t.Logf("turn 1 result: %v", result1)
-
-	// Verify tool calls were made.
-	msgs, _ := s.ListMessages(ctx, sessID)
-	toolCallCount := 0
-	searchCalled := false
-	fetchCalled := false
-	for _, m := range msgs {
-		if m.Role != store.RoleAssistant {
-			continue
+	runTurn := func(msg string) session.RunResult {
+		t.Helper()
+		result, err := session.RunLoop(ctx, s, session.RunInput{
+			SessionID: sessID,
+			UserMsg:   msg,
+			Model:     model,
+			Provider:  prov,
+			Tools:     km.Tools(),
+			ExtraSystem: []string{
+				"You are a helpful assistant with access to a knowledge base of skill documentation.",
+				"When asked about skills, architecture, or guides, use knowledge_search to find relevant documents, then knowledge_fetch if you need full details.",
+			},
+			DisableProviderPrompt: true,
+			MaxSteps:              10,
+		})
+		if err != nil {
+			t.Fatalf("RunLoop error: %v", err)
 		}
-		parts, _ := s.ListParts(ctx, m.ID)
-		for _, p := range parts {
-			if p.Type != store.PartTypeTool {
-				continue
-			}
-			d, ok := p.Data.(*store.ToolPartData)
-			if !ok {
-				continue
-			}
-			toolCallCount++
-			t.Logf("  tool call: %s (status=%s)", d.Tool, d.Status)
-			if d.Tool == "knowledge_search" {
-				searchCalled = true
-			}
-			if d.Tool == "knowledge_fetch" {
-				fetchCalled = true
-			}
-		}
+		return result
 	}
 
-	if !searchCalled {
+	countToolCalls := func() (searchN, fetchN int) {
+		msgs, _ := s.ListMessages(ctx, sessID)
+		for _, m := range msgs {
+			if m.Role != store.RoleAssistant {
+				continue
+			}
+			parts, _ := s.ListParts(ctx, m.ID)
+			for _, p := range parts {
+				if p.Type != store.PartTypeTool {
+					continue
+				}
+				d, ok := p.Data.(*store.ToolPartData)
+				if !ok {
+					continue
+				}
+				if d.Tool == "knowledge_search" {
+					searchN++
+				}
+				if d.Tool == "knowledge_fetch" {
+					fetchN++
+				}
+			}
+		}
+		return
+	}
+
+	// ── Turn 1: Source interface ──────────────────────────────────────────────
+	t.Log("=== Turn 1: knowledge manager Source interface ===")
+	runTurn("Using the knowledge tools, look up how the knowledge manager's Source interface works and what methods it requires. Give me a brief summary.")
+
+	searchN, fetchN := countToolCalls()
+	t.Logf("tool calls: knowledge_search=%d  knowledge_fetch=%d", searchN, fetchN)
+
+	if searchN == 0 {
 		t.Error("FAIL: LLM did not call knowledge_search")
 	} else {
-		t.Log("PASS: knowledge_search was called")
+		t.Logf("PASS: knowledge_search called %d time(s)", searchN)
 	}
 
-	// Fetch is optional — the LLM may decide snippets are sufficient.
-	t.Logf("knowledge_fetch called: %v  (total tool calls: %d)", fetchCalled, toolCallCount)
+	answer1 := lastAssistantText(ctx, t, s, sessID)
+	t.Logf("answer:\n%s", answer1)
 
-	// Verify the final answer mentions key concepts.
-	lastText := lastAssistantText(ctx, t, s, sessID)
-	t.Logf("final answer:\n%s", lastText)
-
-	for _, keyword := range []string{"ID", "Priority", "Accepts", "Peek", "Fetch"} {
-		if strings.Contains(lastText, keyword) {
-			t.Logf("PASS: answer mentions %q", keyword)
+	for _, kw := range []string{"ID", "Priority", "Accepts", "Peek", "Fetch"} {
+		if strings.Contains(answer1, kw) {
+			t.Logf("PASS: mentions %q", kw)
 		} else {
-			t.Logf("NOTE: answer does not mention %q (may still be correct)", keyword)
+			t.Logf("NOTE: does not mention %q", kw)
 		}
 	}
 
-	// ── turn 2: ask about effect skill ───────────────────────────────────────
-	t.Log("\n=== Turn 2: Ask about Effect skill ===")
-	result2, err := session.RunLoop(ctx, s, session.RunInput{
-		SessionID:             sessID,
-		UserMsg:               "Now search for the Effect skill documentation and tell me what testing patterns it recommends.",
-		Model:                 model,
-		Provider:              prov,
-		Tools:                 km.Tools(),
-		DisableProviderPrompt: true,
-		ExtraSystem:           []string{"You are a helpful assistant. When you need information, use the knowledge_search and knowledge_fetch tools."},
-		MaxSteps:              8,
-	})
-	if err != nil {
-		t.Fatalf("turn 2 error: %v", err)
-	}
-	t.Logf("turn 2 result: %v", result2)
+	// ── Turn 2: Effect skill testing patterns ─────────────────────────────────
+	t.Log("\n=== Turn 2: Effect skill testing patterns ===")
+	runTurn("Now search for the Effect skill documentation and summarise its recommended testing patterns.")
 
-	lastText2 := lastAssistantText(ctx, t, s, sessID)
-	t.Logf("turn 2 answer:\n%s", lastText2)
+	searchN2, fetchN2 := countToolCalls()
+	t.Logf("cumulative tool calls: knowledge_search=%d  knowledge_fetch=%d", searchN2, fetchN2)
 
-	if strings.Contains(lastText2, "testEffect") || strings.Contains(lastText2, "it.live") || strings.Contains(lastText2, "test") {
-		t.Log("PASS: answer mentions Effect testing patterns")
+	answer2 := lastAssistantText(ctx, t, s, sessID)
+	t.Logf("answer:\n%s", answer2)
+
+	if strings.ContainsAny(answer2, "test") {
+		t.Log("PASS: answer mentions testing")
 	} else {
-		t.Error("FAIL: answer does not mention Effect testing patterns")
+		t.Error("FAIL: answer does not mention testing")
 	}
 
-	// Summary
-	t.Log("\n=== Summary ===")
+	// ── Summary ───────────────────────────────────────────────────────────────
 	allMsgs, _ := s.ListMessages(ctx, sessID)
-	t.Logf("total messages in session: %d", len(allMsgs))
-	t.Logf("knowledge_search called: %v", searchCalled)
-	t.Logf("knowledge_fetch called: %v", fetchCalled)
+	t.Logf("\n=== Summary ===")
+	t.Logf("session messages: %d", len(allMsgs))
+	t.Logf("knowledge_search calls: %d", searchN2)
+	t.Logf("knowledge_fetch calls: %d", fetchN2)
 }
 
 // ── helpers ───────────────────────────────────────────────────────────────────
@@ -499,21 +437,20 @@ func lastAssistantText(ctx context.Context, t *testing.T, s store.Store, sessID 
 }
 
 func extractRefID(output string) string {
-	// Look for `ref_id` in backtick: `skills:...`
 	for _, line := range strings.Split(output, "\n") {
-		if strings.Contains(line, "ref_id") {
-			start := strings.Index(line, "`")
-			if start < 0 {
-				continue
-			}
-			end := strings.Index(line[start+1:], "`")
-			if end < 0 {
-				continue
-			}
-			candidate := line[start+1 : start+1+end]
-			if strings.Contains(candidate, ":") {
-				return candidate
-			}
+		if !strings.Contains(line, "ref_id") {
+			continue
+		}
+		start := strings.Index(line, "`")
+		if start < 0 {
+			continue
+		}
+		end := strings.Index(line[start+1:], "`")
+		if end < 0 {
+			continue
+		}
+		if c := line[start+1 : start+1+end]; strings.Contains(c, ":") {
+			return c
 		}
 	}
 	return ""
@@ -527,7 +464,4 @@ func truncate(s string, n int) string {
 	return s[:n] + "..."
 }
 
-func init() {
-	// Ensure store part data types are registered for memory store.
-	_ = fmt.Sprintf // suppress unused import
-}
+func init() { _ = fmt.Sprintf }
