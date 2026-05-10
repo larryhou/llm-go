@@ -4,6 +4,7 @@ package anthropic
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -203,8 +204,11 @@ func userBlocks(parts []llm.ContentPart) ([]anthropic.ContentBlockParamUnion, er
 				blocks = append(blocks, anthropic.NewTextBlock(p.Text))
 			}
 		case llm.PartTypeImage:
-			if p.URL != "" {
-				blocks = append(blocks, anthropic.NewImageBlockBase64(p.MediaType, p.URL))
+			if len(p.Data) > 0 {
+				encoded := base64.StdEncoding.EncodeToString(p.Data)
+				blocks = append(blocks, anthropic.NewImageBlockBase64(p.MediaType, encoded))
+			} else if p.URL != "" {
+				blocks = append(blocks, anthropic.NewImageBlock(anthropic.URLImageSourceParam{URL: p.URL}))
 			}
 		}
 	}
