@@ -31,7 +31,8 @@ github.com/larryhou/llm-go/
     ├── context.go     ToModelMessages() — store records → llm.Message[]
     ├── compaction.go  Context overflow: Select(), Compact(), Prune()
     ├── prompt.go      RunLoop() — main agentic loop
-    └── system.go      Per-provider system prompt selection (embedded .txt files)
+    ├── system.go      Per-provider system prompt selection (embedded .txt files)
+    └── max-steps.txt  Prefilled assistant prompt injected on the last agentic step
 ```
 
 ### Data Flow
@@ -147,6 +148,31 @@ flowchart LR
     TailStart --> Head["head = msgs[:tailStartIdx]\n→ summarised by LLM"]
     TailStart --> Tail["tail → preserved verbatim"]
 ```
+
+### MaxSteps — graceful termination
+
+When `RunInput.MaxSteps > 0` and `step >= MaxSteps`, the loop does **not** terminate silently. Instead, aligned with `opencode/src/session/prompt.ts` `isLastStep` handling:
+
+1. A prefilled `role: "assistant"` message with `session.PromptMaxSteps` content is appended to `modelMsgs` — the LLM sees its "own" opening and continues naturally with a text summary.
+2. `tools` is set to `nil` — the provider receives no tool definitions, forcing a text-only response.
+3. After this final LLM turn completes, the loop terminates regardless of `ProcessResult`.
+
+```go
+// session/prompt.go (simplified)
+isLastStep := input.MaxSteps > 0 && step >= input.MaxSteps
+
+if isLastStep {
+    modelMsgs = append(modelMsgs, llm.Message{
+        Role:    "assistant",
+        Content: []llm.ContentPart{{Type: "text", Text: PromptMaxSteps}},
+    })
+    tools = nil   // force text-only response
+}
+```
+
+`session.PromptMaxSteps` is exported from `session/system.go` (embedded from `session/max-steps.txt`).
+
+---
 
 ### Prune — tool output trimming
 
