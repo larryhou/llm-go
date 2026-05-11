@@ -33,6 +33,9 @@ var promptTrinity string
 //go:embed default.txt
 var promptDefault string
 
+//go:embed max-steps.txt
+var PromptMaxSteps string
+
 // SystemPromptForModel returns the appropriate system prompt for a given model.
 // Aligned with packages/opencode/src/session/system.ts provider().
 //

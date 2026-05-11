@@ -63,13 +63,17 @@ func envOr(key, fallback string) string {
 // ── provider wrapper — tees events to a local channel ────────────────────────
 
 type replProvider struct {
-	inner llm.Provider
-	out   chan llm.Event
+	inner     llm.Provider
+	out       chan llm.Event
+	onRequest func(req llm.Request) // called once per Stream() invocation with the input request
 }
 
 func (p *replProvider) ID() string { return p.inner.ID() }
 
 func (p *replProvider) Stream(ctx context.Context, req llm.Request) (<-chan llm.Event, error) {
+	if p.onRequest != nil {
+		p.onRequest(req)
+	}
 	inner, err := p.inner.Stream(ctx, req)
 	if err != nil {
 		return nil, err

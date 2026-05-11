@@ -123,27 +123,12 @@ func (s *webServer) handleChat(w http.ResponseWriter, r *http.Request) {
 		flusher.Flush()
 	}
 
-	// Per-request event channel.
-	evCh := make(chan llm.Event, 128)
-	prov := &replProvider{inner: s.app.prov.inner, out: evCh}
-
-	// Debug recording: collect all raw LLM events for this turn.
-	type eventRecord struct {
-		TS           int64  `json:"ts_ms"`
-		Type         string `json:"type"`
-		Text         string `json:"text,omitempty"`
-		ToolName     string `json:"tool_name,omitempty"`
-		ToolID       string `json:"tool_id,omitempty"`
-		Input        any    `json:"input,omitempty"`
-		Usage        any    `json:"usage,omitempty"`
-		FinishReason string `json:"finish_reason,omitempty"`
-		Error        string `json:"error,omitempty"`
-	}
+	// Debug recording: collect each LLM input request for this turn.
 	type turnRecord struct {
 		SessionID string        `json:"session_id"`
 		TS        string        `json:"ts"`
 		UserMsg   string        `json:"user_message"`
-		Events    []eventRecord `json:"events"`
+		Requests  []llm.Request `json:"requests"`
 		RunError  string        `json:"run_error,omitempty"`
 	}
 	rec := &turnRecord{
@@ -152,36 +137,23 @@ func (s *webServer) handleChat(w http.ResponseWriter, r *http.Request) {
 		UserMsg:   req.Message,
 	}
 
+	// Per-request event channel.
+	evCh := make(chan llm.Event, 128)
+	prov := &replProvider{
+		inner: s.app.prov.inner,
+		out:   evCh,
+	}
+	if s.debugDir != "" {
+		prov.onRequest = func(r llm.Request) {
+			rec.Requests = append(rec.Requests, r)
+		}
+	}
+
 	// Drain events → SSE in a goroutine while RunLoop blocks.
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
 		for ev := range evCh {
-			// Build event record for debug log.
-			if s.debugDir != "" {
-				er := eventRecord{TS: time.Now().UnixMilli(), Type: string(ev.Type)}
-				switch ev.Type {
-				case llm.EventTextDelta, llm.EventReasoningDelta:
-					er.Text = ev.Text
-				case llm.EventToolInputStart, llm.EventToolCall:
-					er.ToolName = ev.ToolName
-					er.ToolID = ev.ToolCallID
-					er.Input = ev.Input
-			case llm.EventStepFinish:
-				er.Usage = map[string]int{
-					"input":  ev.Usage.Input,
-					"output": ev.Usage.Output,
-					"total":  ev.Usage.Effective(),
-				}
-				er.FinishReason = string(ev.FinishReason)
-				case llm.EventError:
-					if ev.Err != nil {
-						er.Error = ev.Err.Error()
-					}
-				}
-				rec.Events = append(rec.Events, er)
-			}
-
 			switch ev.Type {
 			case llm.EventTextDelta:
 				if ev.Text != "" {
@@ -278,7 +250,7 @@ func (s *webServer) handleContext(w http.ResponseWriter, r *http.Request) {
 		Total   int           `json:"total_chars"`
 	}
 
-	const previewLen = 200
+	const previewLen = 2000
 	views := make([]msgView, 0, len(modelMsgs))
 	totalChars := 0
 	for _, m := range modelMsgs {

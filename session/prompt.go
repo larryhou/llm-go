@@ -115,9 +115,7 @@ func RunLoop(ctx context.Context, s store.Store, input RunInput) (RunResult, err
 	}
 	step := 0
 	for {
-		if input.MaxSteps > 0 && step >= input.MaxSteps {
-			return RunResultStop, nil
-		}
+		isLastStep := input.MaxSteps > 0 && step >= input.MaxSteps
 		step++
 
 		// Load all messages for context
@@ -133,6 +131,18 @@ func RunLoop(ctx context.Context, s store.Store, input RunInput) (RunResult, err
 		modelMsgs, err := ToModelMessages(msgs, allParts)
 		if err != nil {
 			return RunResultStop, fmt.Errorf("runloop: build messages: %w", err)
+		}
+
+		// On the last step, append a prefilled assistant message instructing the
+		// LLM to summarise instead of calling more tools — aligned with
+		// opencode packages/opencode/src/session/prompt.ts isLastStep handling.
+		if isLastStep {
+			modelMsgs = append(modelMsgs, llm.Message{
+				Role: "assistant",
+				Content: []llm.ContentPart{
+					{Type: "text", Text: PromptMaxSteps},
+				},
+			})
 		}
 
 		// Build system prompt
@@ -152,13 +162,19 @@ func RunLoop(ctx context.Context, s store.Store, input RunInput) (RunResult, err
 			return RunResultStop, fmt.Errorf("runloop: create assistant message: %w", err)
 		}
 
+		// On the last step, disable tools so the LLM is forced to respond in text.
+		tools := input.Tools
+		if isLastStep {
+			tools = nil
+		}
+
 		// Run one LLM turn
 		result, err := processor.Process(ctx, assistantMsgID, ProcessInput{
 			SessionID: input.SessionID,
 			Model:     input.Model,
 			System:    system,
 			Messages:  modelMsgs,
-			Tools:     input.Tools,
+			Tools:     tools,
 			Provider:  input.Provider,
 			Config:    input.Config,
 		})
@@ -210,6 +226,10 @@ func RunLoop(ctx context.Context, s store.Store, input RunInput) (RunResult, err
 			continue
 
 		case ProcessContinue:
+			// Last step always terminates — the LLM has been asked to summarise.
+			if isLastStep {
+				return RunResultStop, nil
+			}
 			// Check if the last assistant message finished with tool calls.
 			// If so, continue the loop to let the LLM process tool results.
 			// Note: allParts was loaded before assistantMsgID was created, so

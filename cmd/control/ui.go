@@ -65,7 +65,7 @@ const uiHTML = `<!DOCTYPE html>
   #messages::-webkit-scrollbar-thumb { background: var(--overlay); border-radius: 3px; }
 
   /* context panel */
-  #ctx-panel { display: none; position: fixed; top: 0; right: 0; width: 560px; height: 100vh; background: var(--surface); border-left: 1px solid var(--overlay); z-index: 100; flex-direction: column; }
+  #ctx-panel { display: none; position: fixed; top: 0; right: 0; width: 600px; height: 100vh; background: var(--surface); border-left: 1px solid var(--overlay); z-index: 100; flex-direction: column; overflow: hidden; }
   #ctx-panel.open { display: flex; }
   #ctx-head { padding: 10px 14px; background: var(--overlay); display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
   #ctx-head h2 { font-size: 13px; color: var(--mauve); flex: 1; margin: 0; }
@@ -74,21 +74,27 @@ const uiHTML = `<!DOCTYPE html>
   #ctx-close { background: none; border: none; color: var(--subtext); cursor: pointer; font-size: 18px; line-height: 1; padding: 0 4px; }
   #ctx-close:hover { color: var(--text); }
   #ctx-meta { padding: 6px 14px; font-size: 11px; color: var(--subtext); border-bottom: 1px solid var(--overlay); flex-shrink: 0; }
-  #ctx-body { flex: 1; overflow-y: auto; padding: 10px 14px; display: flex; flex-direction: column; gap: 6px; }
+  #ctx-body { flex: 1; min-height: 0; overflow-y: auto; padding: 10px 14px; display: flex; flex-direction: column; gap: 6px; }
   #ctx-body::-webkit-scrollbar { width: 6px; }
+  #ctx-body::-webkit-scrollbar-track { background: transparent; }
   #ctx-body::-webkit-scrollbar-thumb { background: var(--overlay); border-radius: 3px; }
-  .ctx-msg { border: 1px solid var(--overlay); border-radius: 6px; overflow: hidden; }
-  .ctx-msg-head { padding: 4px 10px; font-size: 11px; display: flex; gap: 8px; align-items: center; background: var(--bg); cursor: pointer; user-select: none; }
+  .ctx-msg { border: 1px solid var(--overlay); border-radius: 6px; overflow: hidden; flex-shrink: 0; }
+  .ctx-msg-head { padding: 6px 10px; font-size: 11px; display: flex; gap: 8px; align-items: center; background: var(--bg); cursor: pointer; user-select: none; }
   .ctx-msg-head:hover { background: var(--overlay); }
   .ctx-role { font-weight: bold; }
   .ctx-role.user { color: var(--mauve); }
   .ctx-role.assistant { color: var(--green); }
   .ctx-role.tool { color: var(--yellow); }
   .ctx-chars { color: var(--subtext); margin-left: auto; font-size: 10px; }
-  .ctx-toggle-icon { color: var(--subtext); font-size: 10px; }
-  .ctx-parts { padding: 6px 10px; display: flex; flex-direction: column; gap: 6px; border-top: 1px solid var(--overlay); }
-  .ctx-part-type { font-size: 10px; color: var(--teal); margin-bottom: 2px; }
-  .ctx-part-preview { font-size: 11px; color: var(--subtext); white-space: pre-wrap; word-break: break-all; max-height: 120px; overflow-y: auto; }
+  .ctx-toggle-icon { color: var(--subtext); font-size: 10px; transition: transform .15s; }
+  .ctx-parts { padding: 8px 10px; display: flex; flex-direction: column; gap: 8px; border-top: 1px solid var(--overlay); }
+  .ctx-part { border: 1px solid var(--overlay); border-radius: 4px; overflow: hidden; }
+  .ctx-part-type { font-size: 10px; color: var(--teal); padding: 3px 8px; background: var(--bg); cursor: pointer; user-select: none; display: flex; justify-content: space-between; align-items: center; }
+  .ctx-part-type:hover { background: var(--overlay); }
+  .ctx-part-preview { font-size: 11px; color: var(--subtext); white-space: pre-wrap; word-break: break-all; padding: 6px 8px; max-height: 300px; overflow-y: auto; display: none; }
+  .ctx-part-preview.open { display: block; }
+  .ctx-part-preview::-webkit-scrollbar { width: 4px; }
+  .ctx-part-preview::-webkit-scrollbar-thumb { background: var(--overlay); border-radius: 2px; }
 </style>
 </head>
 <body>
@@ -216,15 +222,29 @@ async function loadContext() {
 
       for (const p of (msg.content || [])) {
         const item = document.createElement('div');
+        item.className = 'ctx-part';
+
         const typeEl = document.createElement('div');
         typeEl.className = 'ctx-part-type';
-        typeEl.textContent = p.type + ' · ' + p.chars.toLocaleString() + ' chars';
+        const typeLabel = document.createElement('span');
+        typeLabel.textContent = p.type + ' · ' + p.chars.toLocaleString() + ' chars';
+        const typeIcon = document.createElement('span');
+        typeIcon.textContent = '▶';
+        typeIcon.style.fontSize = '9px';
+        typeEl.appendChild(typeLabel);
+        typeEl.appendChild(typeIcon);
         item.appendChild(typeEl);
+
         if (p.preview) {
           const prev = document.createElement('div');
           prev.className = 'ctx-part-preview';
           prev.textContent = p.preview;
           item.appendChild(prev);
+
+          typeEl.addEventListener('click', () => {
+            const open = prev.classList.toggle('open');
+            typeIcon.textContent = open ? '▼' : '▶';
+          });
         }
         partsEl.appendChild(item);
       }
