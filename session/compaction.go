@@ -349,7 +349,7 @@ func buildAssistantPartsWithOpts(m *store.Message, ps []*store.Part, opts ToMode
 	for _, p := range ps {
 		switch p.Type {
 		case store.PartTypeText:
-			d, ok := p.Data.(*store.TextPartData)
+			d, ok := store.DataAs[*store.TextPartData](p)
 			if !ok {
 				continue
 			}
@@ -360,7 +360,7 @@ func buildAssistantPartsWithOpts(m *store.Message, ps []*store.Part, opts ToMode
 			assistantParts = append(assistantParts, llm.NewTextPart(text))
 
 		case store.PartTypeReasoning:
-			d, ok := p.Data.(*store.ReasoningPartData)
+			d, ok := store.DataAs[*store.ReasoningPartData](p)
 			if !ok || opts.StripMedia {
 				continue
 			}
@@ -369,7 +369,7 @@ func buildAssistantPartsWithOpts(m *store.Message, ps []*store.Part, opts ToMode
 			}
 
 		case store.PartTypeTool:
-			d, ok := p.Data.(*store.ToolPartData)
+			d, ok := store.DataAs[*store.ToolPartData](p)
 			if !ok {
 				continue
 			}
@@ -460,7 +460,7 @@ func Prune(ctx context.Context, sessionID string, s store.Store, cfg *config.Inf
 			if p.Type != store.PartTypeTool {
 				continue
 			}
-			d, ok := p.Data.(*store.ToolPartData)
+			d, ok := store.DataAs[*store.ToolPartData](p)
 			if !ok || d.Status != store.ToolStatusCompleted || d.Compacted > 0 {
 				continue
 			}

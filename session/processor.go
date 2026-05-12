@@ -404,7 +404,7 @@ func (s *processorState) cleanup(ctx context.Context) {
 		if err != nil {
 			continue
 		}
-		data, ok := p.Data.(*store.ToolPartData)
+		data, ok := store.DataAs[*store.ToolPartData](p)
 		if !ok || data.Status == store.ToolStatusCompleted || data.Status == store.ToolStatusError {
 			continue
 		}
@@ -449,7 +449,7 @@ func (s *processorState) updateToolRunning(ctx context.Context, partID, toolName
 	if err != nil {
 		return err
 	}
-	existing, _ := p.Data.(*store.ToolPartData)
+	existing, _ := store.DataAs[*store.ToolPartData](p)
 	start := nowMS()
 	if existing != nil && existing.TimeStart > 0 {
 		start = existing.TimeStart
@@ -469,7 +469,7 @@ func (s *processorState) updateToolCompleted(ctx context.Context, partID, toolNa
 	if err != nil {
 		return err
 	}
-	existing, _ := p.Data.(*store.ToolPartData)
+	existing, _ := store.DataAs[*store.ToolPartData](p)
 	start := nowMS()
 	if existing != nil && existing.TimeStart > 0 {
 		start = existing.TimeStart
@@ -493,7 +493,7 @@ func (s *processorState) updateToolStatus(ctx context.Context, partID, status st
 	if err != nil {
 		return err
 	}
-	existing, _ := p.Data.(*store.ToolPartData)
+	existing, _ := store.DataAs[*store.ToolPartData](p)
 	data := &store.ToolPartData{Status: status}
 	if existing != nil {
 		data = existing

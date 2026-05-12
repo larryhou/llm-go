@@ -73,7 +73,7 @@ func buildUserParts(ps []*store.Part) []llm.ContentPart {
 	for _, p := range ps {
 		switch p.Type {
 		case store.PartTypeText:
-			d, ok := p.Data.(*store.TextPartData)
+			d, ok := store.DataAs[*store.TextPartData](p)
 			if !ok {
 				continue
 			}
@@ -100,7 +100,7 @@ func buildAssistantParts(m *store.Message, ps []*store.Part) ([]llm.ContentPart,
 	for _, p := range ps {
 		switch p.Type {
 		case store.PartTypeText:
-			d, ok := p.Data.(*store.TextPartData)
+			d, ok := store.DataAs[*store.TextPartData](p)
 			if !ok {
 				continue
 			}
@@ -111,7 +111,7 @@ func buildAssistantParts(m *store.Message, ps []*store.Part) ([]llm.ContentPart,
 			assistantParts = append(assistantParts, llm.NewTextPart(text))
 
 		case store.PartTypeReasoning:
-			d, ok := p.Data.(*store.ReasoningPartData)
+			d, ok := store.DataAs[*store.ReasoningPartData](p)
 			if !ok {
 				continue
 			}
@@ -120,7 +120,7 @@ func buildAssistantParts(m *store.Message, ps []*store.Part) ([]llm.ContentPart,
 			}
 
 		case store.PartTypeTool:
-			d, ok := p.Data.(*store.ToolPartData)
+			d, ok := store.DataAs[*store.ToolPartData](p)
 			if !ok {
 				continue
 			}
@@ -181,12 +181,12 @@ func buildToolResult(d *store.ToolPartData) *llm.ToolResult {
 func hasRealContent(ps []*store.Part) bool {
 	for _, p := range ps {
 		if p.Type == store.PartTypeText {
-			if d, ok := p.Data.(*store.TextPartData); ok && d.Text != "" {
+			if d, ok := store.DataAs[*store.TextPartData](p); ok && d.Text != "" {
 				return true
 			}
 		}
 		if p.Type == store.PartTypeReasoning {
-			if d, ok := p.Data.(*store.ReasoningPartData); ok && d.Text != "" {
+			if d, ok := store.DataAs[*store.ReasoningPartData](p); ok && d.Text != "" {
 				return true
 			}
 		}

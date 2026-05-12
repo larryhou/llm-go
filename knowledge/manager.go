@@ -130,6 +130,12 @@ func (m *Manager) peek(ctx context.Context, q Query) ([]Result, error) {
 	if m.cfg.MaxResults > 0 && len(accumulated) > m.cfg.MaxResults {
 		accumulated = accumulated[:m.cfg.MaxResults]
 	}
+	// Final global sort by score descending so results from lower-priority
+	// groups that scored higher than the tail of a higher-priority group
+	// are surfaced correctly.
+	sort.Slice(accumulated, func(i, j int) bool {
+		return accumulated[i].Score > accumulated[j].Score
+	})
 	return accumulated, nil
 }
 

@@ -154,3 +154,17 @@ type RetryPartData struct {
 	Attempt int
 	Message string
 }
+
+// DataAs extracts the typed payload from a Part.
+// It centralises the runtime type assertion so callers get a single point
+// of failure rather than 14 silent ok=false branches scattered across the
+// session package. When the assertion fails (e.g. after a JSON round-trip
+// through a SQL store), the zero value is returned with ok=false.
+//
+// Usage:
+//
+//	d, ok := store.DataAs[*store.ToolPartData](p)
+func DataAs[T any](p *Part) (T, bool) {
+	v, ok := p.Data.(T)
+	return v, ok
+}
