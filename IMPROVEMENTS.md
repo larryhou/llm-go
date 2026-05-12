@@ -233,22 +233,8 @@ func Select(msgs []*store.Message, parts map[string][]*store.Part, model llm.Mod
 
 ### 11. `Prune()` is implemented but never called — `session/compaction.go` / `session/prompt.go`
 
-**Location:** `compaction.go:417`, `prompt.go:201–208`
-**Severity:** **Low** — dead code, intended feature not reachable by default.
-
-`Prune()` is called in `RunLoop` only when `result == ProcessStop` and the
-config explicitly sets `cfg.compaction.prune = true`. The default value is
-`false`, so Prune is effectively dead code in all standard deployments. It is
-documented as a "lighter alternative to full compaction" but has no integration
-into the compaction decision path. There is also no code path that falls back
-to Prune when Compact fails or when token savings would be sufficient without
-a full summary.
-
-**Fix (option A):** integrate Prune as a pre-compaction step — try Prune first;
-only run full Compact if Prune cannot free enough tokens.
-
-**Fix (option B):** document the opt-in explicitly and add an integration test
-that exercises the `prune=true` path to prevent silent bit-rot.
+**Location:** `compaction.go:424`, `prompt.go:198–208`
+**Status:** **FIXED** — `RunLoop` fires a goroutine calling `Prune()` on every `ProcessStop`. `Prune()` guards with `cfg.Compaction.Prune` (opt-in, default false), so the call is always made but is a no-op unless explicitly enabled via `cfg.compaction.prune = true`.
 
 ---
 
@@ -356,7 +342,7 @@ sort.Slice(accumulated, func(i, j int) bool {
 | 10 | `session` | `processorState` concurrent map access — data race under concurrent tools | Medium | Open |
 | 11 | `session` | `RunLoop` reloads all messages on every agentic step — unnecessary I/O | Medium | Open |
 | 12 | `session` | `Select()` uses position heuristic for compaction boundary detection | Low | Open |
-| 13 | `session` | `Prune()` never called by default — dead feature | Low | Open |
+| 13 | `session` | `Prune()` never called by default — dead feature | Low | **FIXED** |
 | 14 | `cmd` | `NewFromConfig` never called — `llm.json` provider config inert | Medium | **FIXED** |
 | 15 | `provider` | `Registry` never instantiated — extensibility blocked | Medium | **FIXED** |
 
@@ -372,6 +358,7 @@ sort.Slice(accumulated, func(i, j int) bool {
 | 4 | OpenAI `NewFromConfig` ignores extra headers | `provider/openai/openai.go` — reads `cfg.Options.Extra` |
 | 9 (old) | `NewFromConfig` never called in cmd | `cmd/control/main.go`, `cmd/knowledge-api/main.go` — registry wired |
 | 10 (old) | `provider.Registry` dead code | `provider/provider.go` — `RegisterFactory` + `BuildProvider` added |
+| 13 (orig) | `Prune()` dead code — never called | `prompt.go` — unconditional goroutine on `ProcessStop`; `Prune()` guards with opt-in flag internally |
 | 2 (orig) | `classifyStatus` case 529 unreachable | `error.go` — `case 529` now precedes `>= 500` |
 | 3 (orig) | `MaxOutputTokens` returns 0 for unset output | `overflow.go` — `fallback = 4096` added |
 | 4 (orig) | Anthropic image block uses wrong constructor | `anthropic.go` — `NewImageBlockBase64` / `NewImageBlock` correctly routed |
