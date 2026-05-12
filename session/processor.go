@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"sync"
 	"time"
 
 	"github.com/larryhou/llm-go/config"
@@ -88,6 +89,7 @@ func (p *Processor) Process(ctx context.Context, assistantMsgID string, input Pr
 	client := llm.NewClient(input.Provider)
 	events := client.Stream(ctx, req)
 
+	toolCtx, toolCancel := context.WithCancel(ctx)
 	state := &processorState{
 		store:          p.store,
 		sessionID:      input.SessionID,
@@ -95,8 +97,10 @@ func (p *Processor) Process(ctx context.Context, assistantMsgID string, input Pr
 		toolMap:        toolMap,
 		cfg:            input.Config,
 		model:          input.Model,
+		toolCtx:        toolCtx,
+		toolCancel:     toolCancel,
 		// track last N tool calls for doom-loop detection
-		recentCalls:    make([]recentCall, 0, DoomLoopThreshold),
+		recentCalls: make([]recentCall, 0, DoomLoopThreshold),
 	}
 
 	result := ProcessContinue
@@ -138,13 +142,23 @@ type processorState struct {
 	currentTextStart  int64
 
 	// current streaming reasoning part
-	currentReasoningPartID  string
-	currentReasoningBuf     string
-	currentReasoningStart   int64
+	currentReasoningPartID    string
+	currentReasoningBuf       string
+	currentReasoningStart     int64
 	currentReasoningSignature string
 
 	// active tool calls: callID -> partID
+	// protected by toolMu; written by handleEvent (main goroutine) and read
+	// by cleanup (main goroutine after stream ends). executeTool goroutines
+	// do NOT write to this map — they only read toolMap and call store methods.
+	toolMu          sync.Mutex
 	activeToolParts map[string]string
+
+	// toolCtx / toolCancel allow cleanup to cancel all in-flight tool goroutines.
+	// toolWg tracks when all goroutines have exited.
+	toolCtx    context.Context
+	toolCancel context.CancelFunc
+	toolWg     sync.WaitGroup
 
 	// doom-loop detection
 	recentCalls []recentCall
@@ -228,10 +242,14 @@ func (s *processorState) handleEvent(ctx context.Context, ev llm.Event) (Process
 		if err != nil {
 			return ProcessStop, err
 		}
+		s.toolMu.Lock()
 		s.activeToolParts[ev.ToolCallID] = id
+		s.toolMu.Unlock()
 
 	case llm.EventToolCall:
+		s.toolMu.Lock()
 		partID, ok := s.activeToolParts[ev.ToolCallID]
+		s.toolMu.Unlock()
 		if !ok {
 			break
 		}
@@ -247,8 +265,10 @@ func (s *processorState) handleEvent(ctx context.Context, ev llm.Event) (Process
 		inputMap := toInputMap(ev.Input)
 		_ = s.updateToolRunning(ctx, partID, ev.ToolName, ev.ToolCallID, inputMap)
 
-		// Execute the tool
-		go s.executeTool(ctx, ev.ToolCallID, ev.ToolName, partID, inputMap)
+		// Execute the tool in a goroutine tracked by toolWg.
+		// Use toolCtx so cleanup() can cancel all in-flight goroutines.
+		s.toolWg.Add(1)
+		go s.executeTool(s.toolCtx, ev.ToolCallID, ev.ToolName, partID, inputMap)
 
 	case llm.EventToolResult:
 		// Tool results are normally handled asynchronously via executeTool goroutines.
@@ -258,7 +278,9 @@ func (s *processorState) handleEvent(ctx context.Context, ev llm.Event) (Process
 			ev.ToolName, ev.ToolCallID)
 
 	case llm.EventToolError:
+		s.toolMu.Lock()
 		partID, ok := s.activeToolParts[ev.ToolCallID]
+		s.toolMu.Unlock()
 		if !ok {
 			break
 		}
@@ -294,6 +316,8 @@ func (s *processorState) handleEvent(ctx context.Context, ev llm.Event) (Process
 
 // executeTool runs a tool and updates the part with the result.
 func (s *processorState) executeTool(ctx context.Context, callID, toolName, partID string, input map[string]any) {
+	defer s.toolWg.Done()
+
 	t, ok := s.toolMap[toolName]
 	if !ok {
 		_ = s.updateToolStatus(ctx, partID, store.ToolStatusError, nil, fmt.Sprintf("tool %q not found", toolName))
@@ -347,23 +371,44 @@ func (s *processorState) cleanup(ctx context.Context) {
 		s.currentReasoningPartID = ""
 	}
 
-	// Give in-flight tool calls a brief grace period (250ms), then mark as interrupted
-	if len(s.activeToolParts) > 0 {
-		deadline := time.Now().Add(250 * time.Millisecond)
-		for callID, partID := range s.activeToolParts {
-			_ = callID
-			timeoutCtx, cancel := context.WithDeadline(ctx, deadline)
-			p, err := s.store.GetPart(timeoutCtx, partID)
-			cancel()
-			if err != nil {
-				continue
-			}
-			data, ok := p.Data.(*store.ToolPartData)
-			if !ok || data.Status == store.ToolStatusCompleted || data.Status == store.ToolStatusError {
-				continue
-			}
-			_ = s.updateToolStatus(ctx, partID, store.ToolStatusError, map[string]any{"interrupted": true}, "Tool execution aborted")
+	// Cancel all in-flight tool goroutines, then wait up to 250ms for them to exit.
+	// A single shared deadline avoids the N×250ms problem: total wait is at most
+	// 250ms regardless of how many tools are running.
+	if s.toolCancel != nil {
+		s.toolCancel()
+	}
+
+	waitDone := make(chan struct{})
+	go func() {
+		s.toolWg.Wait()
+		close(waitDone)
+	}()
+	select {
+	case <-waitDone:
+		// all goroutines finished cleanly
+	case <-time.After(250 * time.Millisecond):
+		// timed out — goroutines are cancelled but may not have exited yet
+	}
+
+	// Mark any parts that are still pending/running as interrupted.
+	// Use the original context (not toolCtx which is already cancelled).
+	s.toolMu.Lock()
+	activeSnapshot := make(map[string]string, len(s.activeToolParts))
+	for k, v := range s.activeToolParts {
+		activeSnapshot[k] = v
+	}
+	s.toolMu.Unlock()
+
+	for _, partID := range activeSnapshot {
+		p, err := s.store.GetPart(ctx, partID)
+		if err != nil {
+			continue
 		}
+		data, ok := p.Data.(*store.ToolPartData)
+		if !ok || data.Status == store.ToolStatusCompleted || data.Status == store.ToolStatusError {
+			continue
+		}
+		_ = s.updateToolStatus(ctx, partID, store.ToolStatusError, map[string]any{"interrupted": true}, "Tool execution aborted")
 	}
 }
 

@@ -228,12 +228,13 @@ func (c *Compactor) Compact(ctx context.Context, sessionID string, input Process
 
 	now := time.Now()
 
-	// Step 1: Insert a compaction boundary user message.
-	// This must be created BEFORE the summary assistant message so that
-	// ListMessages (insertion-ordered) sees:
-	//   [compactionUserMsg / CompactionPart]  ← FilterCompacted anchor
-	//   [summaryAssistantMsg / summary=true]  ← LLM summary
-	//   [subsequent turns...]
+	// Step 1: Insert a compaction boundary user message WITHOUT the CompactionPart.
+	// The boundary must be in the store BEFORE the summary message so that
+	// ListMessages (insertion-ordered) returns them in the correct order for
+	// FilterCompacted. However, FilterCompacted identifies a boundary by the
+	// presence of a PartTypeCompaction part — so until Step 4 writes that part,
+	// this message is invisible to FilterCompacted. If the LLM call fails,
+	// the boundary stays part-less and history is fully preserved.
 	compactionMsgID := newID()
 	if err := c.store.CreateMessage(ctx, &store.Message{
 		ID:        compactionMsgID,
@@ -244,17 +245,9 @@ func (c *Compactor) Compact(ctx context.Context, sessionID string, input Process
 	}); err != nil {
 		return "", fmt.Errorf("compaction: create boundary message: %w", err)
 	}
-	if err := c.store.CreatePart(ctx, &store.Part{
-		ID:        newID(),
-		MessageID: compactionMsgID,
-		SessionID: sessionID,
-		Type:      store.PartTypeCompaction,
-		Data:      &store.CompactionPartData{},
-	}); err != nil {
-		return "", fmt.Errorf("compaction: create boundary part: %w", err)
-	}
 
 	// Step 2: Create the summary assistant message placeholder.
+	// Process() will write the LLM output parts to this message ID.
 	summaryMsgID := newID()
 	if err := c.store.CreateMessage(ctx, &store.Message{
 		ID:        summaryMsgID,
@@ -296,6 +289,20 @@ func (c *Compactor) Compact(ctx context.Context, sessionID string, input Process
 	}
 	if result == ProcessCompact {
 		return "", fmt.Errorf("compaction: context overflow during summary generation")
+	}
+
+	// Step 4: LLM succeeded — now attach the CompactionPart to the boundary message.
+	// Only after this write does FilterCompacted recognise the boundary as an anchor.
+	// Any failure here is non-fatal: the summary already exists and the next
+	// FilterCompacted call will simply not see it as a compaction pair.
+	if err := c.store.CreatePart(ctx, &store.Part{
+		ID:        newID(),
+		MessageID: compactionMsgID,
+		SessionID: sessionID,
+		Type:      store.PartTypeCompaction,
+		Data:      &store.CompactionPartData{},
+	}); err != nil {
+		return "", fmt.Errorf("compaction: create boundary part: %w", err)
 	}
 
 	return summaryMsgID, nil
