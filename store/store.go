@@ -107,6 +107,7 @@ type TextPartData struct {
 // ReasoningPartData holds data for a reasoning/thinking part.
 type ReasoningPartData struct {
 	Text      string
+	Signature string
 	TimeStart int64
 	TimeEnd   int64
 }

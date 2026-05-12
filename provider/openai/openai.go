@@ -54,6 +54,7 @@ func NewFromConfig(pid string, envVars []string, cfg *config.ProviderInfo, authS
 	}
 	apiKey, _ := auth.ResolveKey(pid, envVars, authStore)
 	baseURL := ""
+	var extraHeaders map[string]string
 
 	if cfg != nil {
 		if cfg.Options != nil {
@@ -67,15 +68,30 @@ func NewFromConfig(pid string, envVars []string, cfg *config.ProviderInfo, authS
 		if cfg.API != "" {
 			baseURL = cfg.API
 		}
+		if cfg.Options != nil && len(cfg.Options.Extra) > 0 {
+			extraHeaders = make(map[string]string)
+			for k, v := range cfg.Options.Extra {
+				if s, ok := v.(string); ok {
+					extraHeaders[k] = s
+				}
+			}
+		}
 	}
 
 	if apiKey == "" {
 		return nil, fmt.Errorf("%s: no API key found", pid)
 	}
-	return New(apiKey, baseURL, pid, nil), nil
+	return New(apiKey, baseURL, pid, extraHeaders), nil
 }
 
 func (p *Provider) ID() string { return p.providerID }
+
+// Factory is a provider.Factory-compatible function for this package.
+// It uses ProviderID and EnvVars as defaults.
+// Register it with a provider.Registry via registry.RegisterFactory(ProviderID, openai.Factory).
+var Factory = func(cfg *config.ProviderInfo, authStore *auth.Store) (llm.Provider, error) {
+	return NewFromConfig(ProviderID, EnvVars, cfg, authStore)
+}
 
 // Stream implements llm.Provider.
 func (p *Provider) Stream(ctx context.Context, req llm.Request) (<-chan llm.Event, error) {

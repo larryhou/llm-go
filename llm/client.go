@@ -70,6 +70,10 @@ func (c *Client) doStream(ctx context.Context, req Request, out chan<- Event, at
 		return false, true
 	}
 
+	// Buffer all events from this attempt; only flush to out once we receive
+	// EventRequestFinish. On retry, discard the buffer so the caller never
+	// sees a partial sequence from a failed attempt.
+	var buf []Event
 	var retryErr *LLMError
 	for ev := range events {
 		if ev.Type == EventError {
@@ -80,11 +84,18 @@ func (c *Client) doStream(ctx context.Context, req Request, out chan<- Event, at
 				}
 				break
 			}
+			// Fatal error — flush buffer then send error so caller gets context.
+			for _, buffered := range buf {
+				out <- buffered
+			}
 			out <- ev
 			return false, true
 		}
-		out <- ev
+		buf = append(buf, ev)
 		if ev.Type == EventRequestFinish {
+			for _, buffered := range buf {
+				out <- buffered
+			}
 			return false, true
 		}
 	}

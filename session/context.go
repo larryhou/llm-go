@@ -116,7 +116,7 @@ func buildAssistantParts(m *store.Message, ps []*store.Part) ([]llm.ContentPart,
 				continue
 			}
 			if d.Text != "" {
-				assistantParts = append(assistantParts, llm.NewReasoningPart(d.Text))
+				assistantParts = append(assistantParts, llm.NewReasoningPart(d.Text, d.Signature))
 			}
 
 		case store.PartTypeTool:

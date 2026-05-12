@@ -6,8 +6,14 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/larryhou/llm-go/auth"
+	"github.com/larryhou/llm-go/config"
 	"github.com/larryhou/llm-go/llm"
 )
+
+// Factory is a function that constructs a Provider from config + auth.
+// Each provider package registers one via Registry.RegisterFactory.
+type Factory func(cfg *config.ProviderInfo, authStore *auth.Store) (llm.Provider, error)
 
 // Capabilities describes what a model supports.
 type Capabilities struct {
@@ -68,19 +74,29 @@ type Info struct {
 	Models  map[string]*Model
 }
 
-// Registry holds all registered providers.
+// Registry holds all registered providers and their factories.
 type Registry struct {
 	providers map[string]*Info
+	factories map[string]Factory
 }
 
 // NewRegistry creates an empty registry.
 func NewRegistry() *Registry {
-	return &Registry{providers: make(map[string]*Info)}
+	return &Registry{
+		providers: make(map[string]*Info),
+		factories: make(map[string]Factory),
+	}
 }
 
-// Register adds or replaces a provider.
+// Register adds or replaces a provider info entry.
 func (r *Registry) Register(p *Info) {
 	r.providers[p.ID] = p
+}
+
+// RegisterFactory registers a constructor factory for a provider ID.
+// Call this once per provider package (e.g. from an init-style setup function).
+func (r *Registry) RegisterFactory(id string, f Factory) {
+	r.factories[id] = f
 }
 
 // Get returns the provider info for a given ID.
@@ -100,6 +116,17 @@ func (r *Registry) GetModel(providerID, modelID string) (*Model, error) {
 		return nil, fmt.Errorf("model %q not found in provider %q", modelID, providerID)
 	}
 	return m, nil
+}
+
+// BuildProvider instantiates a provider by ID using its registered factory.
+// cfg may be nil if no provider-specific config is available.
+// authStore may be nil; auth.ResolveKey handles nil gracefully.
+func (r *Registry) BuildProvider(id string, cfg *config.ProviderInfo, authStore *auth.Store) (llm.Provider, error) {
+	f, ok := r.factories[id]
+	if !ok {
+		return nil, fmt.Errorf("provider %q: no factory registered (call RegisterFactory first)", id)
+	}
+	return f(cfg, authStore)
 }
 
 // ParseModel splits "providerID/modelID" into its parts.

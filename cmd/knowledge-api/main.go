@@ -59,11 +59,14 @@ import (
 
 	bleve "github.com/blevesearch/bleve/v2"
 
+	"github.com/larryhou/llm-go/auth"
+	"github.com/larryhou/llm-go/config"
 	"github.com/larryhou/llm-go/knowledge"
 	blevesource "github.com/larryhou/llm-go/knowledge/source/bleve"
 	"github.com/larryhou/llm-go/llm"
 	anthropicProv "github.com/larryhou/llm-go/provider/anthropic"
 	openaiProv "github.com/larryhou/llm-go/provider/openai"
+	providerPkg "github.com/larryhou/llm-go/provider"
 	"github.com/larryhou/llm-go/session"
 	"github.com/larryhou/llm-go/store"
 	"github.com/larryhou/llm-go/store/memory"
@@ -113,6 +116,50 @@ func main() {
 		log.Fatal("flag -skills is required")
 	}
 
+	// Build provider registry.
+	registry := providerPkg.NewRegistry()
+	registry.RegisterFactory(anthropicProv.ProviderID, anthropicProv.Factory)
+	registry.RegisterFactory(openaiProv.ProviderID, openaiProv.Factory)
+	registry.RegisterFactory("timi", func(provCfg *config.ProviderInfo, a *auth.Store) (llm.Provider, error) {
+		return openaiProv.NewFromConfig("timi", nil, provCfg, a)
+	})
+
+	// Load file config + auth; CLI flags override.
+	fileCfg, _ := config.Load()
+	authStore, _ := auth.Load()
+
+	provCfgMap := map[string]*config.ProviderInfo{}
+	if fileCfg != nil {
+		for k, v := range fileCfg.Provider {
+			provCfgMap[k] = v
+		}
+	}
+	if cfg.apiKey != "" || cfg.baseURL != "" {
+		cliProvID := cfg.provider
+		if cliProvID == "openai" {
+			cliProvID = "timi"
+		}
+		existing := provCfgMap[cliProvID]
+		override := &config.ProviderInfo{}
+		if existing != nil {
+			*override = *existing
+		}
+		if override.Options == nil {
+			override.Options = &config.ProviderOptions{}
+		}
+		if cfg.apiKey != "" {
+			override.Options.APIKey = cfg.apiKey
+		}
+		if cfg.baseURL != "" {
+			if cfg.provider == "anthropic" {
+				override.API = strings.TrimSuffix(cfg.baseURL, "/v1")
+			} else {
+				override.API = cfg.baseURL
+			}
+		}
+		provCfgMap[cliProvID] = override
+	}
+
 	// Build in-memory Bleve index from skills directory.
 	idx, count, err := buildMemoryIndex(cfg.skillsDir)
 	if err != nil {
@@ -143,6 +190,9 @@ func main() {
 		km:           km,
 		sessionStore: sessionStore,
 		sessionCount: &sessionCount,
+		registry:     registry,
+		authStore:    authStore,
+		provCfgMap:   provCfgMap,
 		testTools:    buildTestTools(),
 	}
 
@@ -170,6 +220,11 @@ type server struct {
 	km           *knowledge.Manager
 	sessionStore store.Store
 	sessionCount *atomic.Int64
+
+	// provider registry and resolved config/auth — used in handleChat.
+	registry   *providerPkg.Registry
+	authStore  *auth.Store
+	provCfgMap map[string]*config.ProviderInfo
 
 	// active sessions: sessionID -> *chatSession
 	mu       sync.Mutex
@@ -371,19 +426,16 @@ func (s *server) handleChat(w http.ResponseWriter, r *http.Request) {
 	activeTools = wrappedTools
 
 	// Wrap the provider to intercept streaming events and forward to SSE.
-	var innerProv llm.Provider
-	var summaryProv llm.Provider
-	if s.cfg.provider == "openai" {
-		p := openaiProv.New(s.cfg.apiKey, s.cfg.baseURL, "timi", nil)
-		innerProv = p
-		summaryProv = p
-	} else {
-		p := anthropicProv.New(s.cfg.apiKey, s.cfg.baseURL, map[string]string{
-			"Authorization": "Bearer " + s.cfg.apiKey,
-		})
-		innerProv = p
-		summaryProv = p
+	providerID := s.cfg.provider
+	if providerID == "openai" {
+		providerID = "timi"
 	}
+	innerProv, buildErr := s.registry.BuildProvider(providerID, s.provCfgMap[providerID], s.authStore)
+	if buildErr != nil {
+		sendEvent(map[string]any{"type": "error", "error": buildErr.Error()})
+		return
+	}
+	summaryProv := innerProv
 	wrappedProv := &sseProvider{inner: innerProv, send: sendEvent}
 
 	contextLimit := 128_000
@@ -393,11 +445,6 @@ func (s *server) handleChat(w http.ResponseWriter, r *http.Request) {
 	maxSteps := s.cfg.maxSteps
 	if req.MaxSteps > 0 {
 		maxSteps = req.MaxSteps
-	}
-
-	providerID := "anthropic"
-	if s.cfg.provider == "openai" {
-		providerID = "timi"
 	}
 
 	model := llm.Model{

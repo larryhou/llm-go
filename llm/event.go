@@ -11,6 +11,7 @@ const (
 	EventTextDelta      EventType = "text-delta"
 	EventTextEnd        EventType = "text-end"
 	EventReasoningDelta EventType = "reasoning-delta"
+	EventReasoningEnd   EventType = "reasoning-end"
 	EventToolInputStart EventType = "tool-input-start"
 	EventToolInputDelta EventType = "tool-input-delta"
 	EventToolCall       EventType = "tool-call"       // complete tool call with parsed input
@@ -39,6 +40,9 @@ type Event struct {
 
 	// EventTextDelta, EventReasoningDelta
 	Text string
+
+	// EventReasoningEnd: Anthropic thinking block signature, must be echoed back
+	Signature string
 
 	// EventToolInputStart, EventToolInputDelta, EventToolCall, EventToolResult, EventToolError
 	ToolCallID string

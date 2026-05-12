@@ -48,6 +48,9 @@ type ContentPart struct {
 	// PartTypeText / PartTypeReasoning
 	Text string `json:"text,omitempty"`
 
+	// PartTypeReasoning: Anthropic thinking block signature, must be echoed back verbatim
+	Signature string `json:"signature,omitempty"`
+
 	// PartTypeToolCall
 	ToolCallID string `json:"toolCallId,omitempty"`
 	ToolName   string `json:"toolName,omitempty"`
@@ -130,8 +133,8 @@ func NewTextPart(text string) ContentPart {
 }
 
 // NewReasoningPart constructs a reasoning ContentPart.
-func NewReasoningPart(text string) ContentPart {
-	return ContentPart{Type: PartTypeReasoning, Text: text}
+func NewReasoningPart(text, signature string) ContentPart {
+	return ContentPart{Type: PartTypeReasoning, Text: text, Signature: signature}
 }
 
 // NewToolCallPart constructs a tool-call ContentPart.

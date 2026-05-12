@@ -75,6 +75,12 @@ func NewFromConfig(cfg *config.ProviderInfo, authStore *auth.Store) (*Provider, 
 
 func (p *Provider) ID() string { return ProviderID }
 
+// Factory is a provider.Factory-compatible function for this package.
+// Register it with a provider.Registry via registry.RegisterFactory(ProviderID, anthropic.Factory).
+var Factory = func(cfg *config.ProviderInfo, authStore *auth.Store) (llm.Provider, error) {
+	return NewFromConfig(cfg, authStore)
+}
+
 // Stream implements llm.Provider.
 func (p *Provider) Stream(ctx context.Context, req llm.Request) (<-chan llm.Event, error) {
 	params, err := buildParams(req)
@@ -252,7 +258,13 @@ func assistantBlocks(parts []llm.ContentPart) ([]anthropic.ContentBlockParamUnio
 			blocks = append(blocks, anthropic.NewToolUseBlock(p.ToolCallID, p.Input, p.ToolName))
 		case llm.PartTypeReasoning:
 			if p.Text != "" {
-				blocks = append(blocks, anthropic.NewTextBlock(p.Text))
+				blocks = append(blocks, anthropic.ContentBlockParamUnion{
+					OfThinking: &anthropic.ThinkingBlockParam{
+						Type:      "thinking",
+						Thinking:  p.Text,
+						Signature: p.Signature,
+					},
+				})
 			}
 		}
 	}
@@ -270,6 +282,8 @@ func runStream(ctx context.Context, stream *ssestream.Stream[anthropic.MessageSt
 	currentToolName := ""
 	var toolInputBuf []byte
 	inText := false
+	inReasoning := false
+	reasoningSignature := ""
 
 	for stream.Next() {
 		raw := stream.Current()
@@ -295,6 +309,9 @@ func runStream(ctx context.Context, stream *ssestream.Stream[anthropic.MessageSt
 					ToolCallID: currentToolID,
 					ToolName:   currentToolName,
 				}
+			case anthropic.ThinkingBlock:
+				reasoningSignature = block.Signature
+				inReasoning = true
 			}
 
 		case anthropic.ContentBlockDeltaEvent:
@@ -318,6 +335,10 @@ func runStream(ctx context.Context, stream *ssestream.Stream[anthropic.MessageSt
 			if inText {
 				out <- llm.Event{Type: llm.EventTextEnd}
 				inText = false
+			} else if inReasoning {
+				out <- llm.Event{Type: llm.EventReasoningEnd, Signature: reasoningSignature}
+				inReasoning = false
+				reasoningSignature = ""
 			} else if currentToolID != "" {
 				var input any
 				if len(toolInputBuf) > 0 {

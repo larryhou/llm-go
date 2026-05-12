@@ -24,12 +24,14 @@ import (
 
 	bleve "github.com/blevesearch/bleve/v2"
 
+	"github.com/larryhou/llm-go/auth"
 	llmconfig "github.com/larryhou/llm-go/config"
 	"github.com/larryhou/llm-go/knowledge"
 	blevesource "github.com/larryhou/llm-go/knowledge/source/bleve"
 	"github.com/larryhou/llm-go/llm"
 	anthropicProv "github.com/larryhou/llm-go/provider/anthropic"
 	openaiProv "github.com/larryhou/llm-go/provider/openai"
+	providerPkg "github.com/larryhou/llm-go/provider"
 	"github.com/larryhou/llm-go/session"
 	"github.com/larryhou/llm-go/store"
 	"github.com/larryhou/llm-go/store/memory"
@@ -233,17 +235,67 @@ func main() {
 
 	// ── provider ──────────────────────────────────────────────────────────────
 
-	var innerProv llm.Provider
-	providerID := "timi"
-	if cfg.provider == "openai" {
-		innerProv = openaiProv.New(cfg.apiKey, cfg.baseURL, "timi", nil)
-	} else {
-		providerID = "anthropic"
-		// anthropic-sdk-go auto-appends /v1/messages; base URL must NOT include /v1.
-		baseURL := strings.TrimSuffix(cfg.baseURL, "/v1")
-		innerProv = anthropicProv.New(cfg.apiKey, baseURL, map[string]string{
-			"Authorization": "Bearer " + cfg.apiKey,
-		})
+	// Build provider registry with factories for all supported providers.
+	registry := providerPkg.NewRegistry()
+	registry.RegisterFactory(anthropicProv.ProviderID, anthropicProv.Factory)
+	registry.RegisterFactory(openaiProv.ProviderID, openaiProv.Factory)
+
+	// Also support the "timi" alias (OpenAI-compatible) used in legacy flags.
+	registry.RegisterFactory("timi", func(provCfg *llmconfig.ProviderInfo, a *auth.Store) (llm.Provider, error) {
+		return openaiProv.NewFromConfig("timi", nil, provCfg, a)
+	})
+
+	// Build per-provider config from CLI flags so legacy flags still work
+	// when llm.json has no matching provider section.
+	fileCfg, _ := llmconfig.Load()
+	authStore, _ := auth.Load()
+
+	// Merge: CLI flags override file config.
+	provCfgMap := map[string]*llmconfig.ProviderInfo{}
+	if fileCfg != nil {
+		for k, v := range fileCfg.Provider {
+			provCfgMap[k] = v
+		}
+	}
+	// If CLI flags differ from file config, build an override entry.
+	if cfg.apiKey != "" || cfg.baseURL != "" {
+		cliProvID := cfg.provider
+		if cliProvID == "openai" {
+			cliProvID = "timi" // legacy: openai flag means timi proxy
+		}
+		existing := provCfgMap[cliProvID]
+		override := &llmconfig.ProviderInfo{}
+		if existing != nil {
+			*override = *existing
+		}
+		if override.Options == nil {
+			override.Options = &llmconfig.ProviderOptions{}
+		}
+		if cfg.apiKey != "" {
+			override.Options.APIKey = cfg.apiKey
+		}
+		if cfg.baseURL != "" {
+			if cfg.provider == "anthropic" {
+				// anthropic-sdk-go auto-appends /v1/messages; strip /v1 suffix.
+				override.API = strings.TrimSuffix(cfg.baseURL, "/v1")
+			} else {
+				override.API = cfg.baseURL
+			}
+		}
+		provCfgMap[cliProvID] = override
+	}
+
+	providerID := cfg.provider
+	if providerID == "openai" {
+		providerID = "timi"
+	} else if providerID == "anthropic" {
+		providerID = anthropicProv.ProviderID
+	}
+
+	innerProv, err := registry.BuildProvider(providerID, provCfgMap[providerID], authStore)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "build provider: %v\n", err)
+		os.Exit(1)
 	}
 
 	// Event channel consumed by the REPL printer goroutine.

@@ -138,9 +138,10 @@ type processorState struct {
 	currentTextStart  int64
 
 	// current streaming reasoning part
-	currentReasoningPartID string
-	currentReasoningBuf    string
-	currentReasoningStart  int64
+	currentReasoningPartID  string
+	currentReasoningBuf     string
+	currentReasoningStart   int64
+	currentReasoningSignature string
 
 	// active tool calls: callID -> partID
 	activeToolParts map[string]string
@@ -202,7 +203,17 @@ func (s *processorState) handleEvent(ctx context.Context, ev llm.Event) (Process
 			s.currentReasoningPartID = id
 		}
 		s.currentReasoningBuf += ev.Text
-		_ = s.updateReasoningPart(ctx, s.currentReasoningPartID, s.currentReasoningBuf, s.currentReasoningStart, 0)
+		_ = s.updateReasoningPart(ctx, s.currentReasoningPartID, s.currentReasoningBuf, s.currentReasoningSignature, s.currentReasoningStart, 0)
+
+	case llm.EventReasoningEnd:
+		if s.currentReasoningPartID != "" {
+			s.currentReasoningSignature = ev.Signature
+			end := nowMS()
+			_ = s.updateReasoningPart(ctx, s.currentReasoningPartID, s.currentReasoningBuf, ev.Signature, s.currentReasoningStart, end)
+			s.currentReasoningPartID = ""
+			s.currentReasoningBuf = ""
+			s.currentReasoningSignature = ""
+		}
 
 	case llm.EventToolInputStart:
 		if s.activeToolParts == nil {
@@ -332,7 +343,7 @@ func (s *processorState) cleanup(ctx context.Context) {
 
 	// Finalise open reasoning part
 	if s.currentReasoningPartID != "" {
-		_ = s.updateReasoningPart(ctx, s.currentReasoningPartID, s.currentReasoningBuf, s.currentReasoningStart, nowMS())
+		_ = s.updateReasoningPart(ctx, s.currentReasoningPartID, s.currentReasoningBuf, s.currentReasoningSignature, s.currentReasoningStart, nowMS())
 		s.currentReasoningPartID = ""
 	}
 
@@ -379,12 +390,12 @@ func (s *processorState) updateTextPart(ctx context.Context, id, text string, st
 	return s.store.UpdatePart(ctx, p)
 }
 
-func (s *processorState) updateReasoningPart(ctx context.Context, id, text string, start, end int64) error {
+func (s *processorState) updateReasoningPart(ctx context.Context, id, text, signature string, start, end int64) error {
 	p, err := s.store.GetPart(ctx, id)
 	if err != nil {
 		return err
 	}
-	p.Data = &store.ReasoningPartData{Text: text, TimeStart: start, TimeEnd: end}
+	p.Data = &store.ReasoningPartData{Text: text, Signature: signature, TimeStart: start, TimeEnd: end}
 	return s.store.UpdatePart(ctx, p)
 }
 
