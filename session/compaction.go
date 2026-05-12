@@ -74,31 +74,26 @@ type SelectResult struct {
 //  1. Walk backwards through user turns
 //  2. Keep the most recent tailTurns turns that fit within the preserve budget
 //  3. Everything before the kept turns is the head to summarise
-func Select(msgs []*store.Message, model llm.Model, cfg *config.Info) SelectResult {
+//
+// allParts is used to identify compaction boundary user messages (those that
+// contain a PartTypeCompaction part) so they are skipped, consistent with
+// FilterCompacted. This replaces the brittle i+1-is-summary positional heuristic.
+func Select(msgs []*store.Message, allParts map[string][]*store.Part, model llm.Model, cfg *config.Info) SelectResult {
 	budget := llm.PreserveRecentBudget(model, cfg)
 	tailTurns := DefaultTailTurns
 	if cfg != nil && cfg.Compaction != nil && cfg.Compaction.TailTurns != nil {
 		tailTurns = *cfg.Compaction.TailTurns
 	}
 
-	// Build list of real user turns (skip compaction boundary user messages
-	// which only contain a CompactionPart — they are anchors, not real turns).
-	// The parts map is not available here, so we rely on the caller having
-	// already run FilterCompacted which places the compaction user message
-	// first; we skip the very first message if it has no real text content.
+	// Build list of real user turns, skipping compaction boundary messages.
+	// A boundary is a user message that contains a PartTypeCompaction part —
+	// the same criterion used by FilterCompacted.
 	var turns []Turn
 	for i, m := range msgs {
 		if m.Role != store.RoleUser {
 			continue
 		}
-		// Skip compaction anchor messages (identified by being a user message
-		// with only compaction/empty content — they come right before summary).
-		// A simple heuristic: skip if there is a following summary assistant message.
-		isCompactionBoundary := false
-		if i+1 < len(msgs) && msgs[i+1].Summary {
-			isCompactionBoundary = true
-		}
-		if isCompactionBoundary {
+		if hasPartType(allParts[m.ID], store.PartTypeCompaction) {
 			continue
 		}
 		turns = append(turns, Turn{UserMsgID: m.ID, StartIdx: i})
@@ -168,6 +163,16 @@ func estimateTurnTokens(msgs []*store.Message) int {
 	return total
 }
 
+// hasPartType returns true if any part in ps has the given type.
+func hasPartType(ps []*store.Part, partType string) bool {
+	for _, p := range ps {
+		if p.Type == partType {
+			return true
+		}
+	}
+	return false
+}
+
 // Compactor handles the context compaction workflow.
 type Compactor struct {
 	store     store.Store
@@ -211,8 +216,9 @@ func (c *Compactor) Compact(ctx context.Context, sessionID string, input Process
 	// Filter to post-compaction messages only
 	msgs = FilterCompacted(msgs, allParts)
 
-	// Select head/tail split
-	sel := Select(msgs, input.Model, input.Config)
+	// Select head/tail split — pass allParts so Select can identify compaction
+	// boundaries via PartTypeCompaction (same logic as FilterCompacted).
+	sel := Select(msgs, allParts, input.Model, input.Config)
 	if len(sel.Head) == 0 {
 		return "", fmt.Errorf("compaction: nothing to summarise")
 	}

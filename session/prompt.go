@@ -98,11 +98,18 @@ func RunLoop(ctx context.Context, s store.Store, input RunInput) (RunResult, err
 	processor := NewProcessor(s)
 	compactor := NewCompactor(s, processor)
 
+	// Load messages once and cache across steps.
+	// Only reloaded after compaction (which restructures history).
+	msgs, allParts, err := loadMessages(ctx, s, input.SessionID)
+	if err != nil {
+		return RunResultStop, err
+	}
+
 	// Initialise lastInputTokens from the most recent assistant message in the
 	// store so that cross-turn drops (e.g. compact between two user messages)
 	// are detected even though each RunLoop call starts fresh.
 	var lastInputTokens int
-	if msgs, allParts, err := loadMessages(ctx, s, input.SessionID); err == nil {
+	{
 		filtered := FilterCompacted(msgs, allParts)
 		for i := len(filtered) - 1; i >= 0; i-- {
 			if filtered[i].Role == store.RoleAssistant && !filtered[i].Summary {
@@ -113,22 +120,17 @@ func RunLoop(ctx context.Context, s store.Store, input RunInput) (RunResult, err
 			}
 		}
 	}
+
 	step := 0
 	for {
 		isLastStep := input.MaxSteps > 0 && step >= input.MaxSteps
 		step++
 
-		// Load all messages for context
-		msgs, allParts, err := loadMessages(ctx, s, input.SessionID)
-		if err != nil {
-			return RunResultStop, err
-		}
-
-		// Apply compaction filter
-		msgs = FilterCompacted(msgs, allParts)
+		// Apply compaction filter using cached msgs/allParts.
+		filtered := FilterCompacted(msgs, allParts)
 
 		// Build model messages
-		modelMsgs, err := ToModelMessages(msgs, allParts)
+		modelMsgs, err := ToModelMessages(filtered, allParts)
 		if err != nil {
 			return RunResultStop, fmt.Errorf("runloop: build messages: %w", err)
 		}
@@ -161,6 +163,10 @@ func RunLoop(ctx context.Context, s store.Store, input RunInput) (RunResult, err
 		if err := s.CreateMessage(ctx, assistantMsg); err != nil {
 			return RunResultStop, fmt.Errorf("runloop: create assistant message: %w", err)
 		}
+		// Add the new assistant message to the cache immediately so the next
+		// step sees it without a full reload.
+		msgs = append(msgs, assistantMsg)
+		allParts[assistantMsgID] = nil // placeholder; filled below after the LLM call
 
 		// On the last step, disable tools so the LLM is forced to respond in text.
 		tools := input.Tools
@@ -182,8 +188,16 @@ func RunLoop(ctx context.Context, s store.Store, input RunInput) (RunResult, err
 			return RunResultStop, err
 		}
 
-		// Log input token drops across turns for observability.
-		if am, err := s.GetMessage(ctx, assistantMsgID); err == nil {
+		// Refresh the cached parts for this assistant message now that the
+		// LLM call has written its parts to the store.
+		if assistantParts, listErr := s.ListParts(ctx, assistantMsgID); listErr == nil {
+			allParts[assistantMsgID] = assistantParts
+		}
+
+		// Refresh the assistant message itself to pick up token counts written
+		// by finaliseAssistantMessage.
+		if am, getErr := s.GetMessage(ctx, assistantMsgID); getErr == nil {
+			msgs[len(msgs)-1] = am
 			cur := am.Tokens.Input
 			if lastInputTokens > 0 && cur < lastInputTokens {
 				log.Printf("[session] input tokens dropped: %d → %d (delta=%d)",
@@ -210,7 +224,8 @@ func RunLoop(ctx context.Context, s store.Store, input RunInput) (RunResult, err
 
 		case ProcessCompact:
 			log.Printf("[session] compact triggered: input=%d", lastInputTokens)
-			// Run compaction, then continue the loop
+			// Run compaction, then reload the full message cache because
+			// compaction restructures history (inserts boundary + summary).
 			_, err := compactor.Compact(ctx, input.SessionID, ProcessInput{
 				SessionID:       input.SessionID,
 				Model:           input.Model,
@@ -223,6 +238,11 @@ func RunLoop(ctx context.Context, s store.Store, input RunInput) (RunResult, err
 				return RunResultStop, fmt.Errorf("runloop: compaction failed: %w", err)
 			}
 			log.Printf("[session] compact done")
+			// Invalidate cache — compaction rewrote history.
+			msgs, allParts, err = loadMessages(ctx, s, input.SessionID)
+			if err != nil {
+				return RunResultStop, err
+			}
 			continue
 
 		case ProcessContinue:
@@ -232,13 +252,8 @@ func RunLoop(ctx context.Context, s store.Store, input RunInput) (RunResult, err
 			}
 			// Check if the last assistant message finished with tool calls.
 			// If so, continue the loop to let the LLM process tool results.
-			// Note: allParts was loaded before assistantMsgID was created, so
-			// fetch parts for this message directly from the store.
-			assistantParts, err := s.ListParts(ctx, assistantMsgID)
-			if err != nil {
-				return RunResultStop, fmt.Errorf("runloop: list parts for assistant message: %w", err)
-			}
-			if !hasToolCalls(assistantParts) {
+			// allParts[assistantMsgID] was refreshed above after the LLM call.
+			if !hasToolCalls(allParts[assistantMsgID]) {
 				return RunResultContinue, nil
 			}
 			// Continue loop to let LLM see tool results

@@ -63,9 +63,10 @@ sequenceDiagram
     participant Tool as Tool.Execute()
     participant Store as store.Store
 
-    RL->>Store: ListMessages + ListParts
+    RL->>Store: ListMessages + ListParts (once per RunLoop, cached)
     RL->>RL: FilterCompacted() + ToModelMessages()
     RL->>Store: CreateMessage (assistant placeholder)
+    Note over RL: msgs/allParts cache updated in-memory
     RL->>Proc: Process(assistantMsgID, input)
     Proc->>Prov: Stream(llm.Request)
     Prov-->>Proc: EventRequestStart
@@ -75,7 +76,7 @@ sequenceDiagram
     Prov-->>Proc: EventToolInputDelta × N
     Prov-->>Proc: EventToolCall (complete input)
     Proc->>Store: CreatePart(tool, status=pending)
-    Proc->>Tool: Execute() [goroutine]
+    Proc->>Tool: Execute() [goroutine, toolCtx]
     Tool-->>Proc: Result
     Proc->>Store: UpdatePart(status=completed, output=...)
     Prov-->>Proc: EventStepFinish (usage + finishReason)
@@ -83,6 +84,8 @@ sequenceDiagram
     Prov-->>Proc: EventRequestFinish
     Proc->>Store: UpdateMessage (tokens)
     Proc-->>RL: ProcessContinue / ProcessStop / ProcessCompact
+    RL->>Store: ListParts(assistantMsgID) — refresh cache for new step
+    Note over RL: On ProcessCompact: full reload (loadMessages)
 ```
 
 ### Context Compaction
@@ -98,7 +101,7 @@ flowchart TD
 
     ProcessCompact --> ListMsgs["ListMessages + ListParts\nfor session"]
     ListMsgs --> FilterCompacted["FilterCompacted()\nskip pre-compaction history"]
-    FilterCompacted --> Select["Select(msgs, model, cfg)\nhead / tail split"]
+    FilterCompacted --> Select["Select(msgs, allParts, model, cfg)\nhead / tail split"]
 
     Select --> NothingToSummarise{"len(head) == 0?"}
     NothingToSummarise -- Yes --> CompactFail["Compact() returns error\nRunLoop returns error"]
@@ -134,9 +137,11 @@ Usable          = 128000 - 8192   = 119,808  ← compact triggers here
 
 #### head / tail split (`session/compaction.go Select()`)
 
+`Select(msgs, allParts, model, cfg)` — note `allParts` is now required. It uses `hasPartType(allParts[m.ID], PartTypeCompaction)` to identify compaction boundary user messages, consistent with `FilterCompacted`. The old positional heuristic (`msgs[i+1].Summary`) has been removed.
+
 ```mermaid
 flowchart LR
-    Msgs["All messages\n(post-FilterCompacted)"] --> Turns["Identify user turns\nskip compaction-boundary turns"]
+    Msgs["All messages\n(post-FilterCompacted)"] --> Turns["Identify user turns\nskip boundary msgs\n(PartTypeCompaction check)"]
     Turns --> Enough{"len(turns) > tailTurns\n(default 2)?"}
     Enough -- No --> NoSplit["SelectResult{Head:nil}\nnothing to summarise"]
     Enough -- Yes --> WalkBack["Walk last tailTurns turns backward\nestimate token size per turn"]
@@ -178,7 +183,7 @@ if isLastStep {
 
 Prune is a lighter alternative to full compaction: instead of replacing history with a summary, it **clears old tool output content** in-place, freeing context without changing the message structure.
 
-> **Current status**: `Prune()` is implemented in `session/compaction.go` but is **not called anywhere** in the current codebase. It is available for future use as a pre-compaction or degraded-compaction strategy.
+`Prune()` is called as a **fire-and-forget goroutine** after every `ProcessStop` in `RunLoop`. It is guarded internally by `cfg.compaction.prune` (default `false`), so it is a no-op unless explicitly opt-in. Set `cfg.compaction.prune = true` to enable background pruning.
 
 ```mermaid
 flowchart TD
@@ -301,6 +306,24 @@ Key event: `llm.EventReasoningEnd` carries `Event.Signature`. The processor stor
 ### `llm/client.go` — retry event buffering
 
 `llm.Client.doStream` buffers all events from the current attempt in memory. Events are only flushed to the caller's `out` channel once `EventRequestFinish` is received. On retry, the buffer is discarded so the caller never sees a partial sequence from a failed attempt. On fatal error (non-retryable), the buffer is flushed before the error event so the caller still has context.
+
+### `store.DataAs[T]` — typed Part payload extraction
+
+```go
+func DataAs[T any](p *Part) (T, bool)
+```
+
+Two-phase lookup:
+1. Direct type assertion — works for the memory store (holds Go pointers).
+2. JSON round-trip fallback — handles SQL/Redis stores that deserialise `Part.Data` as `map[string]any`.
+
+Always use `DataAs` instead of bare `p.Data.(T)` assertions. The JSON fallback ensures future non-memory store implementations work without any call-site changes.
+
+### `memory.Store` — design notes
+
+- `sessionMsgs` and `messageParts` are insertion-order `[]string` slices → `ListMessages`/`ListParts` are O(n).
+- `sessionOrder []string` (added) mirrors the same design for sessions → `ListSessions` is now O(n), no sort needed.
+- `hasPartType(ps []*store.Part, partType string) bool` — internal helper in `session/compaction.go`, used by both `FilterCompacted` (via `context.go`) and `Select()` to identify compaction boundary messages by `PartTypeCompaction`.
 
 ---
 

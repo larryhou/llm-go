@@ -56,178 +56,38 @@ a provider-level capability flag.
 
 ## session
 
-### 6. `Compact()` writes boundary to store before LLM call — inconsistency window — `session/compaction.go`
+### 6. `Compact()` writes boundary to store before LLM call — `session/compaction.go`
 
 **Location:** `compaction.go:237–299`
-**Severity:** **High** — data loss risk on partial failure.
-
-```go
-// Step 1 — writes compaction boundary + summary placeholder to store
-c.store.CreateMessage(ctx, &store.Message{...})   // boundary user msg
-c.store.CreatePart(ctx, &store.Part{Type: PartTypeCompaction, ...})
-c.store.CreateMessage(ctx, &store.Message{..., Summary: true}) // empty summary
-
-// Step 2 — LLM call that may fail
-result, err := c.processor.Process(ctx, summaryMsgID, summaryInput)
-if err != nil {
-    return "", fmt.Errorf("compaction: summary generation failed: %w", err)
-}
-```
-
-If the LLM call fails (network error, provider error, context overflow), the
-boundary user message and the empty summary message are already persisted.
-On the next `RunLoop`, `FilterCompacted` walks backward, finds the summary
-message (`Summary=true`), pairs it with the boundary, and returns only
-`[boundary, empty-summary, tail]` — silently discarding all pre-compaction
-history without any actual summary content. The session loses context
-irreversibly.
-
-**Fix:** reverse the order — run the LLM call first, then atomically write
-both the boundary and the completed summary. If the store supports
-transactions, wrap both writes. Otherwise buffer the summary text and only
-write the boundary after the LLM succeeds:
-
-```go
-// Step 1: run LLM to get summary text (no store writes yet)
-summaryText, err := generateSummary(ctx, headMsgs, summaryInput)
-if err != nil {
-    return "", fmt.Errorf("compaction: summary generation failed: %w", err)
-}
-
-// Step 2: only now write boundary + summary to store
-c.store.CreateMessage(ctx, boundaryMsg)
-c.store.CreatePart(ctx, compactionPart)
-c.store.CreateMessage(ctx, summaryMsg)
-c.store.CreatePart(ctx, summaryTextPart)
-```
+**Status:** **FIXED** — boundary user message created first (no CompactionPart), summary message created second; LLM runs; only on success is CompactionPart written to boundary. LLM failure leaves a part-less boundary invisible to `FilterCompacted`.
 
 ---
 
 ### 7. `processorState` concurrent map access — `session/processor.go`
 
 **Location:** `processor.go:147–158`, `processor.go:296–313`, `processor.go:337–368`
-**Severity:** **Medium** — data race under concurrent tool execution.
-
-`executeTool` goroutines read `toolMap` and write back to the store concurrently
-with `cleanup()` which iterates over `activeToolParts`. The `activeToolParts`
-map is written by the main event loop (`handleEvent`) while goroutines may be
-finishing and indirectly triggering `GetPart` / `UpdatePart`. Although the
-current flow mostly serialises through the channel, there is no explicit
-synchronisation protecting `activeToolParts` reads in `cleanup` from concurrent
-goroutine writes:
-
-```go
-// handleEvent (main goroutine) — writes activeToolParts
-s.activeToolParts[ev.ToolCallID] = id
-
-// cleanup (called after stream ends) — reads activeToolParts
-for callID, partID := range s.activeToolParts {
-    // goroutines from executeTool may still be running here
-    p, err := s.store.GetPart(timeoutCtx, partID)
-}
-```
-
-**Fix:** protect `activeToolParts` with a `sync.Mutex`, or use a `sync.WaitGroup`
-to ensure all tool goroutines have either completed or been cancelled before
-`cleanup` iterates the map. Pass a cancellable context to tool goroutines so
-cleanup can actually stop them, not just mark them interrupted.
+**Status:** **FIXED** — `activeToolParts` protected by `sync.Mutex`; `toolCtx`/`toolCancel` added so `cleanup()` cancels all in-flight goroutines; `sync.WaitGroup` tracks goroutine exit; single 250ms shared deadline.
 
 ---
 
 ### 8. `processorState` cleanup grace period multiplied by N tools — `session/processor.go`
 
-**Location:** `processor.go:341–358`  
-**Status:** Real bug — confirmed in current code.
-
-```go
-deadline := time.Now().Add(250 * time.Millisecond)
-for callID, partID := range s.activeToolParts {
-    timeoutCtx, cancel := context.WithDeadline(ctx, deadline)
-    // GetPart call may block up to 250ms per tool
-    p, err := s.store.GetPart(timeoutCtx, partID)
-    cancel()
-    ...
-}
-```
-
-The single `deadline` is computed once, but each iteration of the loop may
-block for the full remaining budget independently. With N concurrent tools the
-worst-case wait is `N × 250 ms`. Additionally, tool goroutines that are still
-running are only marked as interrupted in the store — they are not actually
-cancelled and may continue writing to the store after `cleanup` returns.
-
-**Fix:** create one shared deadline before the loop; cancel running tool
-goroutines via a dedicated context stored in `processorState`.
+**Location:** `processor.go:341–358`
+**Status:** **FIXED** — see #7 above; single `time.After(250ms)` select covers all tools.
 
 ---
 
 ### 9. `RunLoop` loads all messages on every agentic step — `session/prompt.go`
 
 **Location:** `prompt.go:122–131`
-**Severity:** **Medium** — unnecessary I/O overhead on long sessions.
-
-```go
-for {
-    // Re-loads every message + every part on every step
-    msgs, allParts, err := loadMessages(ctx, s, input.SessionID)
-    ...
-    msgs = FilterCompacted(msgs, allParts)
-    modelMsgs, err := ToModelMessages(msgs, allParts)
-}
-```
-
-Each agentic step calls `ListMessages` + `ListParts` for every message in the
-session. For a session with 50 messages and 200 parts this means 51 store
-queries per step. On a remote store (SQLite over network, SQL DB) this is
-measurable latency. Only new messages are added between steps; the reload of
-existing messages is pure waste.
-
-**Fix:** cache the message list and parts map across the loop, and append only
-newly created messages/parts after each step. Invalidate the cache only after
-compaction (which restructures the history).
+**Status:** **FIXED** — `msgs`/`allParts` loaded once before the loop and cached. Each step appends the new assistant message in-memory and calls `ListParts(assistantMsgID)` to refresh only new parts. Full reload only after `ProcessCompact` (compaction restructures history).
 
 ---
 
 ### 10. `Select()` uses position heuristic to identify compaction boundaries — `session/compaction.go`
 
 **Location:** `compaction.go:96–103`
-**Severity:** **Low** — brittle assumption on message ordering.
-
-```go
-// heuristic: a user message is a compaction anchor if the next message is a summary
-isCompactionBoundary := false
-if i+1 < len(msgs) && msgs[i+1].Summary {
-    isCompactionBoundary = true
-}
-```
-
-This relies on the summary assistant message being at index `i+1` immediately
-after the boundary user message. The logic is order-dependent. A real user
-message inserted between the boundary and the summary (e.g. by a concurrent
-write or a bug in Compact's ordering) would break detection, causing the
-compaction anchor to be treated as a real turn and included in the head to
-be summarised again.
-
-`FilterCompacted` already does the correct part-level check
-(`PartTypeCompaction`). `Select()` should reuse that mechanism via the `parts`
-map rather than relying on index proximity.
-
-**Fix:** pass `allParts` to `Select()` and check the part type directly:
-
-```go
-func Select(msgs []*store.Message, parts map[string][]*store.Part, model llm.Model, cfg *config.Info) SelectResult {
-    for i, m := range msgs {
-        if m.Role != store.RoleUser {
-            continue
-        }
-        isCompactionBoundary := hasPartType(parts[m.ID], store.PartTypeCompaction)
-        if isCompactionBoundary {
-            continue
-        }
-        turns = append(turns, Turn{...})
-    }
-}
-```
+**Status:** **FIXED** — `Select` now accepts `allParts map[string][]*store.Part` and uses `hasPartType(allParts[m.ID], PartTypeCompaction)` — identical logic to `FilterCompacted`. Positional `msgs[i+1].Summary` heuristic removed.
 
 ---
 
@@ -240,41 +100,24 @@ func Select(msgs []*store.Message, parts map[string][]*store.Part, model llm.Mod
 
 ## store
 
-### 12. Weak type safety on `Part.Data` — `store/store.go`
+### 12. `ListSessions` has no insertion-order index — re-sorts on every call — `store/memory/memory.go`
 
-**Location:** `store.go:83`, and 14 call sites across `session/`  
-**Status:** Real — low severity, maintenance risk.
+**Location:** `memory.go:78–90`
+**Status:** **FIXED** — `sessionOrder []string` slice added; `CreateSession` appends to it; `ListSessions` iterates `sessionOrder` O(n) with no sort; `sort` import removed.
 
-```go
-Data any
-```
+---
 
-Every caller performs an unchecked runtime type assertion:
+### 13. `DataAs` breaks on JSON round-trip — future store implementations — `store/store.go`
 
-```go
-d, ok := p.Data.(*store.ToolPartData)   // processor.go:350, 396, 416, 440
-d, ok := p.Data.(*store.TextPartData)   // context.go:76, 103, 184
-d, ok := p.Data.(*store.ReasoningPartData) // context.go:114, 189
-```
+**Location:** `store/store.go:167–170`
+**Status:** **FIXED** — `DataAs` now tries direct type assertion first; falls back to `json.Marshal` + `json.Unmarshal` when assertion fails (e.g. `map[string]any` from SQL deserialisation).
 
-Mismatches from JSON round-trips fail silently (the `ok=false` branch is
-typically ignored) with no compile-time protection. A new part type added
-without updating all switch/assertion sites will silently produce empty data.
+---
 
-**Fix (option A):** sealed interface:
+### 14. Weak type safety on `Part.Data` — `store/store.go`
 
-```go
-type PartData interface{ partData() }
-func (*TextPartData) partData()      {}
-func (*ToolPartData) partData()      {}
-func (*ReasoningPartData) partData() {}
-```
-
-**Fix (option B):** generic helper that centralises assertion failures:
-
-```go
-func DataAs[T any](p *Part) (T, bool) { v, ok := p.Data.(T); return v, ok }
-```
+**Location:** `store.go:83`, all call sites across `session/`
+**Status:** Partially addressed — all bare `p.Data.(T)` assertions replaced with `store.DataAs[T](p)`; JSON fallback now handles round-trips. Sealed interface (Option A) remains as a future improvement.
 
 ---
 
@@ -292,21 +135,7 @@ func DataAs[T any](p *Part) (T, bool) { v, ok := p.Data.(T); return v, ok }
 ### 14. Cross-priority-group results have no global score sort — `knowledge/manager.go`
 
 **Location:** `manager.go:113–133`  
-**Status:** Real — low severity, intentional trade-off or oversight.
-
-Results within a group are sorted by score descending via `dispatchGroup`.
-Results from different priority groups are appended in priority order only. A
-lower-priority group may contain higher-scoring results than the tail of a
-higher-priority group, causing sub-optimal result ranking.
-
-**Fix:** apply a final global sort after accumulating all groups, or document
-that priority ordering intentionally overrides score.
-
-```go
-sort.Slice(accumulated, func(i, j int) bool {
-    return accumulated[i].Score > accumulated[j].Score
-})
-```
+**Status:** **FIXED** — global `sort.Slice` by score descending added after all groups are accumulated in `peek()`.
 
 ---
 
@@ -314,14 +143,14 @@ sort.Slice(accumulated, func(i, j int) bool {
 
 ### 10. `NewFromConfig` has no callers — `llm.json` provider config is inert — `cmd/control/main.go`, `cmd/knowledge-api/main.go`
 
-**Location:** `cmd/control/main.go:238–247`  
+**Location:** `cmd/control/main.go:238–247`
 **Status:** **FIXED** — both cmd entrypoints now load `config.Load()` + `auth.Load()`, build a `provider.Registry`, register anthropic/openai/timi factories, and call `registry.BuildProvider()`. CLI flags override file config via a merged `ProviderInfo`.
 
 ---
 
 ### 11. `provider.Registry` never instantiated — entire registry system is dead code — `provider/provider.go`
 
-**Location:** `provider/provider.go:72–122`  
+**Location:** `provider/provider.go:72–122`
 **Status:** **FIXED** — `Registry` gains `RegisterFactory(id, Factory)` and `BuildProvider(id, cfg, authStore)`; each provider package exposes a `Factory` var; both cmd entrypoints instantiate and use the registry.
 
 ---
@@ -335,16 +164,20 @@ sort.Slice(accumulated, func(i, j int) bool {
 | 3 | `provider/anthropic` | `ThinkingBlock` signature not captured — multi-turn reasoning broken | **High** | **FIXED** |
 | 4 | `provider/openai` | `NewFromConfig` ignores extra headers from config | Low | **FIXED** |
 | 5 | `provider/openai` | `IncludeUsage` sent to all compatible providers — proxy rejection risk | Low | Open |
-| 6 | `session` | Cleanup grace period multiplied by N tools — incorrect timeout logic | Medium | Open |
-| 7 | `store` | Weak `Part.Data` typing — silent assertion failures, no compile-time safety | Low | Open |
-| 8 | `knowledge` | Cross-group results have no global score sort — sub-optimal ranking | Low | Open |
-| 9 | `session` | `Compact()` writes boundary before LLM call — data loss on partial failure | **High** | Open |
-| 10 | `session` | `processorState` concurrent map access — data race under concurrent tools | Medium | Open |
-| 11 | `session` | `RunLoop` reloads all messages on every agentic step — unnecessary I/O | Medium | Open |
-| 12 | `session` | `Select()` uses position heuristic for compaction boundary detection | Low | Open |
-| 13 | `session` | `Prune()` never called by default — dead feature | Low | **FIXED** |
-| 14 | `cmd` | `NewFromConfig` never called — `llm.json` provider config inert | Medium | **FIXED** |
-| 15 | `provider` | `Registry` never instantiated — extensibility blocked | Medium | **FIXED** |
+| 6 | `session` | `Compact()` writes boundary before LLM call — data loss on partial failure | **High** | **FIXED** |
+| 7 | `session` | `processorState` concurrent map access — data race under concurrent tools | Medium | **FIXED** |
+| 8 | `session` | Cleanup grace period multiplied by N tools — incorrect timeout logic | Medium | **FIXED** |
+| 9 | `session` | `RunLoop` reloads all messages on every agentic step — unnecessary I/O | Medium | **FIXED** |
+| 10 | `session` | `Select()` uses position heuristic for compaction boundary detection | Low | **FIXED** |
+| 11 | `session` | `Prune()` never called by default — dead feature | Low | **FIXED** |
+| 12 | `store` | `ListSessions` re-sorts on every call — no insertion-order index | Low | **FIXED** |
+| 13 | `store` | `DataAs` breaks on JSON round-trip — future non-memory stores silently broken | Medium | **FIXED** |
+| 14 | `store` | Weak `Part.Data` typing — bare assertions replaced; sealed interface still future work | Low | Partial |
+| 15 | `knowledge` | Cross-group results have no global score sort — sub-optimal ranking | Low | **FIXED** |
+| 16 | `cmd` | `NewFromConfig` never called — `llm.json` provider config inert | Medium | **FIXED** |
+| 17 | `provider` | `Registry` never instantiated — extensibility blocked | Medium | **FIXED** |
+
+Only **#5** (IncludeUsage compatibility) remains fully open.
 
 ---
 
@@ -356,9 +189,17 @@ sort.Slice(accumulated, func(i, j int) bool {
 | 2 | Anthropic reasoning replayed as `text` block | `provider/anthropic/anthropic.go` — `ThinkingBlockParam` with `Signature` |
 | 3 | `ThinkingBlock` signature not captured | `anthropic.go` — `ThinkingBlock` case + `EventReasoningEnd`; `store.ReasoningPartData.Signature` |
 | 4 | OpenAI `NewFromConfig` ignores extra headers | `provider/openai/openai.go` — reads `cfg.Options.Extra` |
-| 9 (old) | `NewFromConfig` never called in cmd | `cmd/control/main.go`, `cmd/knowledge-api/main.go` — registry wired |
-| 10 (old) | `provider.Registry` dead code | `provider/provider.go` — `RegisterFactory` + `BuildProvider` added |
-| 13 (orig) | `Prune()` dead code — never called | `prompt.go` — unconditional goroutine on `ProcessStop`; `Prune()` guards with opt-in flag internally |
+| 6 | `Compact()` writes boundary before LLM call | `session/compaction.go` — boundary created first; CompactionPart written only on LLM success |
+| 7+8 | `processorState` concurrent map + N×250ms cleanup | `session/processor.go` — `sync.Mutex`, `toolCtx`/`toolCancel`, `sync.WaitGroup` |
+| 9 | `RunLoop` reloads all messages each step | `session/prompt.go` — msgs/allParts cached; only new parts appended per step |
+| 10 | `Select()` positional boundary heuristic | `session/compaction.go` — `hasPartType(PartTypeCompaction)` check; `allParts` param added |
+| 11 | `Prune()` dead code — never called | `prompt.go` — unconditional goroutine on `ProcessStop`; opt-in via `cfg.compaction.prune` |
+| 12 | `ListSessions` O(n log n) sort | `store/memory/memory.go` — `sessionOrder []string` insertion-order index |
+| 13 | `DataAs` breaks on JSON round-trip | `store/store.go` — JSON marshal/unmarshal fallback |
+| 14 | Bare `p.Data.(T)` assertions across session | `session/` — all replaced with `store.DataAs[T](p)` |
+| 15 | Cross-group knowledge score sort | `knowledge/manager.go` — global `sort.Slice` after accumulation |
+| 16 | `NewFromConfig` never called in cmd | `cmd/control/main.go`, `cmd/knowledge-api/main.go` — registry wired |
+| 17 | `provider.Registry` dead code | `provider/provider.go` — `RegisterFactory` + `BuildProvider` added |
 | 2 (orig) | `classifyStatus` case 529 unreachable | `error.go` — `case 529` now precedes `>= 500` |
 | 3 (orig) | `MaxOutputTokens` returns 0 for unset output | `overflow.go` — `fallback = 4096` added |
 | 4 (orig) | Anthropic image block uses wrong constructor | `anthropic.go` — `NewImageBlockBase64` / `NewImageBlock` correctly routed |
@@ -368,7 +209,9 @@ sort.Slice(accumulated, func(i, j int) bool {
 | 13 (orig) | Token estimation placeholder (constant 100) | `compaction.go` — uses `m.Tokens` with 100 fallback |
 | 14 (orig) | `EventToolResult` silently ignored | `processor.go` — `log.Printf` warning emitted |
 | 15 (orig) | `FilterCompacted` may mis-pair boundary and summary | `context.go` — backward walk finds most recent complete pair |
-| 16 (orig) | Double `loadMessages` per loop iteration | `prompt.go` — `ProcessContinue` uses `s.ListParts(assistantMsgID)` directly |
+| 16 (orig) | Double `loadMessages` per loop iteration | `prompt.go` — cache across steps; full reload only after compaction |
 | 23 (orig) | `max_results` upper bound not enforced at runtime | `search_tool.go` — `maxResultsCap = 20` enforced |
+| 25 (orig) | `fetch` fallback passes un-stripped `q.Input` to `Accepts` | `manager.go` — prefix stripped before fallback loop |
+| 26 (orig) | `groupByPriority` dead `peekMode` parameter | `manager.go` — parameter removed |
 | 25 (orig) | `fetch` fallback passes un-stripped `q.Input` to `Accepts` | `manager.go` — prefix stripped before fallback loop |
 | 26 (orig) | `groupByPriority` dead `peekMode` parameter | `manager.go` — parameter removed |
