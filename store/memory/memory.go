@@ -5,7 +5,6 @@ package memory
 import (
 	"context"
 	"fmt"
-	"sort"
 	"sync"
 	"time"
 
@@ -18,6 +17,8 @@ type Store struct {
 	sessions map[string]*store.Session
 	messages map[string]*store.Message
 	parts    map[string]*store.Part
+	// index: insertion-order session IDs (mirrors sessionMsgs design)
+	sessionOrder []string
 	// index: sessionID -> []messageID (insertion order)
 	sessionMsgs map[string][]string
 	// index: messageID -> []partID (insertion order)
@@ -49,6 +50,7 @@ func (s *Store) CreateSession(_ context.Context, sess *store.Session) error {
 	sess.UpdatedAt = time.Now()
 	cp := *sess
 	s.sessions[sess.ID] = &cp
+	s.sessionOrder = append(s.sessionOrder, sess.ID)
 	return nil
 }
 
@@ -78,14 +80,13 @@ func (s *Store) UpdateSession(_ context.Context, sess *store.Session) error {
 func (s *Store) ListSessions(_ context.Context) ([]*store.Session, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	out := make([]*store.Session, 0, len(s.sessions))
-	for _, sess := range s.sessions {
-		cp := *sess
-		out = append(out, &cp)
+	out := make([]*store.Session, 0, len(s.sessionOrder))
+	for _, id := range s.sessionOrder {
+		if sess, ok := s.sessions[id]; ok {
+			cp := *sess
+			out = append(out, &cp)
+		}
 	}
-	sort.Slice(out, func(i, j int) bool {
-		return out[i].CreatedAt.Before(out[j].CreatedAt)
-	})
 	return out, nil
 }
 

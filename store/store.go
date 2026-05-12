@@ -4,6 +4,7 @@ package store
 
 import (
 	"context"
+	"encoding/json"
 	"time"
 )
 
@@ -157,14 +158,33 @@ type RetryPartData struct {
 
 // DataAs extracts the typed payload from a Part.
 // It centralises the runtime type assertion so callers get a single point
-// of failure rather than 14 silent ok=false branches scattered across the
-// session package. When the assertion fails (e.g. after a JSON round-trip
-// through a SQL store), the zero value is returned with ok=false.
+// of failure rather than silent ok=false branches scattered across the
+// session package.
+//
+// Two-phase lookup:
+//  1. Direct type assertion — works for the memory store which holds typed Go pointers.
+//  2. JSON round-trip fallback — handles stores (SQLite, Redis, etc.) that
+//     deserialise Part.Data as map[string]any. Without this fallback, every
+//     DataAs call on a SQL-backed store would silently return ok=false,
+//     dropping all tool/text/reasoning data.
 //
 // Usage:
 //
 //	d, ok := store.DataAs[*store.ToolPartData](p)
 func DataAs[T any](p *Part) (T, bool) {
-	v, ok := p.Data.(T)
-	return v, ok
+	if v, ok := p.Data.(T); ok {
+		return v, ok
+	}
+	// JSON round-trip fallback for stores that deserialise Data as map[string]any.
+	b, err := json.Marshal(p.Data)
+	if err != nil {
+		var zero T
+		return zero, false
+	}
+	var v T
+	if err := json.Unmarshal(b, &v); err != nil {
+		var zero T
+		return zero, false
+	}
+	return v, true
 }
