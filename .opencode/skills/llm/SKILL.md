@@ -245,6 +245,7 @@ type Message struct {
 type ContentPart struct {
     Type       string     // "text" | "tool-call" | "tool-result" | "reasoning" | "image"
     Text       string
+    Signature  string     // PartTypeReasoning: Anthropic thinking-block signature, must be echoed back
     ToolCallID string
     ToolName   string
     Input      any        // decoded tool arguments (tool-call)
@@ -261,6 +262,7 @@ type ContentPart struct {
 type Event struct {
     Type         EventType    // see EventType constants
     Text         string       // text-delta / reasoning-delta / tool-input-delta
+    Signature    string       // reasoning-end: Anthropic thinking-block signature
     ToolCallID   string
     ToolName     string
     Input        any          // tool-call: parsed args
@@ -283,6 +285,22 @@ stateDiagram-v2
     completed --> [*]
     error --> [*]
 ```
+
+### Anthropic extended thinking — signature lifecycle
+
+Anthropic attaches a `signature` to every thinking block. It must be captured from the stream and replayed verbatim on subsequent turns.
+
+```
+Stream:   ContentBlockStartEvent(ThinkingBlock{Signature}) → EventReasoningEnd{Signature}
+Store:    ReasoningPartData.Signature persisted via UpdatePart
+Replay:   assistantBlocks emits ThinkingBlockParam{Thinking, Signature} — NOT a text block
+```
+
+Key event: `llm.EventReasoningEnd` carries `Event.Signature`. The processor stores it in `ReasoningPartData.Signature`. `NewReasoningPart(text, signature)` constructs the `ContentPart` with both fields.
+
+### `llm/client.go` — retry event buffering
+
+`llm.Client.doStream` buffers all events from the current attempt in memory. Events are only flushed to the caller's `out` channel once `EventRequestFinish` is received. On retry, the buffer is discarded so the caller never sees a partial sequence from a failed attempt. On fatal error (non-retryable), the buffer is flushed before the error event so the caller still has context.
 
 ---
 
@@ -345,6 +363,24 @@ Key requirements:
 - On error: emit `EventError` with `Err` set to an `*llm.LLMError`; use `llm.ClassifyHTTPError()` to classify
 
 The provider must support `option.WithBaseURL()` or equivalent for custom endpoints.
+
+Expose a `Factory` var so the provider can be registered with `provider.Registry`:
+
+```go
+// In your provider package:
+var Factory = func(cfg *config.ProviderInfo, authStore *auth.Store) (llm.Provider, error) {
+    return NewFromConfig(cfg, authStore)
+}
+```
+
+Then at startup:
+
+```go
+registry := provider.NewRegistry()
+registry.RegisterFactory(myprov.ProviderID, myprov.Factory)
+
+prov, err := registry.BuildProvider("myprovider", cfg.Provider["myprovider"], authStore)
+```
 
 ### SDK BaseURL Quirks
 When configuring custom endpoints (e.g. proxies or OpenAI wrappers), be aware of the underlying SDK routing logic:
@@ -616,7 +652,7 @@ The 19 overflow regex patterns in `llm/error.go` (`overflowPatterns` var) must b
 1. Add the dependency: `go get github.com/new-provider/sdk-go`
 2. Create `provider/newprovider/newprovider.go` implementing `llm.Provider`
 3. Follow the event emission contract described in "Adding a New Provider" above
-4. Register in your application via `provider.Registry.Register()`
+4. Expose a `Factory` var and call `registry.RegisterFactory(ProviderID, Factory)` at startup in your cmd entrypoint
 
 ### SDK version updates
 

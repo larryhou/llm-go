@@ -10,142 +10,28 @@ Each item has been verified against the current codebase. Items marked **[FIXED]
 ### 1. Retry emits partial events to caller — `llm/client.go`
 
 **Location:** `client.go:74–89`  
-**Status:** Real bug — confirmed in current code.
-
-```go
-for ev := range events {
-    if ev.Type == EventError {
-        retryErr = llmErr
-        break   // partial events already forwarded to out
-    }
-    out <- ev   // EventRequestStart / EventStepStart / EventTextDelta already sent
-}
-```
-
-When a mid-stream error triggers a retry, every event forwarded to `out` before
-the error is permanent. The caller receives a partial sequence from the failed
-attempt followed by a complete sequence from the retry. `session.Processor`
-will have corrupt state: duplicate `EventRequestStart`, stale text deltas, and
-tool parts created for a request that never finished.
-
-**Fix:** buffer all events from the current attempt; only flush to `out` once
-`EventRequestFinish` is received. On retry, discard the buffer and start fresh.
-
-```go
-var buf []llm.Event
-for ev := range events {
-    if ev.Type == EventError {
-        if shouldRetry { buf = buf[:0]; break }  // discard and retry
-        flush(buf, out); out <- ev; return
-    }
-    buf = append(buf, ev)
-    if ev.Type == EventRequestFinish {
-        flush(buf, out); return
-    }
-}
-```
+**Status:** **FIXED** — `doStream` now buffers all events; flushes only on `EventRequestFinish`; discards buffer on retry.
 
 ---
 
 ### 2. Anthropic `reasoning` part replayed as `text` block — `provider/anthropic/anthropic.go`
 
 **Location:** `anthropic.go:253–256`  
-**Status:** Real bug — confirmed in current code.
-
-```go
-case llm.PartTypeReasoning:
-    if p.Text != "" {
-        blocks = append(blocks, anthropic.NewTextBlock(p.Text))
-    }
-```
-
-Anthropic's extended thinking protocol requires that `thinking` blocks from a
-previous turn be replayed as `thinking`-typed blocks, not `text` blocks.
-Sending the wrong block type causes a 400 API error or silently broken
-multi-turn reasoning. Additionally, Anthropic attaches a `signature` to every
-thinking block; it must be echoed back verbatim, but `llm.ContentPart` has no
-`Signature` field so it cannot be preserved even if the block type is fixed.
-
-**Fix (two steps):**
-1. Add `Signature string` to `llm.ContentPart`.
-2. Use `anthropic.ThinkingBlockParam` in `assistantBlocks`:
-
-```go
-case llm.PartTypeReasoning:
-    if p.Text != "" {
-        blocks = append(blocks, anthropic.ContentBlockParamUnion{
-            OfThinking: &anthropic.ThinkingBlockParam{
-                Type:      "thinking",
-                Thinking:  p.Text,
-                Signature: p.Signature,
-            },
-        })
-    }
-```
+**Status:** **FIXED** — `assistantBlocks` now emits `ThinkingBlockParam{Thinking, Signature}` for `PartTypeReasoning`.
 
 ---
 
 ### 3. Anthropic `ThinkingBlock` start event and `signature` not captured — `provider/anthropic/anthropic.go`
 
 **Location:** `anthropic.go:283–298`  
-**Status:** Real bug — confirmed in current code.
-
-```go
-case anthropic.ContentBlockStartEvent:
-    switch block := ev.ContentBlock.AsAny().(type) {
-    case anthropic.TextBlock:    ...
-    case anthropic.ToolUseBlock: ...
-    // no case for anthropic.ThinkingBlock — signature permanently lost
-    }
-```
-
-The `ContentBlockStartEvent` for a thinking block carries a `signature` that
-must be stored and replayed (see issue 2). Without a `ThinkingBlock` case the
-signature is lost. The `ContentBlockStopEvent` handler also silently skips
-thinking-block stop events (`inText=false`, `currentToolID=""`), so no
-`EventReasoningEnd` is emitted and the reasoning part is never finalised.
-
-**Fix:** add `ThinkingBlock` case with parallel `inReasoning` / `reasoningSignature` state:
-
-```go
-case anthropic.ThinkingBlock:
-    currentReasoningSignature = block.Signature
-    inReasoning = true
-
-// in ContentBlockStopEvent:
-} else if inReasoning {
-    out <- llm.Event{Type: llm.EventReasoningEnd, Signature: currentReasoningSignature}
-    inReasoning = false
-    currentReasoningSignature = ""
-}
-```
-
-Requires adding `EventReasoningEnd` and `Signature string` to `llm.Event`.
+**Status:** **FIXED** — `ThinkingBlock` case added in `ContentBlockStartEvent`; `ContentBlockStopEvent` emits `EventReasoningEnd` with signature; `llm.Event.Signature` and `store.ReasoningPartData.Signature` added.
 
 ---
 
 ### 4. OpenAI `NewFromConfig` ignores extra headers from config — `provider/openai/openai.go`
 
 **Location:** `openai.go:75`  
-**Status:** Real bug — confirmed in current code.
-
-```go
-return New(apiKey, baseURL, pid, nil), nil  // extraHeaders always nil
-```
-
-`New()` accepts `extraHeaders map[string]string` but `NewFromConfig` hardcodes
-`nil`. Any `headers` configured under `provider.options` in `llm.json` are
-permanently ignored when the provider is built from config.
-
-**Fix:**
-
-```go
-var headers map[string]string
-if cfg != nil && cfg.Options != nil {
-    headers = cfg.Options.Headers
-}
-return New(apiKey, baseURL, pid, headers), nil
-```
+**Status:** **FIXED** — `NewFromConfig` now reads `cfg.Options.Extra` (string values) and passes them as `extraHeaders` to `New()`.
 
 ---
 
@@ -443,67 +329,36 @@ sort.Slice(accumulated, func(i, j int) bool {
 ### 10. `NewFromConfig` has no callers — `llm.json` provider config is inert — `cmd/control/main.go`, `cmd/knowledge-api/main.go`
 
 **Location:** `cmd/control/main.go:238–247`  
-**Status:** Real — medium severity, confirmed in current code.
-
-Both `anthropic.NewFromConfig` and `openai.NewFromConfig` exist as the correct
-config-to-provider bridge, but no cmd entry point calls them. All providers are
-constructed manually from CLI flags:
-
-```go
-// cmd/control/main.go — manual construction, config file ignored
-if cfg.provider == "openai" {
-    innerProv = openaiProv.New(cfg.apiKey, cfg.baseURL, "timi", nil)
-} else {
-    innerProv = anthropicProv.New(cfg.apiKey, baseURL, map[string]string{...})
-}
-```
-
-As a result, `llm.json` provider settings (`baseURL`, `apiKey`, `headers`,
-per-model limits) are never applied.
-
-**Fix:** cmd entries should load config + auth and delegate to `NewFromConfig`:
-
-```go
-cfg, _ := config.Load()
-authStore, _ := auth.Load()
-prov, err := anthropicProv.NewFromConfig(cfg.Provider["anthropic"], authStore)
-```
+**Status:** **FIXED** — both cmd entrypoints now load `config.Load()` + `auth.Load()`, build a `provider.Registry`, register anthropic/openai/timi factories, and call `registry.BuildProvider()`. CLI flags override file config via a merged `ProviderInfo`.
 
 ---
 
 ### 11. `provider.Registry` never instantiated — entire registry system is dead code — `provider/provider.go`
 
 **Location:** `provider/provider.go:72–122`  
-**Status:** Real — medium severity, confirmed in current code.
-
-`provider.Registry` defines `Register`, `Get`, `GetModel`, `List`, but no call
-to `provider.NewRegistry()` exists anywhere in the project. Adding a third
-provider (e.g. Gemini) requires modifying every cmd entry's if/else chain
-instead of registering once.
-
-**Fix:** provide a `BuildProvider` factory on the Registry and wire cmd entries
-through it:
-
-```go
-func (r *Registry) BuildProvider(providerID string, cfg *config.ProviderInfo, authStore *auth.Store) (llm.Provider, error)
-```
+**Status:** **FIXED** — `Registry` gains `RegisterFactory(id, Factory)` and `BuildProvider(id, cfg, authStore)`; each provider package exposes a `Factory` var; both cmd entrypoints instantiate and use the registry.
 
 ---
 
 ## Priority Summary
 
-| # | Package | Issue | Severity | Effort |
+| # | Package | Issue | Severity | Status |
 |---|---------|-------|----------|--------|
-| 1 | `llm` | Retry emits partial events — corrupt processor state on retry | **High** | Medium |
-| 2 | `provider/anthropic` | Reasoning replayed as `text` block — API 400 / broken multi-turn reasoning | **High** | Medium |
-| 3 | `provider/anthropic` | `ThinkingBlock` signature not captured — multi-turn reasoning broken | **High** | Medium |
-| 4 | `provider/openai` | `NewFromConfig` ignores extra headers from config | Low | Low |
-| 5 | `provider/openai` | `IncludeUsage` sent to all compatible providers — proxy rejection risk | Low | Low |
-| 6 | `session` | Cleanup grace period multiplied by N tools — incorrect timeout logic | Medium | Medium |
-| 7 | `store` | Weak `Part.Data` typing — silent assertion failures, no compile-time safety | Low | High |
-| 8 | `knowledge` | Cross-group results have no global score sort — sub-optimal ranking | Low | Low |
-| 9 | `cmd` | `NewFromConfig` never called — `llm.json` provider config inert | Medium | Low |
-| 10 | `provider` | `Registry` never instantiated — extensibility blocked, dead system | Medium | Medium |
+| 1 | `llm` | Retry emits partial events — corrupt processor state on retry | **High** | **FIXED** |
+| 2 | `provider/anthropic` | Reasoning replayed as `text` block — API 400 / broken multi-turn reasoning | **High** | **FIXED** |
+| 3 | `provider/anthropic` | `ThinkingBlock` signature not captured — multi-turn reasoning broken | **High** | **FIXED** |
+| 4 | `provider/openai` | `NewFromConfig` ignores extra headers from config | Low | **FIXED** |
+| 5 | `provider/openai` | `IncludeUsage` sent to all compatible providers — proxy rejection risk | Low | Open |
+| 6 | `session` | Cleanup grace period multiplied by N tools — incorrect timeout logic | Medium | Open |
+| 7 | `store` | Weak `Part.Data` typing — silent assertion failures, no compile-time safety | Low | Open |
+| 8 | `knowledge` | Cross-group results have no global score sort — sub-optimal ranking | Low | Open |
+| 9 | `session` | `Compact()` writes boundary before LLM call — data loss on partial failure | **High** | Open |
+| 10 | `session` | `processorState` concurrent map access — data race under concurrent tools | Medium | Open |
+| 11 | `session` | `RunLoop` reloads all messages on every agentic step — unnecessary I/O | Medium | Open |
+| 12 | `session` | `Select()` uses position heuristic for compaction boundary detection | Low | Open |
+| 13 | `session` | `Prune()` never called by default — dead feature | Low | Open |
+| 14 | `cmd` | `NewFromConfig` never called — `llm.json` provider config inert | Medium | **FIXED** |
+| 15 | `provider` | `Registry` never instantiated — extensibility blocked | Medium | **FIXED** |
 
 ---
 
@@ -511,16 +366,22 @@ func (r *Registry) BuildProvider(providerID string, cfg *config.ProviderInfo, au
 
 | Original # | Issue | Fix location |
 |---|---|---|
-| 2 | `classifyStatus` case 529 unreachable | `error.go` — `case 529` now precedes `>= 500` |
-| 3 | `MaxOutputTokens` returns 0 for unset output | `overflow.go` — `fallback = 4096` added |
-| 4 (old) | Anthropic image block uses wrong constructor | `anthropic.go` — `NewImageBlockBase64` / `NewImageBlock` correctly routed |
-| 5 (old) | Anthropic system prompt loses cache granularity | `anthropic.go` — individual `TextBlockParam` entries preserved |
-| 6 (old) | OpenAI `EventToolInputStart` may never be emitted | `openai.go` — `ts.started` flag defers until both id and name are known |
-| 10 | `newID()` non-unique (UnixNano) | `processor.go` — `crypto/rand` hex |
-| 13 | Token estimation placeholder (constant 100) | `compaction.go` — uses `m.Tokens` with 100 fallback |
-| 14 | `EventToolResult` silently ignored | `processor.go` — `log.Printf` warning emitted |
-| 15 | `FilterCompacted` may mis-pair boundary and summary | `context.go` — backward walk finds most recent complete pair |
-| 16 | Double `loadMessages` per loop iteration | `prompt.go` — `ProcessContinue` uses `s.ListParts(assistantMsgID)` directly |
-| 23 | `max_results` upper bound not enforced at runtime | `search_tool.go` — `maxResultsCap = 20` enforced |
-| 25 (fetch prefix) | `fetch` fallback passes un-stripped `q.Input` to `Accepts` | `manager.go` — prefix stripped before fallback loop |
-| 26 (old) | `groupByPriority` dead `peekMode` parameter | `manager.go` — parameter removed |
+| 1 | Retry emits partial events to caller | `llm/client.go` — buffer per attempt, flush on `EventRequestFinish` |
+| 2 | Anthropic reasoning replayed as `text` block | `provider/anthropic/anthropic.go` — `ThinkingBlockParam` with `Signature` |
+| 3 | `ThinkingBlock` signature not captured | `anthropic.go` — `ThinkingBlock` case + `EventReasoningEnd`; `store.ReasoningPartData.Signature` |
+| 4 | OpenAI `NewFromConfig` ignores extra headers | `provider/openai/openai.go` — reads `cfg.Options.Extra` |
+| 9 (old) | `NewFromConfig` never called in cmd | `cmd/control/main.go`, `cmd/knowledge-api/main.go` — registry wired |
+| 10 (old) | `provider.Registry` dead code | `provider/provider.go` — `RegisterFactory` + `BuildProvider` added |
+| 2 (orig) | `classifyStatus` case 529 unreachable | `error.go` — `case 529` now precedes `>= 500` |
+| 3 (orig) | `MaxOutputTokens` returns 0 for unset output | `overflow.go` — `fallback = 4096` added |
+| 4 (orig) | Anthropic image block uses wrong constructor | `anthropic.go` — `NewImageBlockBase64` / `NewImageBlock` correctly routed |
+| 5 (orig) | Anthropic system prompt loses cache granularity | `anthropic.go` — individual `TextBlockParam` entries preserved |
+| 6 (orig) | OpenAI `EventToolInputStart` may never be emitted | `openai.go` — `ts.started` flag defers until both id and name are known |
+| 10 (orig) | `newID()` non-unique (UnixNano) | `processor.go` — `crypto/rand` hex |
+| 13 (orig) | Token estimation placeholder (constant 100) | `compaction.go` — uses `m.Tokens` with 100 fallback |
+| 14 (orig) | `EventToolResult` silently ignored | `processor.go` — `log.Printf` warning emitted |
+| 15 (orig) | `FilterCompacted` may mis-pair boundary and summary | `context.go` — backward walk finds most recent complete pair |
+| 16 (orig) | Double `loadMessages` per loop iteration | `prompt.go` — `ProcessContinue` uses `s.ListParts(assistantMsgID)` directly |
+| 23 (orig) | `max_results` upper bound not enforced at runtime | `search_tool.go` — `maxResultsCap = 20` enforced |
+| 25 (orig) | `fetch` fallback passes un-stripped `q.Input` to `Accepts` | `manager.go` — prefix stripped before fallback loop |
+| 26 (orig) | `groupByPriority` dead `peekMode` parameter | `manager.go` — parameter removed |
