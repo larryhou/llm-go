@@ -323,11 +323,18 @@ func main() {
 
 	// ── skills index + knowledge tools ───────────────────────────────────────
 
+	// sessionID declared here so it can be used by SessionHistorySource below.
+	sessionID := fmt.Sprintf("control-%d", time.Now().UnixNano())
+
 	skillsCount := 0
 	skillsAbsDir := cfg.skillsDir
 	if !filepath.IsAbs(skillsAbsDir) {
 		skillsAbsDir = filepath.Join(cwd, skillsAbsDir)
 	}
+
+	// compactionHook and historySrc are set when SessionHistorySource is created.
+	var compactionHook knowledge.CompactionHook
+	var historySrc *knowledge.SessionHistorySource
 
 	if _, statErr := os.Stat(skillsAbsDir); os.IsNotExist(statErr) {
 		fmt.Fprintf(os.Stderr, "[warn] skills directory not found: %s, skipping knowledge index\n", skillsAbsDir)
@@ -337,6 +344,17 @@ func main() {
 			fmt.Fprintf(os.Stderr, "[warn] failed to build skills index: %v, skipping knowledge index\n", idxErr)
 		} else {
 			skillsCount = n
+
+			// SessionHistorySource: indexes compacted messages for recall.
+			// Priority 0 (highest) — queried before skills index (priority 1).
+			var histErr error
+			historySrc, histErr = knowledge.NewSessionHistorySource(sessionID, knowledge.DefaultMaxCompactions)
+			if histErr != nil {
+				fmt.Fprintf(os.Stderr, "[warn] failed to create session history source: %v\n", histErr)
+			} else {
+				compactionHook = historySrc.Hook()
+			}
+
 			km := knowledge.NewManager(knowledge.ManagerConfig{
 				SourceTimeout:       10 * time.Second,
 				MaxResults:          5,
@@ -344,10 +362,13 @@ func main() {
 				ContentMaxChars:     8000,
 				AllowPartialFailure: true,
 			})
-			km.Register(blevesource.New(idx, "skills", 0, &blevesource.Config{
+			km.Register(blevesource.New(idx, "skills", 1, &blevesource.Config{
 				TitleField:   "title",
 				ContentField: "content",
 			}))
+			if historySrc != nil {
+				km.Register(historySrc)
+			}
 			tools = append(tools, km.Tools()...)
 		}
 	}
@@ -355,7 +376,6 @@ func main() {
 	// ── session store ─────────────────────────────────────────────────────────
 
 	sessionStore := memory.New()
-	sessionID := fmt.Sprintf("control-%d", time.Now().UnixNano())
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 	tool.StartCleanup(ctx)
@@ -366,6 +386,26 @@ func main() {
 		fmt.Fprintf(os.Stderr, "create session: %v\n", err)
 		os.Exit(1)
 	}
+
+	// session_reset: control is single-session, no server-level lock needed.
+	// historySrc may be nil if the skills directory was not found.
+	tools = append(tools, session.NewResetTool(func(resetCtx context.Context) error {
+		if err := sessionStore.DeleteSession(resetCtx, sessionID); err != nil {
+			return err
+		}
+		if err := sessionStore.CreateSession(resetCtx, &store.Session{
+			ID:    sessionID,
+			Model: cfg.provider + "/" + cfg.modelID,
+		}); err != nil {
+			return err
+		}
+		if historySrc != nil {
+			if err := historySrc.Reset(); err != nil {
+				fmt.Fprintf(os.Stderr, "[warn] session history index reset failed: %v\n", err)
+			}
+		}
+		return nil
+	}))
 
 	// ── system prompt ─────────────────────────────────────────────────────────
 
@@ -478,6 +518,7 @@ func main() {
 			ExtraSystem: extraSystem,
 			MaxSteps:    cfg.maxSteps,
 			Config:      sessionCfg,
+			OnCompact:   compactionHook,
 		})
 
 		// Signal printer to drain and exit.
