@@ -38,19 +38,7 @@ Each item has been verified against the current codebase. Items marked **[FIXED]
 ### 5. OpenAI `StreamOptions.IncludeUsage` sent to all compatible providers — `provider/openai/openai.go`
 
 **Location:** `openai.go:101–103`  
-**Status:** Real — low severity, confirmed in current code.
-
-```go
-StreamOptions: openai.ChatCompletionStreamOptionsParam{
-    IncludeUsage: openai.Bool(true),
-},
-```
-
-This is an OpenAI-specific extension. Some OpenAI-compatible proxies and local
-model servers reject requests with unknown fields.
-
-**Fix:** gate behind a known-safe provider allowlist, or make configurable via
-a provider-level capability flag.
+**Status:** **FIXED** — `StreamOptions.IncludeUsage` now only added when `req.Model.ProviderID == ProviderID` ("openai"). Third-party compatible providers skip the field entirely.
 
 ---
 
@@ -163,7 +151,7 @@ a provider-level capability flag.
 | 2 | `provider/anthropic` | Reasoning replayed as `text` block — API 400 / broken multi-turn reasoning | **High** | **FIXED** |
 | 3 | `provider/anthropic` | `ThinkingBlock` signature not captured — multi-turn reasoning broken | **High** | **FIXED** |
 | 4 | `provider/openai` | `NewFromConfig` ignores extra headers from config | Low | **FIXED** |
-| 5 | `provider/openai` | `IncludeUsage` sent to all compatible providers — proxy rejection risk | Low | Open |
+| 5 | `provider/openai` | `IncludeUsage` sent to all compatible providers — proxy rejection risk | Low | **FIXED** |
 | 6 | `session` | `Compact()` writes boundary before LLM call — data loss on partial failure | **High** | **FIXED** |
 | 7 | `session` | `processorState` concurrent map access — data race under concurrent tools | Medium | **FIXED** |
 | 8 | `session` | Cleanup grace period multiplied by N tools — incorrect timeout logic | Medium | **FIXED** |
@@ -177,7 +165,7 @@ a provider-level capability flag.
 | 16 | `cmd` | `NewFromConfig` never called — `llm.json` provider config inert | Medium | **FIXED** |
 | 17 | `provider` | `Registry` never instantiated — extensibility blocked | Medium | **FIXED** |
 
-Only **#5** (IncludeUsage compatibility) remains fully open.
+Only **#14** (weak `Part.Data` typing — sealed interface) remains as future work.
 
 ---
 
