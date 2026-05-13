@@ -25,12 +25,13 @@ github.com/larryhou/llm-go/
 │   ├── anthropic/         Anthropic Messages API adapter (anthropic-sdk-go)
 │   └── openai/            OpenAI Chat Completions adapter (openai-go)
 ├── tool/        Tool interface, Registry, Truncate, builtin tools
-├── store/       Store interface + memory/ implementation
+├── store/       Store interface (incl. DeleteSession) + memory/ implementation
 └── session/
     ├── processor.go   LLM event handler — tool call lifecycle, doom-loop detection
     ├── context.go     ToModelMessages() — store records → llm.Message[]
     ├── compaction.go  Context overflow: Select(), Compact(), Prune()
     ├── prompt.go      RunLoop() — main agentic loop
+    ├── reset_tool.go  session_reset built-in tool
     ├── system.go      Per-provider system prompt selection (embedded .txt files)
     └── max-steps.txt  Prefilled assistant prompt injected on the last agentic step
 ```
@@ -324,6 +325,58 @@ Always use `DataAs` instead of bare `p.Data.(T)` assertions. The JSON fallback e
 - `sessionMsgs` and `messageParts` are insertion-order `[]string` slices → `ListMessages`/`ListParts` are O(n).
 - `sessionOrder []string` (added) mirrors the same design for sessions → `ListSessions` is now O(n), no sort needed.
 - `hasPartType(ps []*store.Part, partType string) bool` — internal helper in `session/compaction.go`, used by both `FilterCompacted` (via `context.go`) and `Select()` to identify compaction boundary messages by `PartTypeCompaction`.
+- `DeleteSession(ctx, id)` — removes all parts, messages, and session record in a single write-lock pass. Idempotent (returns nil if session does not exist). Used by `session_reset` tool.
+
+---
+
+## Built-in Session Tools
+
+### `session.ResetTool` — `session/reset_tool.go`
+
+`session_reset` is a built-in tool that lets the LLM completely wipe a session's history on explicit user request.
+
+**Behaviour:**
+1. Calls the provided `resetFn(ctx)` callback which atomically: deletes all messages/parts via `store.DeleteSession`, recreates the empty session record, and resets the `SessionHistorySource` Bleve index.
+2. Returns a confirmation message to the LLM.
+
+**Confirmation requirement:** The tool description explicitly instructs the LLM that it **must** warn the user and obtain confirmation before calling. This is enforced by prompt, not by a `confirmed` parameter.
+
+**Construction:**
+
+```go
+resetFn := func(ctx context.Context) error {
+    // Hold any server-level lock here to prevent concurrent requests
+    // from interleaving between DeleteSession and CreateSession.
+    mu.Lock()
+    defer mu.Unlock()
+    if err := store.DeleteSession(ctx, sessID); err != nil {
+        return err
+    }
+    if err := store.CreateSession(ctx, &store.Session{ID: sessID}); err != nil {
+        return err
+    }
+    return historySrc.Reset() // non-fatal if nil
+}
+
+resetTool := session.NewResetTool(resetFn)
+```
+
+**Wiring** (cache on the session object, not recreated per request):
+
+```go
+sess = &chatSession{
+    hook:      historySrc.Hook(),
+    resetTool: session.NewResetTool(resetFn), // created once
+}
+
+// In RunLoop:
+session.RunLoop(ctx, store, session.RunInput{
+    Tools:     append(km.Tools(), sess.resetTool),
+    OnCompact: sess.hook,
+})
+```
+
+**Partial failure note:** If `CreateSession` fails after `DeleteSession` succeeds, the session is absent from the store but still present in the server's in-memory map. Subsequent `RunLoop` calls will fail until server restart or manual recovery. This is low-probability for in-memory stores.
 
 ---
 
@@ -410,6 +463,7 @@ When configuring custom endpoints (e.g. proxies or OpenAI wrappers), be aware of
 - **Anthropic**: The `anthropic-sdk-go` will automatically append the specific resource paths (like `/v1/messages`) to the `BaseURL`. Therefore, you should NOT include `/v1` or `/v1/messages` in the BaseURL (e.g., use `http://192.168.3.119:8080/claude` instead of `http://192.168.3.119:8080/claude/v1`).
 - **OpenAI**: The `openai-go` SDK (or compatible proxies) usually expects the `/v1` to be part of the BaseURL (e.g., `http://192.168.3.119:8080/timi-claude/v1`).
 - **Tool Use Inputs**: Anthropic natively requires tool arguments to be provided as a proper JSON object. When implementing `Provider.Stream`, do not JSON-marshal `llm.PartTypeToolCall.Input` to a string before passing it into `anthropic.NewToolUseBlock`, as it expects an `any` interface and stringifying it will result in `unexpected EOF` or 400 errors from strict proxy endpoints.
+- **StreamOptions.IncludeUsage**: `ChatCompletionStreamOptionsParam{IncludeUsage: true}` is an OpenAI-specific extension. It is only sent when `req.Model.ProviderID == "openai"`. Third-party compatible providers (e.g. custom proxies with a different `ProviderID`) skip this field entirely to avoid rejection.
 
 ### Error Classification
 

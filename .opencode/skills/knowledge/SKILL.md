@@ -272,15 +272,35 @@ sessKM := knowledge.NewManager(knowledge.ManagerConfig{
 sessKM.Register(blevesource.New(skillsIdx, "skills", 1, nil)) // priority 1
 sessKM.Register(historySrc)                                    // priority 0
 
+// resetFn holds s.mu so DeleteSession+CreateSession+Reset are atomic
+// with respect to concurrent /chat requests for the same session.
+resetFn := func(ctx context.Context) error {
+    s.mu.Lock()
+    defer s.mu.Unlock()
+    if err := st.DeleteSession(ctx, sessID); err != nil {
+        return err
+    }
+    if err := st.CreateSession(ctx, &store.Session{ID: sessID}); err != nil {
+        return err
+    }
+    return historySrc.Reset()
+}
+
 sess = &chatSession{
     historySrc: historySrc,
     km:         sessKM,
-    hook:       historySrc.Hook(), // cached — not re-created per request
+    hook:       historySrc.Hook(),                    // cached — not re-created per request
+    resetTool:  session.NewResetTool(resetFn),        // cached — not re-created per request
 }
 
 // In RunLoop:
+kmTools := sess.km.Tools()
+allTools := make([]tool.Tool, 0, len(kmTools)+1)
+allTools = append(allTools, kmTools...)
+allTools = append(allTools, sess.resetTool) // explicit make avoids km.Tools() array aliasing
+
 session.RunLoop(ctx, store, session.RunInput{
-    Tools:     sess.km.Tools(),
+    Tools:     allTools,
     OnCompact: sess.hook,
 })
 ```
@@ -516,6 +536,12 @@ blevesource.New(idx, "docs", 0, &blevesource.Config{
 - `CompactionHook` is called synchronously inside `Compact()` — keep it fast.
 - `sess.hook` must be cached on `chatSession` (not re-created per request).
 
+### Session reset (`session_reset` tool)
+- `session.NewResetTool(resetFn)` — the `resetFn` callback must be wired under the server's session lock to prevent concurrent request races between `DeleteSession` and `CreateSession`.
+- `historySrc.Reset()` sets `s.index = nil` before rebuilding — all `Peek`/`Fetch`/`Hook` calls guard against nil index.
+- Cache `resetTool` on `chatSession` alongside `hook`; do not recreate per request.
+- Build `allTools` with an explicit `make([]tool.Tool, 0, cap)` to avoid aliasing `km.Tools()`'s backing array.
+
 ---
 
 ## Key Files
@@ -531,6 +557,7 @@ blevesource.New(idx, "docs", 0, &blevesource.Config{
 | `knowledge/gsetokenizer/gsetokenizer.go` | gse Bleve tokenizer adapter — registered via `init()` |
 | `knowledge/knowledge_test.go` | 14 unit tests covering routing, priority, truncation, timeout, partial failure |
 | `knowledge/source/bleve/bleve.go` | Reference Source implementation — use as template for new sources |
+| `session/reset_tool.go` | `session_reset` built-in tool — atomic store delete + index reset via callback |
 | `session/knowledge-recall.txt` | Chinese system prompt guidance for `knowledge_search` recall |
 
 
