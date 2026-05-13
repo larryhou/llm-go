@@ -18,8 +18,10 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 
 	bleve "github.com/blevesearch/bleve/v2"
@@ -354,7 +356,9 @@ func main() {
 
 	sessionStore := memory.New()
 	sessionID := fmt.Sprintf("control-%d", time.Now().UnixNano())
-	ctx := context.Background()
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+	tool.StartCleanup(ctx)
 	if err := sessionStore.CreateSession(ctx, &store.Session{
 		ID:    sessionID,
 		Model: cfg.provider + "/" + cfg.modelID,

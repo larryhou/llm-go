@@ -314,18 +314,16 @@ func hasToolCalls(ps []*store.Part) bool {
 }
 
 // loadMessages loads all messages and their parts for a session.
+// Uses ListPartsBySession to fetch all parts in a single operation,
+// avoiding N+1 queries against real database backends.
 func loadMessages(ctx context.Context, s store.Store, sessionID string) ([]*store.Message, map[string][]*store.Part, error) {
 	msgs, err := s.ListMessages(ctx, sessionID)
 	if err != nil {
 		return nil, nil, err
 	}
-	allParts := make(map[string][]*store.Part, len(msgs))
-	for _, m := range msgs {
-		ps, err := s.ListParts(ctx, m.ID)
-		if err != nil {
-			return nil, nil, err
-		}
-		allParts[m.ID] = ps
+	allParts, err := s.ListPartsBySession(ctx, sessionID)
+	if err != nil {
+		return nil, nil, err
 	}
 	return msgs, allParts, nil
 }

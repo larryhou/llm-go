@@ -1,6 +1,7 @@
 package tool
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -36,8 +37,28 @@ var truncDir string
 
 func init() {
 	truncDir = filepath.Join(os.TempDir(), "opencode-tool-output")
-	// Background cleanup: remove files older than 7 days
-	go cleanupLoop()
+}
+
+// StartCleanup starts the background cleanup goroutine that removes truncation
+// files older than RetentionDays. It respects ctx cancellation so it exits
+// cleanly when the process shuts down. Call once from main().
+func StartCleanup(ctx context.Context) {
+	go func() {
+		// Initial delay of 1 minute before first cleanup
+		select {
+		case <-time.After(time.Minute):
+		case <-ctx.Done():
+			return
+		}
+		for {
+			cleanupOldFiles()
+			select {
+			case <-time.After(time.Hour):
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
 }
 
 // Truncate applies line/byte limits to text.
@@ -137,15 +158,6 @@ func writeTruncationFile(toolName, content string) string {
 		return ""
 	}
 	return path
-}
-
-func cleanupLoop() {
-	// Initial delay of 1 minute before first cleanup
-	time.Sleep(time.Minute)
-	for {
-		cleanupOldFiles()
-		time.Sleep(time.Hour)
-	}
 }
 
 func cleanupOldFiles() {

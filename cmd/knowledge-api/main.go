@@ -50,11 +50,13 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	bleve "github.com/blevesearch/bleve/v2"
@@ -102,6 +104,9 @@ func main() {
 	flag.StringVar(&cfg.modelID, "model", envOr("TIMI_MODEL", "claude-sonnet-4.6"), "LLM model ID")
 	flag.IntVar(&cfg.maxSteps, "max-steps", 10, "max LLM steps per turn")
 	flag.Parse()
+
+	rootCtx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
 
 	if cfg.baseURL == "" {
 		if cfg.provider == "openai" {
@@ -161,6 +166,7 @@ func main() {
 	}
 
 	// Build in-memory Bleve index from skills directory.
+	tool.StartCleanup(rootCtx)
 	idx, count, err := buildMemoryIndex(cfg.skillsDir)
 	if err != nil {
 		log.Fatalf("build index: %v", err)

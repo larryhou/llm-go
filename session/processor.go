@@ -49,8 +49,19 @@ type ProcessInput struct {
 // Processor handles one LLM streaming turn, managing the lifecycle of
 // text parts, reasoning parts, and tool call parts in the store.
 // Aligned with packages/opencode/src/session/processor.ts.
+//
+// Each Processor instance is scoped to a single RunLoop call (one user turn).
+// Do NOT share a Processor across multiple sessions or RunLoop calls; the
+// doom-loop recentCalls window would span unrelated sessions and produce
+// false positives.
 type Processor struct {
 	store store.Store
+
+	// recentCalls is shared across Process calls within one RunLoop so that
+	// doom-loop detection spans multiple agentic steps within the same turn.
+	// It is intentionally not reset between Process calls.
+	recentCallsMu sync.Mutex
+	recentCalls   []recentCall
 }
 
 // NewProcessor creates a Processor backed by the given store.
@@ -99,8 +110,9 @@ func (p *Processor) Process(ctx context.Context, assistantMsgID string, input Pr
 		model:          input.Model,
 		toolCtx:        toolCtx,
 		toolCancel:     toolCancel,
-		// track last N tool calls for doom-loop detection
-		recentCalls: make([]recentCall, 0, DoomLoopThreshold),
+		// recentCalls shared from Processor so doom-loop detection spans steps
+		sharedRecentCalls:   &p.recentCalls,
+		sharedRecentCallsMu: &p.recentCallsMu,
 	}
 
 	result := ProcessContinue
@@ -160,8 +172,9 @@ type processorState struct {
 	toolCancel context.CancelFunc
 	toolWg     sync.WaitGroup
 
-	// doom-loop detection
-	recentCalls []recentCall
+	// doom-loop detection: shared with Processor so it spans agentic steps
+	sharedRecentCalls   *[]recentCall
+	sharedRecentCallsMu *sync.Mutex
 
 	// token usage accumulation
 	totalUsage llm.TokenUsage
@@ -338,17 +351,20 @@ func (s *processorState) executeTool(ctx context.Context, callID, toolName, part
 }
 
 // checkDoomLoop returns true if the same tool with same args has been called
-// DoomLoopThreshold times consecutively.
+// DoomLoopThreshold times consecutively. Uses the shared cross-step slice.
 func (s *processorState) checkDoomLoop(toolName, inputKey string) bool {
-	s.recentCalls = append(s.recentCalls, recentCall{toolName: toolName, inputKey: inputKey})
-	if len(s.recentCalls) > DoomLoopThreshold {
-		s.recentCalls = s.recentCalls[len(s.recentCalls)-DoomLoopThreshold:]
+	s.sharedRecentCallsMu.Lock()
+	defer s.sharedRecentCallsMu.Unlock()
+
+	*s.sharedRecentCalls = append(*s.sharedRecentCalls, recentCall{toolName: toolName, inputKey: inputKey})
+	if len(*s.sharedRecentCalls) > DoomLoopThreshold {
+		*s.sharedRecentCalls = (*s.sharedRecentCalls)[len(*s.sharedRecentCalls)-DoomLoopThreshold:]
 	}
-	if len(s.recentCalls) < DoomLoopThreshold {
+	if len(*s.sharedRecentCalls) < DoomLoopThreshold {
 		return false
 	}
-	first := s.recentCalls[0]
-	for _, c := range s.recentCalls[1:] {
+	first := (*s.sharedRecentCalls)[0]
+	for _, c := range (*s.sharedRecentCalls)[1:] {
 		if c.toolName != first.toolName || c.inputKey != first.inputKey {
 			return false
 		}

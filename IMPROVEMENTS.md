@@ -215,3 +215,218 @@ Only **#5** (IncludeUsage compatibility) remains fully open.
 | 26 (orig) | `groupByPriority` dead `peekMode` parameter | `manager.go` — parameter removed |
 | 25 (orig) | `fetch` fallback passes un-stripped `q.Input` to `Accepts` | `manager.go` — prefix stripped before fallback loop |
 | 26 (orig) | `groupByPriority` dead `peekMode` parameter | `manager.go` — parameter removed |
+
+---
+
+## New Findings (Independent Code Review)
+
+### Findings Summary
+
+| # | Package | Issue | Severity | Action |
+|---|---------|-------|----------|--------|
+| A | `provider/openai` | User messages silently drop image/file parts | **High** | Fix |
+| B | `provider/openai` | `EventToolInputStart` not emitted when first delta has empty `tc.ID` | **High** | Fix |
+| C | `tool` | `init()` spawns an unstoppable background goroutine | Medium | Fix |
+| D | `store` | No batch query on `Store` interface — N+1 when backed by a real DB | Medium | Fix interface |
+| E | `store` | `DataAs` JSON round-trip silently returns zero-value when `Data` is nil | Low–Medium | Fix |
+| F | `session` | Doom-loop detection resets per `Process` call — does not span agentic steps | Low | Clarify / Fix |
+| G | `config` | `Load()` does shallow JSON unmarshal merge — project config cannot unset global fields | Low | Document / Fix |
+| H | `session` | `system.go` model-ID matching uses short substrings (`o1`, `o3`) — false positives on custom IDs | Low | Fix |
+
+---
+
+### A. OpenAI provider silently drops image/file parts — `provider/openai/openai.go`
+
+**Location:** `openai.go:183–185`
+
+```go
+case llm.RoleUser:
+    text := extractText(m.Content)
+    out = append(out, openai.UserMessage(text))
+```
+
+`extractText` only concatenates `PartTypeText` parts. `PartTypeImage` and `PartTypeFile`
+parts are silently discarded with no error or warning. The Anthropic provider correctly
+handles images via `userBlocks` / `NewImageBlockBase64` / `NewImageBlock`.
+
+**Impact:** Any multimodal user message sent via an OpenAI-compatible provider loses all
+attachments. The LLM receives only the text portion; no error is surfaced to the caller.
+
+**Fix:** Extend `convertMessages` user-role branch to build a multi-part content array
+(using `openai.ImagePart` / `openai.TextPart`) when the message contains image or file
+parts, mirroring the Anthropic `userBlocks` implementation.
+
+---
+
+### B. `EventToolInputStart` not emitted when first delta has empty `tc.ID` — `provider/openai/openai.go`
+
+**Location:** `openai.go:319–329`
+
+```go
+if !exists {
+    ts = &toolState{id: tc.ID, name: tc.Function.Name}
+    toolByIndex[idx] = ts
+    if tc.ID != "" {
+        out <- llm.Event{Type: llm.EventToolInputStart, ...}
+    }
+}
+```
+
+Some OpenAI-compatible providers send the first tool-call delta with an empty `tc.ID`,
+filling it in a subsequent delta. When that happens `EventToolInputStart` is never emitted.
+`processor.go` creates the tool `Part` on `EventToolInputStart`; if the event is absent,
+`activeToolParts[callID]` has no entry and the entire tool call part is lost silently.
+
+**Impact:** Tool calls from certain providers are not persisted to the store; the agentic
+loop continues without a record of the tool execution.
+
+**Fix:** Decouple part creation from `EventToolInputStart`. Either emit a deferred
+`EventToolInputStart` once `tc.ID` becomes known, or have the processor create the part
+lazily on `EventToolCall` if no prior start event was received.
+
+---
+
+### C. `init()` spawns an unstoppable background goroutine — `tool/truncate.go`
+
+**Location:** `truncate.go:37–41`
+
+```go
+func init() {
+    truncDir = filepath.Join(os.TempDir(), "opencode-tool-output")
+    go cleanupLoop()
+}
+```
+
+`cleanupLoop` runs an infinite `time.Sleep / cleanupOldFiles` loop. It starts
+automatically on package import, has no shutdown channel, and cannot be stopped.
+In test binaries every `go test` run leaks this goroutine. In long-running processes
+it is benign but uncontrollable.
+
+**Fix:** Replace `init()` with an explicit `StartCleanup(ctx context.Context)` function
+that respects context cancellation. Callers (e.g. `cmd/knowledge-api`) call it once at
+startup and pass the root context.
+
+---
+
+### D. `Store` interface lacks batch query — N+1 pattern when backed by a real DB — `store/store.go`
+
+**Location:** `store/store.go:12–30`, `session/prompt.go:317–330`
+
+`loadMessages` calls `ListParts(ctx, m.ID)` once per message:
+
+```go
+for _, m := range msgs {
+    ps, err := s.ListParts(ctx, m.ID)
+    ...
+}
+```
+
+With an in-memory store this is cheap. Against a SQL or remote store each call is a
+round-trip, resulting in N+1 queries per agentic step. The interface has no
+`ListPartsBySession(sessionID)` method to retrieve all parts in one query.
+
+**Impact:** Acceptable today (only `memory` store exists). Any future SQL/Redis
+implementation will inherit this N+1 without a compile-time signal.
+
+**Fix:** Add `ListPartsBySession(ctx context.Context, sessionID string) ([]*Part, error)`
+to the `Store` interface. Update `loadMessages` to use it. Implement in `memory.Store`
+by iterating `sessionMsgs` and collecting all parts.
+
+---
+
+### E. `DataAs` returns zero-value silently when `Part.Data` is nil — `store/store.go`
+
+**Location:** `store/store.go:174–189`
+
+```go
+func DataAs[T any](p *Part) (T, bool) {
+    if v, ok := p.Data.(T); ok {
+        return v, ok
+    }
+    b, err := json.Marshal(p.Data)   // json.Marshal(nil) → "null"
+    ...
+    var v T
+    _ = json.Unmarshal(b, &v)        // json.Unmarshal("null", &v) → v stays zero
+    return v, true                   // ok=true even though Data was nil
+}
+```
+
+When `p.Data` is `nil`, `json.Marshal` produces `"null"`, `json.Unmarshal` sets the
+pointer target to `nil`, and the function returns `(nil, true)`. The caller gets
+`ok=true` with a nil pointer, which may panic on dereference or silently produce
+incorrect behaviour.
+
+**Fix:** Add an explicit nil check before the JSON fallback:
+
+```go
+if p.Data == nil {
+    var zero T
+    return zero, false
+}
+```
+
+---
+
+### F. Doom-loop detection resets per `Process` call — `session/processor.go`
+
+**Location:** `processor.go:93–104`
+
+`processorState` (including `recentCalls`) is created fresh inside each `Process` call.
+The doom-loop counter therefore resets between agentic steps. A tool called once per
+step across three consecutive steps will never trigger the threshold, even though the
+LLM is clearly stuck.
+
+**Impact:** Low — most actual doom loops occur within a single step (multiple tool
+calls in one LLM response). Cross-step loops are caught eventually by `MaxSteps`.
+
+**Fix (if desired):** Move `recentCalls` to `Processor` (shared across calls) or pass it
+in via `ProcessInput`. Add a reset condition when a different tool is called.
+
+---
+
+### G. `config.Load()` shallow merge cannot unset global fields — `config/config.go`
+
+**Location:** `config.go:259–274`
+
+```go
+cfg := &Info{}
+for _, p := range paths {
+    json.Unmarshal(data, cfg)   // second file merges into same struct
+}
+```
+
+Go's `json.Unmarshal` only overwrites fields present in the JSON; absent fields keep
+their previous value. A project-local config cannot reset a field set by the global
+config to its zero value (e.g. cannot clear a string or reset a `*bool` to `nil`).
+
+**Impact:** Low for current two-layer setup. Becomes confusing as config complexity grows.
+
+**Fix:** Document the merge semantics explicitly. For a proper deep-merge, unmarshal each
+file into a separate `Info` and merge field-by-field with explicit "unset" sentinel support
+(e.g. JSON `null` clears a pointer field).
+
+---
+
+### H. Model-ID matching uses short substrings — false positives — `session/system.go`
+
+**Location:** `system.go:56`
+
+```go
+case strings.Contains(id, "gpt-4") || strings.Contains(id, "o1") || strings.Contains(id, "o3"):
+    return promptBeast
+```
+
+`"o1"` and `"o3"` are two-character strings that will match any model ID containing
+those characters (e.g. `"moonshot-o1-mini"`, `"custom-o3-turbo"`, any UUID containing
+`o1`). The wrong system prompt is injected silently.
+
+**Impact:** Low for standard OpenAI/Anthropic model naming. Affects users with custom
+or third-party model IDs.
+
+**Fix:** Use word-boundary or prefix matching:
+
+```go
+case id == "o1" || id == "o3" || strings.HasPrefix(id, "o1-") || strings.HasPrefix(id, "o3-") ||
+     strings.Contains(id, "gpt-4"):
+```
+

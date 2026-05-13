@@ -199,3 +199,22 @@ func (s *Store) ListParts(_ context.Context, messageID string) ([]*store.Part, e
 	}
 	return out, nil
 }
+
+func (s *Store) ListPartsBySession(_ context.Context, sessionID string) (map[string][]*store.Part, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	msgIDs := s.sessionMsgs[sessionID]
+	result := make(map[string][]*store.Part, len(msgIDs))
+	for _, mid := range msgIDs {
+		ids := s.messageParts[mid]
+		parts := make([]*store.Part, 0, len(ids))
+		for _, id := range ids {
+			if p, ok := s.parts[id]; ok {
+				cp := *p
+				parts = append(parts, &cp)
+			}
+		}
+		result[mid] = parts
+	}
+	return result, nil
+}

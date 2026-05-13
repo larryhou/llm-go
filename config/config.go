@@ -256,9 +256,29 @@ const (
 //  1. $XDG_CONFIG_HOME/llm/llm.json   (global user config)
 //  2. ~/.config/llm/llm.json           (fallback when XDG_CONFIG_HOME is unset)
 //  3. .llm/llm.json                    (project-local override)
+//
+// # Merge semantics (BREAKING CHANGE from earlier behaviour)
+//
+// Merging follows RFC 7396 JSON Merge Patch semantics at the top level of
+// the JSON object:
+//   - A key present in a later file overwrites the same key from an earlier file.
+//   - Setting a key to JSON null in a later file removes it entirely.
+//
+// IMPORTANT: this is a shallow merge at the top-level only. Nested JSON objects
+// (e.g. "provider", "agent", "compaction") are replaced wholesale by the value
+// in the later file — individual sub-fields are NOT inherited from earlier files.
+//
+// Migration note: if your global config defines multiple providers and your
+// project config overrides only one, you must repeat all provider entries in
+// the project-local file or the others will be lost. The old behaviour (sequential
+// json.Unmarshal into the same struct) merged nested struct fields individually;
+// that behaviour is no longer present.
 func Load() (*Info, error) {
 	paths := configPaths()
-	cfg := &Info{}
+
+	// Start with an empty JSON object as the base.
+	merged := map[string]json.RawMessage{}
+
 	for _, p := range paths {
 		data, err := os.ReadFile(p)
 		if err != nil {
@@ -267,9 +287,28 @@ func Load() (*Info, error) {
 			}
 			return nil, err
 		}
-		if err := json.Unmarshal(data, cfg); err != nil {
+		var layer map[string]json.RawMessage
+		if err := json.Unmarshal(data, &layer); err != nil {
 			return nil, fmt.Errorf("config: parse %s: %w", p, err)
 		}
+		// Apply merge patch: null values remove the key, others overwrite.
+		for k, v := range layer {
+			if string(v) == "null" {
+				delete(merged, k)
+			} else {
+				merged[k] = v
+			}
+		}
+	}
+
+	// Encode merged map back to JSON, then decode into typed struct.
+	b, err := json.Marshal(merged)
+	if err != nil {
+		return nil, fmt.Errorf("config: re-encode merged config: %w", err)
+	}
+	cfg := &Info{}
+	if err := json.Unmarshal(b, cfg); err != nil {
+		return nil, fmt.Errorf("config: decode merged config: %w", err)
 	}
 	return cfg, nil
 }

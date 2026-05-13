@@ -53,7 +53,9 @@ func SystemPromptForModel(model llm.Model) string {
 	lower := strings.ToLower(id)
 
 	switch {
-	case strings.Contains(id, "gpt-4") || strings.Contains(id, "o1") || strings.Contains(id, "o3"):
+	case strings.Contains(id, "gpt-4") ||
+		id == "o1" || strings.HasPrefix(id, "o1-") ||
+		id == "o3" || strings.HasPrefix(id, "o3-"):
 		return promptBeast
 	case strings.Contains(id, "gpt") && strings.Contains(lower, "codex"):
 		return promptCodex

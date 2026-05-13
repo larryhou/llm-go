@@ -27,6 +27,10 @@ type Store interface {
 	GetPart(ctx context.Context, id string) (*Part, error)
 	UpdatePart(ctx context.Context, p *Part) error
 	ListParts(ctx context.Context, messageID string) ([]*Part, error)
+	// ListPartsBySession returns all parts for every message in the session,
+	// keyed by message ID. Implementations should return all parts in a single
+	// operation to avoid N+1 queries against real databases.
+	ListPartsBySession(ctx context.Context, sessionID string) (map[string][]*Part, error)
 }
 
 // Session is a top-level conversation container.
@@ -172,6 +176,10 @@ type RetryPartData struct {
 //
 //	d, ok := store.DataAs[*store.ToolPartData](p)
 func DataAs[T any](p *Part) (T, bool) {
+	if p.Data == nil {
+		var zero T
+		return zero, false
+	}
 	if v, ok := p.Data.(T); ok {
 		return v, ok
 	}

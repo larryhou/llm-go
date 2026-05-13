@@ -4,6 +4,7 @@ package openai
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -181,8 +182,37 @@ func convertMessages(system []string, msgs []llm.Message) ([]openai.ChatCompleti
 	for _, m := range msgs {
 		switch m.Role {
 		case llm.RoleUser:
-			text := extractText(m.Content)
-			out = append(out, openai.UserMessage(text))
+			// Build a multi-part content array when the message contains image or
+			// file parts; otherwise fall back to a plain text message.
+			var parts []openai.ChatCompletionContentPartUnionParam
+			for _, p := range m.Content {
+			switch p.Type {
+			case llm.PartTypeText:
+				if p.Text != "" {
+					parts = append(parts, openai.TextContentPart(p.Text))
+				}
+				case llm.PartTypeImage:
+					if p.URL != "" {
+						parts = append(parts, openai.ImageContentPart(
+							openai.ChatCompletionContentPartImageImageURLParam{URL: p.URL},
+						))
+					} else if len(p.Data) > 0 && p.MediaType != "" {
+						parts = append(parts, openai.ImageContentPart(
+							openai.ChatCompletionContentPartImageImageURLParam{
+								URL: "data:" + p.MediaType + ";base64," + encodeBase64(p.Data),
+							},
+						))
+					}
+				// PartTypeFile: no standard OpenAI multi-modal file part; skip silently
+				}
+			}
+			if len(parts) == 0 {
+				// No renderable content (e.g. file-only message). Skip rather
+				// than sending an empty string that would confuse the model.
+				continue
+			} else {
+				out = append(out, openai.UserMessage(parts))
+			}
 
 		case llm.RoleAssistant:
 			text := ""
@@ -245,6 +275,10 @@ func extractText(parts []llm.ContentPart) string {
 	return text
 }
 
+func encodeBase64(data []byte) string {
+	return base64.StdEncoding.EncodeToString(data)
+}
+
 // runStream processes the OpenAI streaming response and emits canonical events.
 //
 // Usage handling: with stream_options.include_usage=true, the provider sends
@@ -258,9 +292,10 @@ func runStream(ctx context.Context, providerID string, stream *ssestream.Stream[
 	out <- llm.Event{Type: llm.EventStepStart}
 
 	type toolState struct {
-		id   string
-		name string
-		args []byte
+		id      string
+		name    string
+		args    []byte
+		started bool // true once EventToolInputStart has been emitted
 	}
 	toolByIndex := map[int64]*toolState{}
 	inText := false
@@ -319,13 +354,6 @@ func runStream(ctx context.Context, providerID string, stream *ssestream.Stream[
 			if !exists {
 				ts = &toolState{id: tc.ID, name: tc.Function.Name}
 				toolByIndex[idx] = ts
-				if tc.ID != "" {
-					out <- llm.Event{
-						Type:       llm.EventToolInputStart,
-						ToolCallID: tc.ID,
-						ToolName:   tc.Function.Name,
-					}
-				}
 			}
 			if tc.ID != "" && ts.id == "" {
 				ts.id = tc.ID
@@ -333,13 +361,38 @@ func runStream(ctx context.Context, providerID string, stream *ssestream.Stream[
 			if tc.Function.Name != "" && ts.name == "" {
 				ts.name = tc.Function.Name
 			}
-			if tc.Function.Arguments != "" {
-				ts.args = append(ts.args, tc.Function.Arguments...)
+			// Emit EventToolInputStart once both id and name are known.
+			// Deferred here to handle providers that send an empty id on the
+			// first delta and fill it in a subsequent one.
+			if !ts.started && ts.id != "" && ts.name != "" {
+				ts.started = true
 				out <- llm.Event{
-					Type:       llm.EventToolInputDelta,
+					Type:       llm.EventToolInputStart,
 					ToolCallID: ts.id,
 					ToolName:   ts.name,
-					Text:       tc.Function.Arguments,
+				}
+				// Replay any argument bytes that arrived before we had an ID.
+				if len(ts.args) > 0 {
+					out <- llm.Event{
+						Type:       llm.EventToolInputDelta,
+						ToolCallID: ts.id,
+						ToolName:   ts.name,
+						Text:       string(ts.args),
+					}
+				}
+			}
+			if tc.Function.Arguments != "" {
+				ts.args = append(ts.args, tc.Function.Arguments...)
+				// Only emit delta if we've already sent EventToolInputStart;
+				// otherwise the args are buffered in ts.args and will be
+				// replayed in the block above when the ID arrives.
+				if ts.started {
+					out <- llm.Event{
+						Type:       llm.EventToolInputDelta,
+						ToolCallID: ts.id,
+						ToolName:   ts.name,
+						Text:       tc.Function.Arguments,
+					}
 				}
 			}
 		}
