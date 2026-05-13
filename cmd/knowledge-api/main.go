@@ -247,6 +247,7 @@ type chatSession struct {
 	historySrc *knowledge.SessionHistorySource
 	km         *knowledge.Manager // per-session manager: skills source + history source
 	hook       knowledge.CompactionHook // cached hook from historySrc
+	resetTool  tool.Tool                // cached session_reset tool
 }
 
 // ── /health ───────────────────────────────────────────────────────────────────
@@ -427,12 +428,33 @@ func (s *server) handleChat(w http.ResponseWriter, r *http.Request) {
 		}))
 		sessKM.Register(historySrc)
 
+		// resetFn is called under s.mu to prevent concurrent requests for the
+		// same session from interleaving between DeleteSession and CreateSession.
+		st := s.sessionStore // capture for closure
+		resetFn := func(ctx context.Context) error {
+			s.mu.Lock()
+			defer s.mu.Unlock()
+			if err := st.DeleteSession(ctx, sessID); err != nil {
+				return fmt.Errorf("delete session: %w", err)
+			}
+			if err := st.CreateSession(ctx, &store.Session{ID: sessID}); err != nil {
+				return fmt.Errorf("recreate session: %w", err)
+			}
+			if err := historySrc.Reset(); err != nil {
+				// Non-fatal: store is clean; index failure leaves index nil
+				// until next successful reset. Log but don't fail.
+				log.Printf("[session_reset] history index reset failed: %v", err)
+			}
+			return nil
+		}
+
 		sess = &chatSession{
 			id:         sessID,
 			store:      s.sessionStore,
 			historySrc: historySrc,
 			km:         sessKM,
 			hook:       historySrc.Hook(),
+			resetTool:  session.NewResetTool(resetFn),
 		}
 		s.sessions[sessID] = sess
 	}
@@ -450,9 +472,14 @@ func (s *server) handleChat(w http.ResponseWriter, r *http.Request) {
 		s.sessionCount.Add(1)
 	}
 
-	// Build tool list: per-session knowledge tools (skills + history) + test tools,
-	// then filter by request.
-	allTools := append(sess.km.Tools(), s.testTools...)
+	// Build tool list: per-session knowledge tools (skills + history) + test tools
+	// + session_reset. Allocate a fresh slice to avoid aliasing km.Tools()'s
+	// backing array across requests.
+	kmTools := sess.km.Tools()
+	allTools := make([]tool.Tool, 0, len(kmTools)+len(s.testTools)+1)
+	allTools = append(allTools, kmTools...)
+	allTools = append(allTools, s.testTools...)
+	allTools = append(allTools, sess.resetTool)
 	activeTools := allTools
 	if len(req.Tools) > 0 {
 		allowed := make(map[string]bool, len(req.Tools))

@@ -15,6 +15,10 @@ type Store interface {
 	GetSession(ctx context.Context, id string) (*Session, error)
 	UpdateSession(ctx context.Context, s *Session) error
 	ListSessions(ctx context.Context) ([]*Session, error)
+	// DeleteSession removes the session and all its messages and parts.
+	// Implementations should perform this atomically where possible.
+	// Returns nil if the session does not exist (idempotent).
+	DeleteSession(ctx context.Context, id string) error
 
 	// Message operations
 	CreateMessage(ctx context.Context, m *Message) error

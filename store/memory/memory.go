@@ -90,6 +90,33 @@ func (s *Store) ListSessions(_ context.Context) ([]*store.Session, error) {
 	return out, nil
 }
 
+// DeleteSession removes the session and all its messages and parts.
+// Returns nil if the session does not exist (idempotent).
+func (s *Store) DeleteSession(_ context.Context, id string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	// Remove all parts and messages belonging to this session.
+	for _, msgID := range s.sessionMsgs[id] {
+		for _, partID := range s.messageParts[msgID] {
+			delete(s.parts, partID)
+		}
+		delete(s.messageParts, msgID)
+		delete(s.messages, msgID)
+	}
+	delete(s.sessionMsgs, id)
+	delete(s.sessions, id)
+
+	// Remove from insertion-order index.
+	for i, sid := range s.sessionOrder {
+		if sid == id {
+			s.sessionOrder = append(s.sessionOrder[:i], s.sessionOrder[i+1:]...)
+			break
+		}
+	}
+	return nil
+}
+
 // --- Message ---
 
 func (s *Store) CreateMessage(_ context.Context, m *store.Message) error {

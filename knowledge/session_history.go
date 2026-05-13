@@ -114,6 +114,31 @@ func (s *SessionHistorySource) ID() string { return sessionHistorySourceID }
 // Priority implements knowledge.Source. Returns 0 (highest priority).
 func (s *SessionHistorySource) Priority() int { return 0 }
 
+// Reset discards all indexed history and resets the source to its initial empty
+// state. Use this when the session is being fully reset (all messages cleared).
+// The SessionHistorySource remains usable after Reset — future compactions will
+// index into the fresh empty index.
+func (s *SessionHistorySource) Reset() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.index.Close()
+	s.index = nil // guard against use-after-close if rebuild below fails
+
+	m, err := buildIndexMapping()
+	if err != nil {
+		return fmt.Errorf("session history reset: build mapping: %w", err)
+	}
+	idx, err := bleve.NewMemOnly(m)
+	if err != nil {
+		return fmt.Errorf("session history reset: create index: %w", err)
+	}
+	s.index = idx
+	s.compactionDocs = make(map[int][]string)
+	s.currentSeq = 0
+	return nil
+}
+
 // Accepts implements knowledge.Source.
 func (s *SessionHistorySource) Accepts(q Query) bool {
 	return q.Type == QueryTypeSearch || q.Type == QueryTypeFetch
@@ -125,6 +150,10 @@ func (s *SessionHistorySource) Accepts(q Query) bool {
 func (s *SessionHistorySource) Peek(ctx context.Context, q Query) ([]Result, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	if s.index == nil {
+		return nil, fmt.Errorf("session history peek: index unavailable (reset in progress)")
+	}
 
 	input := strings.TrimSpace(q.Input)
 	var bq bquery.Query
@@ -187,6 +216,10 @@ func (s *SessionHistorySource) Peek(ctx context.Context, q Query) ([]Result, err
 func (s *SessionHistorySource) Fetch(ctx context.Context, q Query) ([]Result, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	if s.index == nil {
+		return nil, fmt.Errorf("session history fetch: index unavailable (reset in progress)")
+	}
 
 	docID := q.Input
 	if pfx := sessionHistorySourceID + ":"; strings.HasPrefix(docID, pfx) {
@@ -252,6 +285,10 @@ func (s *SessionHistorySource) Hook() CompactionHook {
 		s.mu.Lock()
 		defer s.mu.Unlock()
 
+		if s.index == nil {
+			return // reset in progress; skip indexing
+		}
+
 		s.currentSeq++
 
 		// Prune oldest round if we've hit the limit.
@@ -289,6 +326,9 @@ func (s *SessionHistorySource) oldestSeq() int {
 // storedText retrieves the raw text field of a document from the index.
 // Must be called with s.mu held (same lock as Peek/Fetch).
 func (s *SessionHistorySource) storedText(docID string) string {
+	if s.index == nil {
+		return ""
+	}
 	doc, err := s.index.Document(docID)
 	if err != nil || doc == nil {
 		return ""
