@@ -311,10 +311,15 @@ func (c *Compactor) Compact(ctx context.Context, sessionID string, input Process
 		return "", fmt.Errorf("compaction: create boundary part: %w", err)
 	}
 
+	// Step 5: Call the compaction hook (e.g. to index head messages for recall).
+	// This is fire-and-forget from the compaction's perspective; hook errors are
+	// not surfaced — a failed index write does not invalidate the compaction.
+	if input.OnCompact != nil {
+		input.OnCompact(sel.Head, allParts)
+	}
+
 	return summaryMsgID, nil
 }
-
-// ToModelOptions configures ToModelMessagesWithOptions.
 type ToModelOptions struct {
 	StripMedia         bool
 	ToolOutputMaxChars int

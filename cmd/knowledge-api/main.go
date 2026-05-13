@@ -200,6 +200,7 @@ func main() {
 		authStore:    authStore,
 		provCfgMap:   provCfgMap,
 		testTools:    buildTestTools(),
+		sessions:     make(map[string]*chatSession),
 	}
 
 	mux := http.NewServeMux()
@@ -241,8 +242,11 @@ type server struct {
 }
 
 type chatSession struct {
-	id    string
-	store store.Store // per-session isolated store
+	id         string
+	store      store.Store // per-session isolated store
+	historySrc *knowledge.SessionHistorySource
+	km         *knowledge.Manager // per-session manager: skills source + history source
+	hook       knowledge.CompactionHook // cached hook from historySrc
 }
 
 // ── /health ───────────────────────────────────────────────────────────────────
@@ -372,25 +376,15 @@ func (s *server) handleChat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Resolve or create session.
+	// Resolve session ID early so it can be sent as a response header
+	// before WriteHeader is called (headers are frozen after WriteHeader).
 	sessID := req.SessionID
 	if sessID == "" {
 		sessID = fmt.Sprintf("sess-%d", time.Now().UnixNano())
 	}
 	ctx := r.Context()
-	if _, err := s.sessionStore.GetSession(ctx, sessID); err != nil {
-		modelPrefix := "anthropic"
-		if s.cfg.provider == "openai" {
-			modelPrefix = "timi"
-		}
-		_ = s.sessionStore.CreateSession(ctx, &store.Session{
-			ID:    sessID,
-			Model: modelPrefix + "/" + s.cfg.modelID,
-		})
-		s.sessionCount.Add(1)
-	}
 
-	// Set SSE headers.
+	// Set SSE headers first so all error responses are delivered as SSE events.
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
@@ -406,8 +400,59 @@ func (s *server) handleChat(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Build tool list: knowledge tools + test tools, then filter by request.
-	allTools := append(s.km.Tools(), s.testTools...)
+	// Get or create per-session state (history source + knowledge manager).
+	// Created once per session; reused across turns.
+	s.mu.Lock()
+	sess, exists := s.sessions[sessID]
+	if !exists {
+		historySrc, histErr := knowledge.NewSessionHistorySource(sessID, knowledge.DefaultMaxCompactions)
+		if histErr != nil {
+			s.mu.Unlock()
+			sendEvent(map[string]any{"type": "error", "error": "create history source: " + histErr.Error()})
+			return
+		}
+		// Per-session knowledge manager: skills index (priority 1) + session
+		// history (priority 0, higher). AllowPartialFailure matches s.km so that
+		// /search, /fetch, and /chat all behave consistently on source errors.
+		sessKM := knowledge.NewManager(knowledge.ManagerConfig{
+			SourceTimeout:       10 * time.Second,
+			MaxResults:          10,
+			SnippetMaxChars:     s.cfg.snippetMax,
+			ContentMaxChars:     s.cfg.contentMax,
+			AllowPartialFailure: false,
+		})
+		sessKM.Register(blevesource.New(s.idx, s.cfg.sourceID, 1, &blevesource.Config{
+			TitleField:   "title",
+			ContentField: "content",
+		}))
+		sessKM.Register(historySrc)
+
+		sess = &chatSession{
+			id:         sessID,
+			store:      s.sessionStore,
+			historySrc: historySrc,
+			km:         sessKM,
+			hook:       historySrc.Hook(),
+		}
+		s.sessions[sessID] = sess
+	}
+	s.mu.Unlock()
+
+	if _, err := s.sessionStore.GetSession(ctx, sessID); err != nil {
+		modelPrefix := "anthropic"
+		if s.cfg.provider == "openai" {
+			modelPrefix = "timi"
+		}
+		_ = s.sessionStore.CreateSession(ctx, &store.Session{
+			ID:    sessID,
+			Model: modelPrefix + "/" + s.cfg.modelID,
+		})
+		s.sessionCount.Add(1)
+	}
+
+	// Build tool list: per-session knowledge tools (skills + history) + test tools,
+	// then filter by request.
+	allTools := append(sess.km.Tools(), s.testTools...)
 	activeTools := allTools
 	if len(req.Tools) > 0 {
 		allowed := make(map[string]bool, len(req.Tools))
@@ -476,6 +521,7 @@ func (s *server) handleChat(w http.ResponseWriter, r *http.Request) {
 		},
 		DisableProviderPrompt: true,
 		MaxSteps:              maxSteps,
+		OnCompact:             sess.hook,
 	})
 	if err != nil {
 		sendEvent(map[string]any{"type": "error", "error": err.Error()})

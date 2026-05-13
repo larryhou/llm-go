@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/larryhou/llm-go/config"
+	"github.com/larryhou/llm-go/knowledge"
 	"github.com/larryhou/llm-go/llm"
 	"github.com/larryhou/llm-go/store"
 	"github.com/larryhou/llm-go/tool"
@@ -59,6 +60,12 @@ type RunInput struct {
 
 	// MaxSteps prevents infinite agentic loops (0 = unlimited).
 	MaxSteps int
+
+	// OnCompact, when non-nil, is called after each successful Compact().
+	// Use knowledge.SessionHistorySource.Hook() to index compacted history
+	// for later retrieval via knowledge_search / knowledge_fetch.
+	// Nil is a no-op — existing callers are unaffected.
+	OnCompact knowledge.CompactionHook
 }
 
 // RunLoop is the main agentic loop for a session.
@@ -232,6 +239,7 @@ func RunLoop(ctx context.Context, s store.Store, input RunInput) (RunResult, err
 				Provider:        input.Provider,
 				SummaryProvider: input.SummaryProvider,
 				Config:          input.Config,
+				OnCompact:       input.OnCompact,
 			})
 			if err != nil {
 				log.Printf("[session] compact failed: %v", err)
@@ -291,6 +299,13 @@ func buildSystem(input RunInput) []string {
 
 	// Always append caller-supplied extra instructions
 	parts = append(parts, input.ExtraSystem...)
+
+	// When session history recall is enabled (OnCompact is set), inject
+	// the knowledge_search guidance so the LLM knows it can retrieve
+	// compacted history on demand.
+	if input.OnCompact != nil {
+		parts = append(parts, PromptKnowledgeRecall)
+	}
 
 	// Filter empty strings
 	var out []string

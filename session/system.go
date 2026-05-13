@@ -36,6 +36,9 @@ var promptDefault string
 //go:embed max-steps.txt
 var PromptMaxSteps string
 
+//go:embed knowledge-recall.txt
+var PromptKnowledgeRecall string
+
 // SystemPromptForModel returns the appropriate system prompt for a given model.
 // Aligned with packages/opencode/src/session/system.ts provider().
 //
