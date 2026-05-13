@@ -5,3 +5,10 @@ vendor/
 # compiled binaries (root level only)
 /knowledge-api
 /control
+
+# local test scripts and runtime artifacts
+/test_anthropic.go
+/test_anthropic.json
+/web-*/
+/.DS_Store
+SESSION_RECALL.md

@@ -164,8 +164,12 @@ Each item has been verified against the current codebase. Items marked **[FIXED]
 | 15 | `knowledge` | Cross-group results have no global score sort — sub-optimal ranking | Low | **FIXED** |
 | 16 | `cmd` | `NewFromConfig` never called — `llm.json` provider config inert | Medium | **FIXED** |
 | 17 | `provider` | `Registry` never instantiated — extensibility blocked | Medium | **FIXED** |
+| KN-1 | `knowledge` | `AllowPartialFailure=false` default — one timeout aborts entire query | **High** | Open |
+| KN-2 | `knowledge` | `dispatchGroup` waits for all goroutines — slow source blocks group | Medium | Open |
+| KN-3 | `knowledge` | `oldestSeq()` O(n) scan — should be O(1) field read | Low | Open |
+| KN-4 | `knowledge` | `fetch` fallback silently strips prefix — wrong source gets corrupt input | Medium | Open |
 
-Only **#14** (weak `Part.Data` typing — sealed interface) remains as future work.
+**#14** (weak `Part.Data` typing — sealed interface) and **KN-1 through KN-4** (knowledge package items) remain as future work.
 
 ---
 
@@ -203,6 +207,232 @@ Only **#14** (weak `Part.Data` typing — sealed interface) remains as future wo
 | 26 (orig) | `groupByPriority` dead `peekMode` parameter | `manager.go` — parameter removed |
 | 25 (orig) | `fetch` fallback passes un-stripped `q.Input` to `Accepts` | `manager.go` — prefix stripped before fallback loop |
 | 26 (orig) | `groupByPriority` dead `peekMode` parameter | `manager.go` — parameter removed |
+
+---
+
+## Knowledge Package — Detailed Weakness Analysis
+
+### KN-1. `AllowPartialFailure` defaults to `false` — single source timeout aborts entire query — `knowledge/manager.go`
+
+**Location:** `manager.go:34–35`, `manager.go:117`
+
+```go
+// ManagerConfig — zero value
+AllowPartialFailure bool   // default false
+
+// peek()
+if err != nil && !m.cfg.AllowPartialFailure {
+    return nil, err        // aborts on first group error
+}
+```
+
+`ManagerConfig` is a plain struct; its zero value leaves `AllowPartialFailure = false`.
+When a caller constructs `NewManager(ManagerConfig{})` without explicitly setting the flag
+(the common case shown in every test that needs robustness uses `AllowPartialFailure: true`),
+any single source error — including a `SourceTimeout` expiry — aborts the entire query and
+returns nil results to the LLM.
+
+In a production setup with even two sources (e.g. a local Bleve index + a remote web
+search), a momentary network hiccup in the web source silently removes all search
+capability from the LLM. The LLM receives a tool error and has no results at all, even
+though the local index may have answered the query perfectly.
+
+**Impact:** High operational risk in any multi-source deployment. The safe default for a
+knowledge retrieval layer should be degraded-but-functional, not fail-fast.
+
+**Fix:** Flip the default or rename to opt-out:
+
+Option A — safe default (`AllowPartialFailure = true` unless explicitly disabled):
+```go
+// ManagerConfig
+DisablePartialFailure bool  // opt-out; default = partial results allowed
+```
+
+Option B — keep the field name, change the default by always initialising via constructor:
+```go
+func DefaultManagerConfig() ManagerConfig {
+    return ManagerConfig{AllowPartialFailure: true}
+}
+```
+
+Callers that want strict all-or-nothing can pass `AllowPartialFailure: false` explicitly.
+
+---
+
+### KN-2. `dispatchGroup` waits for all goroutines — slow source blocks group completion — `knowledge/manager.go`
+
+**Location:** `manager.go:213–248`
+
+```go
+ch := make(chan outcome, len(group))
+for _, s := range group {
+    go func() { ch <- outcome{m.callSource(ctx, s, q, peek)} }()
+}
+var all []Result
+for range group {          // blocks until every goroutine sends
+    o := <-ch
+    ...
+}
+```
+
+All goroutines in a priority group are started concurrently, but `dispatchGroup` then
+blocks on a plain `for range group` loop that receives every outcome before returning.
+This means the group's latency is `max(source latencies)`, not `median`.
+
+If `SourceTimeout > 0`, each source has an individual deadline, so the worst-case group
+latency is `SourceTimeout × 1` (all sources time out at the same wall time). However if
+`SourceTimeout == 0`, a single unresponsive source stalls the entire group indefinitely,
+even if `ctx` has no deadline — there is no intra-group short-circuit.
+
+More subtly: even with `SourceTimeout` set, the group that has already accumulated
+`>= MaxResults` results from fast sources still waits for the slow one to time out before
+returning. This wastes `SourceTimeout` on every request that a fast source already
+satisfied.
+
+**Impact:** Unnecessary tail latency on every query with heterogeneous source speeds.
+
+**Fix — early-exit when results are sufficient:**
+
+```go
+func (m *Manager) dispatchGroup(ctx context.Context, group []Source, q Query, peek bool) ([]Result, error) {
+    type outcome struct{ results []Result; err error }
+    ch := make(chan outcome, len(group))
+    for _, s := range group {
+        s := s
+        go func() { ch <- outcome{m.callSource(ctx, s, q, peek)} }()
+    }
+    var all []Result
+    var firstErr error
+    remaining := len(group)
+    for remaining > 0 {
+        o := <-ch
+        remaining--
+        if o.err != nil {
+            if firstErr == nil { firstErr = o.err }
+            continue
+        }
+        all = append(all, o.results...)
+        // Early exit: already have enough, don't wait for stragglers.
+        if m.cfg.MaxResults > 0 && len(all) >= m.cfg.MaxResults {
+            break
+        }
+    }
+    // Drain remaining goroutines into the buffered channel — they'll finish
+    // on their own (SourceTimeout or ctx cancellation).
+    sort.Slice(all, func(i, j int) bool { return all[i].Score > all[j].Score })
+    return all, firstErr
+}
+```
+
+The buffered `ch` ensures abandoned goroutines are never leaked — they write to the
+channel (which has capacity) and exit.
+
+---
+
+### KN-3. `oldestSeq()` is O(n) linear scan — should be O(1) — `knowledge/session_history.go`
+
+**Location:** `session_history.go:316–324`
+
+```go
+func (s *SessionHistorySource) oldestSeq() int {
+    oldest := int(^uint(0) >> 1) // max int
+    for seq := range s.compactionDocs {
+        if seq < oldest {
+            oldest = seq
+        }
+    }
+    return oldest
+}
+```
+
+`oldestSeq` is called inside `Hook()` every time a new compaction round triggers an
+eviction (i.e. when `len(compactionDocs) >= maxCompactions`). With `maxCompactions = 8`
+the map is tiny, so the cost is negligible today. However:
+
+1. `compactionDocs` is a `map[int][]string` (not a sorted structure), so the scan cannot
+   be avoided without a separate data structure.
+2. Because `currentSeq` is a monotonically incrementing counter and evictions always
+   remove the smallest key, the "oldest" seq is always `currentSeq - maxCompactions + 1`
+   (or the actual minimum if there were gaps). This property is never exploited.
+3. The method acquires no lock itself — it must be called under `s.mu`, which it is, but
+   this is not documented and easy to miss.
+
+**Fix — track min-seq explicitly:**
+
+```go
+type SessionHistorySource struct {
+    ...
+    minSeq int  // oldest retained compaction seq (0 = none)
+}
+
+// In Hook(), instead of calling oldestSeq():
+if len(s.compactionDocs) >= s.maxCompactions {
+    for _, id := range s.compactionDocs[s.minSeq] {
+        _ = s.index.Delete(id)
+    }
+    delete(s.compactionDocs, s.minSeq)
+    s.minSeq++ // advance to next oldest
+}
+```
+
+This reduces `oldestSeq()` to an O(1) field read and removes the map scan entirely.
+`oldestSeq()` itself can then be deleted.
+
+---
+
+### KN-4. `Fetch` fallback passes `internalKey` to `Accepts` — unrecognised `sourceID` corrupts fallback input — `knowledge/manager.go`
+
+**Location:** `manager.go:151–171`
+
+```go
+sourceID, internalKey, hasPfx := strings.Cut(q.Input, ":")
+if hasPfx {
+    for _, s := range sources {
+        if s.ID() == sourceID { ... return ... }  // direct route
+    }
+}
+// Fallback: first accepting source.
+fallbackQ := q
+if hasPfx {
+    fallbackQ.Input = internalKey  // ← strips sourceID prefix
+}
+for _, s := range sources {
+    if !s.Accepts(fallbackQ) { continue }
+    results, err := m.callSource(ctx, s, fallbackQ, false)
+```
+
+When the RefID contains a `:` but the `sourceID` portion does not match any registered
+source, the code falls through to the fallback path and **silently strips the
+`sourceID:` prefix**, passing only `internalKey` to `Accepts` and `Fetch`. 
+
+Example: RefID = `"external-wiki:https://example.com/page"`. If `external-wiki` is not
+registered, the fallback receives `"https://example.com/page"` — the URL — which may or
+may not be what the fallback source expects. A web-fetch source that parses its input as
+a URL will accidentally succeed; a vector-DB source will get a bare URL string with no
+context.
+
+The original query intent is `"fetch external-wiki doc"`. The fallback silently
+reinterprets it as `"fetch https://example.com/page from first accepting source"`. If a
+web source happens to accept it, the caller gets content from an entirely different
+backend with no error or warning.
+
+**Fix — do not strip the prefix in the fallback; pass the full original input:**
+
+```go
+fallbackQ := q
+// Do NOT strip prefix — let each source's Accepts() and Fetch() handle it.
+// Stripping was intended to avoid "sourceID:key" being passed to a source
+// that expects only "key", but it silently changes the query semantics.
+for _, s := range sources {
+    if !s.Accepts(fallbackQ) { continue }
+    ...
+}
+```
+
+If sources genuinely need clean input, they should strip the prefix themselves in
+`Accepts` / `Fetch` when they recognise it. Alternatively, add a `fallbackInput` field
+to `Query` that the Manager populates and sources can use when they do not understand
+the full `Input`.
 
 ---
 
