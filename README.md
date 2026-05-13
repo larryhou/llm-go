@@ -230,7 +230,112 @@ session.RunLoop(ctx, st, session.RunInput{
 })
 ```
 
-### 4. Run the knowledge-api HTTP server
+### 4. Session history recall + session_reset
+
+After compaction, old messages are hidden from the LLM. `SessionHistorySource`
+indexes them into a private Bleve index so the LLM can search them on demand.
+`session_reset` lets the LLM wipe the session on user request.
+
+```go
+package main
+
+import (
+    "context"
+    "fmt"
+    "log"
+    "time"
+
+    bleve "github.com/blevesearch/bleve/v2"
+    "github.com/larryhou/llm-go/knowledge"
+    blevesrc "github.com/larryhou/llm-go/knowledge/source/bleve"
+    "github.com/larryhou/llm-go/llm"
+    openaiProv "github.com/larryhou/llm-go/provider/openai"
+    "github.com/larryhou/llm-go/session"
+    "github.com/larryhou/llm-go/store"
+    "github.com/larryhou/llm-go/store/memory"
+    "github.com/larryhou/llm-go/tool"
+)
+
+func main() {
+    ctx  := context.Background()
+    st   := memory.New()
+    prov := openaiProv.New("sk-your-api-key", "https://api.openai.com/v1", "openai", nil)
+    model := llm.Model{
+        ID: "gpt-4o", ProviderID: "openai", APIID: "gpt-4o",
+        Limit: llm.ModelLimit{Context: 128_000, Output: 4096},
+    }
+
+    sessID := "demo-session-1"
+    _ = st.CreateSession(ctx, &store.Session{ID: sessID, Model: "openai/gpt-4o"})
+
+    // 1. SessionHistorySource — per-session, created once.
+    //    Priority 0 (highest): queried before static knowledge sources.
+    //    maxCompactions=8 caps memory at ~50 MB per session.
+    historySrc, err := knowledge.NewSessionHistorySource(sessID, knowledge.DefaultMaxCompactions)
+    if err != nil {
+        log.Fatal(err)
+    }
+    compactionHook := historySrc.Hook() // cache the hook, don't call Hook() per turn
+
+    // 2. Knowledge manager — register static source at priority 1, history at 0.
+    idx, _ := bleve.NewMemOnly(bleve.NewIndexMapping())
+    km := knowledge.NewManager(knowledge.ManagerConfig{
+        SourceTimeout: 5 * time.Second,
+        MaxResults:    5,
+        SnippetMaxChars: 300,
+        ContentMaxChars: 8000,
+    })
+    km.Register(blevesrc.New(idx, "docs", 1, nil))
+    km.Register(historySrc) // history has higher priority (0)
+
+    // 3. session_reset tool — resetFn is called atomically.
+    //    If a server-level lock is needed (concurrent requests), hold it here.
+    resetTool := session.NewResetTool(func(resetCtx context.Context) error {
+        if err := st.DeleteSession(resetCtx, sessID); err != nil {
+            return err
+        }
+        if err := st.CreateSession(resetCtx, &store.Session{
+            ID: sessID, Model: "openai/gpt-4o",
+        }); err != nil {
+            return err
+        }
+        return historySrc.Reset() // wipes the Bleve index
+    })
+
+    // 4. Build tool list — explicit make avoids aliasing km.Tools() backing array.
+    kmTools := km.Tools()
+    tools := make([]tool.Tool, 0, len(kmTools)+1)
+    tools = append(tools, kmTools...)
+    tools = append(tools, resetTool)
+
+    // 5. RunLoop — pass OnCompact so compacted turns are indexed automatically.
+    for _, msg := range []string{
+        "Explain context compaction.",
+        "What did we discuss earlier?", // LLM may call knowledge_search here
+    } {
+        _, err := session.RunLoop(ctx, st, session.RunInput{
+            SessionID: sessID,
+            UserMsg:   msg,
+            Model:     model,
+            Provider:  prov,
+            Tools:     tools,
+            OnCompact: compactionHook, // nil = no history indexing
+        })
+        if err != nil {
+            fmt.Fprintf(nil, "error: %v\n", err)
+        }
+    }
+}
+```
+
+**Key rules:**
+- Create `SessionHistorySource` and call `Hook()` **once per session**, not per turn.
+- Register `historySrc` at a **lower priority number** than static knowledge sources.
+- Build `tools` with explicit `make` + `append` — do not `append(km.Tools(), ...)` directly.
+- The `resetFn` must cover `DeleteSession` + `CreateSession` + `historySrc.Reset()` atomically.
+- `OnCompact: nil` disables history indexing silently — no hook call, no error.
+
+### 5. Run the knowledge-api HTTP server
 
 ```bash
 # Start — indexes .opencode/skills and listens on :7700
