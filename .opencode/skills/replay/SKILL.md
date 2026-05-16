@@ -307,6 +307,86 @@ func isSummaryStep(key string) bool {
 
 ---
 
+## Using replay to diagnose and verify bugs
+
+The ndjson recording + `ReplayProvider` form a complete offline debugging loop:
+no real LLM calls are needed to find root causes or confirm fixes.
+
+### Pattern 1 — Inspect a suspicious step directly from ndjson
+
+```python
+import json
+
+with open("debug-<ts>.ndjson") as f:
+    lines = [l for l in f.readlines() if l.strip()]
+
+# Find any step whose events look wrong (e.g. no text-delta, usage=0)
+for i, line in enumerate(lines):
+    rec = json.loads(line)
+    events = rec["events"]
+    etypes = [e["type"] for e in events]
+    for e in events:
+        if e["type"] == "step-finish":
+            usage = e.get("usage", {})
+            if usage.get("output", -1) == 0:
+                print(f"step {i+1}: suspicious — output=0, events={etypes}")
+                # Inspect last message in request
+                msgs = rec["request"]["Messages"]
+                last = msgs[-1]
+                print(f"  last msg: role={last['role']}")
+                for cp in last.get("content", []):
+                    print(f"    type={cp['type']} text={cp.get('text','')[:80]!r}")
+```
+
+**Real example — MaxSteps prefill bug:**
+Step 61 showed `events=['request-start','step-start','step-finish','request-finish']`
+with `usage=0` and no `text-delta`. Inspecting the request revealed
+`last msg role=assistant text='CRITICAL - MAXIMUM STEPS REACHED...'` —
+Anthropic silently ignores assistant prefill and returns an empty response.
+
+**Fix:** change prefill to a user message (`llm.NewUserMessage(PromptMaxSteps)`).
+
+### Pattern 2 — Wrap ReplayProvider with a probe to observe request structure
+
+```go
+type probeProvider struct {
+    inner *llm.ReplayProvider
+    step  int
+}
+
+func (p *probeProvider) ID() string { return "probe" }
+func (p *probeProvider) Stream(ctx context.Context, req llm.Request) (<-chan llm.Event, error) {
+    p.step++
+    last := req.Messages[len(req.Messages)-1]
+    for _, cp := range last.Content {
+        if cp.Type == "text" && cp.Text != "" {
+            fmt.Printf("step %2d: last_msg role=%-10s text=%q\n",
+                p.step, last.Role, cp.Text[:80])
+            break
+        }
+    }
+    return p.inner.Stream(ctx, req)
+}
+```
+
+Feed the probe into `session.RunLoop` with the same `MaxSteps` and model as
+the original session. After the fix, the output for the isLastStep should show
+`role=user` instead of `role=assistant`.
+
+### Workflow summary
+
+```
+1. Record a real session with cmd/control -debug
+2. Spot anomaly in ndjson (empty events, usage=0, wrong finish_reason)
+3. Inspect the request messages of that step directly in Python
+4. Identify root cause (wrong message role, missing content, etc.)
+5. Apply fix
+6. Re-run via probeProvider or cmd/replay to confirm the request is now correct
+   — all offline, no real LLM calls
+```
+
+---
+
 ## Key Code Locations
 
 | Component | File | Key location |

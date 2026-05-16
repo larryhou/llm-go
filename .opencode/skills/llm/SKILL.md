@@ -33,7 +33,7 @@ github.com/larryhou/llm-go/
     ├── prompt.go      RunLoop() — main agentic loop
     ├── reset_tool.go  session_reset built-in tool
     ├── system.go      Per-provider system prompt selection (embedded .txt files)
-    └── max-steps.txt  Prefilled assistant prompt injected on the last agentic step
+    └── max-steps.txt  User message injected on the last agentic step (MaxSteps reached)
 ```
 
 ### Data Flow
@@ -268,9 +268,9 @@ ctx := context.WithoutCancel(r.Context())
 
 ### MaxSteps — graceful termination
 
-When `RunInput.MaxSteps > 0` and `step >= MaxSteps`, the loop does **not** terminate silently. Instead, aligned with `opencode/src/session/prompt.ts` `isLastStep` handling:
+When `RunInput.MaxSteps > 0` and `step >= MaxSteps`, the loop does **not** terminate silently. Instead:
 
-1. A prefilled `role: "assistant"` message with `session.PromptMaxSteps` content is appended to `modelMsgs` — the LLM sees its "own" opening and continues naturally with a text summary.
+1. A `role: "user"` message containing `session.PromptMaxSteps` is appended to `modelMsgs` — instructing the LLM to stop calling tools and produce a text summary of work done so far.
 2. `tools` is set to `nil` — the provider receives no tool definitions, forcing a text-only response.
 3. After this final LLM turn completes, the loop terminates regardless of `ProcessResult`.
 
@@ -279,15 +279,14 @@ When `RunInput.MaxSteps > 0` and `step >= MaxSteps`, the loop does **not** termi
 isLastStep := input.MaxSteps > 0 && step >= input.MaxSteps
 
 if isLastStep {
-    modelMsgs = append(modelMsgs, llm.Message{
-        Role:    "assistant",
-        Content: []llm.ContentPart{{Type: "text", Text: PromptMaxSteps}},
-    })
+    modelMsgs = append(modelMsgs, llm.NewUserMessage(PromptMaxSteps))
     tools = nil   // force text-only response
 }
 ```
 
 `session.PromptMaxSteps` is exported from `session/system.go` (embedded from `session/max-steps.txt`).
+
+**Why user message, not assistant prefill:** opencode's TypeScript implementation uses an assistant prefill here, but Anthropic's Messages API does not support assistant prefill in the standard route — it silently returns an empty response (`usage=0`, no text). Using a user message achieves the same effect and works across all providers. This was diagnosed via ndjson replay: the offending step showed `step-finish(stop, usage=0)` with no `text-delta`, and the request had `role=assistant` as the last message.
 
 ---
 
