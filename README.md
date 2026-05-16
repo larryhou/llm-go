@@ -193,7 +193,85 @@ func main() {
 }
 ```
 
-### 3. Knowledge retrieval (search + fetch)
+### 3. Cancellable turns with `RunLoopAsync`
+
+`RunLoop` is synchronous and blocks until the turn completes. `RunLoopAsync`
+returns a `*RunHandle` immediately, allowing the caller to cancel an in-flight
+turn and start a new one without waiting for the old one to fully clean up.
+
+**`RunHandle` fields:**
+
+| Field | Description |
+|-------|-------------|
+| `Done <-chan struct{}` | Closed after full cleanup including Prune |
+| `StoreDone <-chan struct{}` | Closed once store writes are complete (before Prune) — sufficient for the next turn to start safely |
+| `Result RunResult` | Available after `<-Done` |
+| `Err error` | Available after `<-Done` |
+
+```go
+// Start a turn asynchronously.
+h := session.RunLoopAsync(ctx, st, session.RunInput{
+    SessionID: sessID,
+    UserMsg:   "What is 123 * 456?",
+    Model:     model,
+    Provider:  prov,
+    Tools:     []tool.Tool{calcTool{}},
+})
+
+// Cancel the turn (e.g. user pressed ESC or sent a new message).
+h.Cancel()
+<-h.Done // wait for full cleanup before reusing the session
+
+// --- OR: start a new turn immediately, passing StoreDone as WaitFor.
+// The new turn's goroutine starts right away but waits internally on
+// prev.StoreDone before writing to the store, so no orphan records are
+// created and history is always consistent.
+h2 := session.RunLoopAsync(ctx, st, session.RunInput{
+    SessionID: sessID,
+    UserMsg:   "Actually, what is 789 * 321?",
+    Model:     model,
+    Provider:  prov,
+    Tools:     []tool.Tool{calcTool{}},
+    WaitFor:   h.StoreDone, // wait for store consistency, not full Prune
+})
+<-h2.Done
+```
+
+**Typical HTTP server pattern** (cancel previous turn on new message):
+
+```go
+var mu sync.Mutex
+var activeHandle *session.RunHandle
+
+func handleChat(userMsg string) {
+    mu.Lock()
+    prev := activeHandle
+    if prev != nil {
+        prev.Cancel()
+    }
+    var waitFor <-chan struct{}
+    if prev != nil {
+        waitFor = prev.StoreDone
+    }
+    h := session.RunLoopAsync(ctx, st, session.RunInput{
+        SessionID: sessID,
+        UserMsg:   userMsg,
+        Model:     model,
+        Provider:  prov,
+        WaitFor:   waitFor,
+    })
+    activeHandle = h
+    mu.Unlock()
+
+    <-h.Done // keep SSE connection open until turn finishes
+}
+```
+
+Holding `mu` across `Cancel + RunLoopAsync + activeHandle =` ensures a third
+concurrent request cannot observe a stale previous handle and race on the same
+`StoreDone`.
+
+### 4. Knowledge retrieval (search + fetch)
 
 ```go
 import (
@@ -230,7 +308,7 @@ session.RunLoop(ctx, st, session.RunInput{
 })
 ```
 
-### 4. Session history recall + session_reset
+### 5. Session history recall + session_reset
 
 After compaction, old messages are hidden from the LLM. `SessionHistorySource`
 indexes them into a private Bleve index so the LLM can search them on demand.
@@ -335,7 +413,7 @@ func main() {
 - The `resetFn` must cover `DeleteSession` + `CreateSession` + `historySrc.Reset()` atomically.
 - `OnCompact: nil` disables history indexing silently — no hook call, no error.
 
-### 5. Run the llm-api HTTP server
+### 6. Run the llm-api HTTP server
 
 ```bash
 # Start — indexes .opencode/skills and listens on :7700
@@ -467,6 +545,14 @@ compaction, async tool execution, all SSE event types, and session inspection.
 **Provider-agnostic core** — `llm.Provider` is a single interface (`ID()` +
 `Stream()`). Anthropic and OpenAI adapters translate their native SDK events into
 the same canonical `llm.Event` stream. New providers implement one interface.
+
+**Immediate turn handoff** — `RunHandle` exposes two channels: `StoreDone`
+(closed once the current turn's store writes are complete, before Prune) and
+`Done` (closed after full cleanup including Prune). A new turn can pass
+`prev.StoreDone` as `RunInput.WaitFor` to start immediately without waiting
+for Prune, while still guaranteeing a consistent store view. The user message
+is written *after* `WaitFor` resolves, so a cancelled wait leaves no orphan
+records.
 
 **Compaction is transparent to the caller** — `RunLoop` detects overflow via
 `IsOverflow(usage, model)` after every `EventStepFinish`. It calls `Compact()`
