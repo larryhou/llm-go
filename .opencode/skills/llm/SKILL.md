@@ -365,14 +365,18 @@ sequenceDiagram
 ### Message.Status state machine
 
 ```mermaid
-stateDiagram-v2
-    [*] --> running : CreateMessage(assistantMsg)\nStatus=""
-    running --> normal : Process() returns nil\nprocessCommitted=true\nStatus stays ""
-    running --> interrupted : Cancel() fires\nctx.Err()!=nil\nparts exist (text or tools)
-    running --> cancelled : Cancel() fires\nctx.Err()!=nil\nno parts written yet
-    normal --> [*] : included in LLM context normally
-    interrupted --> [*] : buildAssistantPartsInterrupted()
-    cancelled --> [*] : skipped; " " placeholder injected\nbetween consecutive user messages
+flowchart TD
+    Start(["CreateMessage(assistantMsg)\nStatus='normal'"]) --> Running
+
+    Running["Process() running\nLLM stream + tool goroutines"]
+
+    Running -->|"Process() returns nil\nprocessCommitted=true"| Normal["Status: normal\n(unchanged)"]
+    Running -->|"ctx cancelled\nparts exist"| Interrupted["Status: interrupted"]
+    Running -->|"ctx cancelled\nno parts written"| Cancelled["Status: cancelled"]
+
+    Normal --> NormalOut["included in LLM context\nvia standard path"]
+    Interrupted --> IntOut["buildAssistantPartsInterrupted()\nkeep completed tools\nappend interruption notice"]
+    Cancelled --> CancelOut["skipped entirely\nsilent placeholder injected\nbetween consecutive user msgs"]
 ```
 
 ### Interrupted turn rendering (`buildAssistantPartsInterrupted`)
