@@ -220,7 +220,7 @@ func main() {
 	flag.IntVar(&cfg.maxSteps, "max-steps", 20, "max agentic steps per turn")
 	flag.IntVar(&cfg.contextLimit, "context-limit", 128000, "context window token limit")
 	flag.StringVar(&cfg.skillsDir, "skills", ".opencode", "skills root directory to index")
-	flag.StringVar(&cfg.storeDSN, "store", "memory", "store DSN: \"memory\" or \"sqlite:<path>\"")
+	flag.StringVar(&cfg.storeDSN, "store", "sqlite:memory.sqlite", "store DSN: \"memory\" or \"sqlite:<path>\"")
 	flag.BoolVar(&cfg.web, "web", false, "start web UI instead of REPL (port chosen automatically)")
 	flag.BoolVar(&cfg.debug, "debug", false, "record each turn to <session-id>/chat-<ts>.json")
 	flag.Parse()
