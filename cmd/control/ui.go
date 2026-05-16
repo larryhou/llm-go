@@ -58,7 +58,6 @@ const uiHTML = `<!DOCTYPE html>
   #input { flex: 1; background: var(--bg); border: 1px solid var(--overlay); color: var(--text); padding: 10px 12px; border-radius: 8px; font-family: var(--font); font-size: 14px; resize: none; height: 44px; max-height: 200px; overflow-y: auto; outline: none; }
   #input:focus { border-color: var(--mauve); }
   #send { background: var(--mauve); color: var(--bg); border: none; border-radius: 8px; padding: 0 18px; font-family: var(--font); font-size: 14px; font-weight: bold; cursor: pointer; }
-  #send:disabled { opacity: .4; cursor: not-allowed; }
 
   /* scrollbar */
   #messages::-webkit-scrollbar { width: 6px; }
@@ -389,7 +388,6 @@ async function send() {
   if (!text) return;
   input.value = '';
   input.style.height = '44px';
-  sendBtn.disabled = true;
   setTurnActive(true);
 
   recEvent('user_message', { text });
@@ -475,7 +473,6 @@ async function send() {
   if (wasCancelled) appendCancelled(wrap);
   scrollBottom();
   setTurnActive(false);
-  sendBtn.disabled = false;
   input.focus();
 }
 
