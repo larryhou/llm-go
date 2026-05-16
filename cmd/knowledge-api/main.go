@@ -362,11 +362,12 @@ func (s *server) handleChat(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req struct {
-		Message      string   `json:"message"`
-		SessionID    string   `json:"session_id"`
-		ContextLimit int      `json:"context_limit"` // override model context window (for compaction testing)
-		MaxSteps     int      `json:"max_steps"`     // override server default
-		Tools        []string `json:"tools"`         // subset of tools to enable; empty = all
+		Message            string   `json:"message"`
+		SessionID          string   `json:"session_id"`
+		ContextLimit       int      `json:"context_limit"`        // override model context window (for compaction testing)
+		CompactionReserved int      `json:"compaction_reserved"`  // override reserved tokens (default: min(20000, maxOutput))
+		MaxSteps           int      `json:"max_steps"`            // override server default
+		Tools              []string `json:"tools"`                // subset of tools to enable; empty = all
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeErr(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
@@ -525,6 +526,19 @@ func (s *server) handleChat(w http.ResponseWriter, r *http.Request) {
 		maxSteps = req.MaxSteps
 	}
 
+	// Build per-request config — used only for compaction tuning.
+	var sessionCfg *config.Info
+	if req.CompactionReserved > 0 {
+		reserved := req.CompactionReserved
+		pruneEnabled := true
+		sessionCfg = &config.Info{
+			Compaction: &config.CompactionConfig{
+				Reserved: &reserved,
+				Prune:    &pruneEnabled,
+			},
+		}
+	}
+
 	model := llm.Model{
 		ID:         s.cfg.modelID,
 		ProviderID: providerID,
@@ -548,6 +562,7 @@ func (s *server) handleChat(w http.ResponseWriter, r *http.Request) {
 		},
 		DisableProviderPrompt: true,
 		MaxSteps:              maxSteps,
+		Config:                sessionCfg,
 		OnCompact:             sess.hook,
 	})
 	if err != nil {
@@ -610,6 +625,12 @@ func (s *server) handleSession(w http.ResponseWriter, r *http.Request) {
 				ps2.Summary = fmt.Sprintf("finish=%s input=%d output=%d", d.FinishReason, d.Usage.Input, d.Usage.Output)
 			case *store.CompactionPartData:
 				ps2.Summary = "compaction boundary"
+			case *store.RecentContextPartData:
+				if len(d.Excerpt) > 120 {
+					ps2.Summary = "recent-context: " + d.Excerpt[:120] + "…"
+				} else {
+					ps2.Summary = "recent-context: " + d.Excerpt
+				}
 			}
 			pss = append(pss, ps2)
 		}
