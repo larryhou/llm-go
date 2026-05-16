@@ -29,6 +29,15 @@ around what the store contains after a cancelled or interrupted turn.
 4. **Capture the full test output** in a named variable (`OUT_A`, `OUT_B`, …).
 5. Per-test timeout is **30 seconds** (`-timeout 30s`). A build failure is
    also an ABORT condition.
+6. **STEP H MUST be delegated to a `general` Task agent.** Do NOT execute
+   STEP H inline in the top-level conversation. Invoke Task with the full
+   T1–T10 sequence description and let the agent drive all curl calls,
+   SSE monitoring, and per-turn verification autonomously.
+7. **Never write intermediate script files for STEP H.** Execute every curl
+   call directly via the bash tool — one call per turn, verify immediately,
+   then proceed to the next turn.
+8. **Before executing STEP H, re-read lines 213–342 of this SKILL.md** to
+   confirm the current T1–T10 sequence. Do not rely on session memory.
 
 ---
 
@@ -214,9 +223,11 @@ go test ./session/... -run "TestRunLoopAsync_doneAfterStoreConsistent" \
 
 通过 `/chat` HTTP 接口验证对话式中断的全链路行为。
 
-> **执行方式：** 参考 compact-test skill 的风格——实时消费每轮的 SSE 流，
-> 流结束即验证，agent 自主选择实现手段（curl、脚本、工具调用均可）。
-> 不依赖 sleep + 轮询。
+> **执行方式（强制）：**
+> 1. 将 STEP H 整体委托给 **`general` Task agent** 执行。
+> 2. agent 必须**逐轮**用 bash 工具直接发 curl，实时消费 SSE 流，每轮结束即验证。
+> 3. **禁止**写中间脚本文件（`.sh` / `.py`）——所有逻辑通过 bash 工具调用内联执行。
+> 4. 中断场景（cancelled / interrupted-text / interrupted+tool）必须用**后台 curl + 轮询 SSE 文件**的方式实现，不依赖 sleep+轮询整个请求。
 
 ### 服务器
 
@@ -547,51 +558,13 @@ for i := 0; i < len(msgs); i++ {
 对话式中断触发的是 **LLM 流式输出阶段**（在 tool_call 之前，或在收到 tool result 后
 LLM 开始第二步输出时）。
 
-### 验证脚本
+### slow_calc 中断场景（补充）
 
-```bash
-SESS="itest-interrupt-$(date +%s)"
+除 T1-T10 序列外，建议额外覆盖**工具执行期间被中断**的场景：
 
-# 第一轮后台：LLM 写长文（不调工具）
-curl -sN --max-time 120 -X POST http://127.0.0.1:7700/chat \
-  -H "Content-Type: application/json" \
-  -d "{\"message\":\"Write a very long essay (500+ words) about computing history.\",
-       \"session_id\":\"$SESS\",\"tools\":[],\"max_steps\":1}" \
-  > /tmp/turn1_sse.txt 2>&1 &
-TURN1_PID=$!
-
-# 等 LLM 开始输出（第一个 text delta 出现）
-for i in $(seq 1 10); do
-  sleep 1
-  grep -q '"type":"text"' /tmp/turn1_sse.txt && { echo "LLM started at T+${i}s"; break; }
-done
-
-# 第二轮：触发中断
-curl -sN --max-time 30 -X POST http://127.0.0.1:7700/chat \
-  -H "Content-Type: application/json" \
-  -d "{\"message\":\"Stop. Just say OK.\",\"session_id\":\"$SESS\",\"tools\":[],\"max_steps\":1}"
-
-wait $TURN1_PID 2>/dev/null
-
-# 验证日志
-grep -E "INTERRUPT|TURN-DONE" /tmp/kapi.log | tail -4
-
-# 验证 store 状态
-curl -s "http://127.0.0.1:7700/sessions/$SESS/messages" | python3 -c "
-import json, sys
-d = json.load(sys.stdin)
-for m in d['messages']:
-    if m['role'] == 'assistant':
-        status = m.get('status', '')
-        print(f'assistant status={status!r}')
-        # 期望第一轮: interrupted, 第二轮: ''
-"
-```
-
-**期望结果：**
-- 服务器日志出现 `[INTERRUPT]`
-- 第一轮 assistant `status='interrupted'`
-- 第二轮 assistant `status=''`（正常完成）或第二轮本身也因 LLM 问题失败
+- 后台发请求调用 `slow_calc`（2 秒延迟），监测到 `tool_call` 事件但 `tool_result` **尚未出现**时，立刻发下一轮触发中断。
+- 预期：`slow_calc` tool part `status=error`，RunLoop 被取消，store 中留下 `status='cancelled'` 或 `status='interrupted'` 的 assistant 消息。
+- 检测技巧（zsh 兼容）：用 `grep -c` 结果赋值时需去掉换行，或改用 `[ -s file ] && grep -q pattern file`。
 
 ---
 
