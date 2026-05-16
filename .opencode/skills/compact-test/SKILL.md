@@ -100,7 +100,7 @@ echo "SESSION: $SESS"
 ### STEP 2 — Turn 1: plant the anchor
 
 ```bash
-R1=$(curl -s --max-time 120 -X POST http://127.0.0.1:7700/chat \
+R1=$(curl -sN --max-time 120 -X POST http://127.0.0.1:7700/chat \
   -H "Content-Type: application/json" \
   -d "{\"message\":\"Critical technical decision: the agreed API timeout value is 7531 milliseconds. Confirm you have recorded this. Use counter tool to set key phase=1.\",\"session_id\":\"$SESS\",\"context_limit\":5500,\"tools\":[\"counter\",\"calc\"],\"max_steps\":6}")
 echo "$R1" | grep '"type":"done"\|"type":"error"' | head -1
@@ -117,7 +117,7 @@ The anchor is **7531**. The LLM must reproduce this number in Step 9.
 ### STEP 3 — Turn 2: accumulate tokens
 
 ```bash
-R2=$(curl -s --max-time 120 -X POST http://127.0.0.1:7700/chat \
+R2=$(curl -sN --max-time 120 -X POST http://127.0.0.1:7700/chat \
   -H "Content-Type: application/json" \
   -d "{\"message\":\"Use calc for 1234 times 5678. Use counter to set phase=2. Report both.\",\"session_id\":\"$SESS\",\"context_limit\":5500,\"tools\":[\"counter\",\"calc\"],\"max_steps\":6}")
 echo "$R2" | grep '"type":"done"\|"type":"error"' | head -1
@@ -130,7 +130,7 @@ echo "$R2" | grep '"type":"done"\|"type":"error"' | head -1
 ### STEP 4 — Turn 3: trigger first compaction
 
 ```bash
-R3=$(curl -s --max-time 120 -X POST http://127.0.0.1:7700/chat \
+R3=$(curl -sN --max-time 120 -X POST http://127.0.0.1:7700/chat \
   -H "Content-Type: application/json" \
   -d "{\"message\":\"Use calc for 9876 times 5432. Also calc 1111 times 9999. Set counter phase=3. Report all.\",\"session_id\":\"$SESS\",\"context_limit\":5500,\"tools\":[\"counter\",\"calc\"],\"max_steps\":6}")
 echo "$R3" | grep '"type":"done"\|"type":"error"' | head -1
@@ -181,7 +181,7 @@ Step 5. Maximum 2 extra turns before aborting.
 
 ```bash
 # Extra accumulation turn if needed:
-curl -s --max-time 120 -X POST http://127.0.0.1:7700/chat \
+curl -sN --max-time 120 -X POST http://127.0.0.1:7700/chat \
   -H "Content-Type: application/json" \
   -d "{\"message\":\"Use calc for 7777 times 8888. Also calc 3333 times 4444. Set counter phase=3b. Report.\",\"session_id\":\"$SESS\",\"context_limit\":5500,\"tools\":[\"counter\",\"calc\"],\"max_steps\":6}"
 ```
@@ -191,7 +191,7 @@ curl -s --max-time 120 -X POST http://127.0.0.1:7700/chat \
 ### STEP 6 — Turn 4: accumulate toward second compaction
 
 ```bash
-R4=$(curl -s --max-time 120 -X POST http://127.0.0.1:7700/chat \
+R4=$(curl -sN --max-time 120 -X POST http://127.0.0.1:7700/chat \
   -H "Content-Type: application/json" \
   -d "{\"message\":\"Use calc for 2222 times 3333. Also calc 4444 times 5555. Set counter phase=4. Report both.\",\"session_id\":\"$SESS\",\"context_limit\":5500,\"tools\":[\"counter\",\"calc\"],\"max_steps\":6}")
 echo "$R4" | grep '"type":"done"\|"type":"error"' | head -1
@@ -204,7 +204,7 @@ echo "$R4" | grep '"type":"done"\|"type":"error"' | head -1
 ### STEP 7 — Turn 5: trigger second compaction
 
 ```bash
-R5=$(curl -s --max-time 120 -X POST http://127.0.0.1:7700/chat \
+R5=$(curl -sN --max-time 120 -X POST http://127.0.0.1:7700/chat \
   -H "Content-Type: application/json" \
   -d "{\"message\":\"Use calc for 6666 times 7777. Also calc 8888 times 1234. Also calc 2468 times 1357. Set counter phase=5. Report all three.\",\"session_id\":\"$SESS\",\"context_limit\":5500,\"tools\":[\"counter\",\"calc\"],\"max_steps\":6}")
 echo "$R5" | grep '"type":"done"\|"type":"error"' | head -1
@@ -300,7 +300,7 @@ print('StripMedia working:', 'YES' if not summaries_with_rc else 'NO - excerpts 
 ### STEP 9 — Recall test (CRITICAL — hard PASS/FAIL)
 
 ```bash
-R_RECALL=$(curl -s --max-time 120 -X POST http://127.0.0.1:7700/chat \
+R_RECALL=$(curl -sN --max-time 120 -X POST http://127.0.0.1:7700/chat \
   -H "Content-Type: application/json" \
   -d "{\"message\":\"What was the exact API timeout value in milliseconds that we agreed on at the very beginning of our conversation? State only the number.\",\"session_id\":\"$SESS\",\"context_limit\":5500,\"tools\":[],\"max_steps\":2}")
 
@@ -343,7 +343,7 @@ works passively here — the excerpt is already in the boundary message, so the
 LLM should know the context without being prompted.
 
 ```bash
-R_CONT=$(curl -s --max-time 120 -X POST http://127.0.0.1:7700/chat \
+R_CONT=$(curl -sN --max-time 120 -X POST http://127.0.0.1:7700/chat \
   -H "Content-Type: application/json" \
   -d "{\"message\":\"OK so let's go with that timeout value we agreed on. Use the calc tool to convert it from milliseconds to seconds, and tell me how many minutes that would be.\",\"session_id\":\"$SESS\",\"context_limit\":5500,\"tools\":[\"calc\"],\"max_steps\":4}")
 
