@@ -108,7 +108,6 @@ echo "$R1" | grep '"type":"done"\|"type":"error"' | head -1
 
 **ABORT if:**
 - curl exits with code 28 (timeout)
-- response contains `"nothing to summarise"` → `context_limit` too small; increase to 6500 and restart from Step 1 with a new session
 - response contains neither `"type":"done"` nor `"type":"error"`
 
 The anchor is **7531**. The LLM must reproduce this number in Step 9.
@@ -139,8 +138,8 @@ echo "$R3" | grep '"type":"done"\|"type":"error"' | head -1
 
 **ABORT if:** curl timeout.
 
-A `"type":"error"` containing `"nothing to summarise"` means overflow fired on
-turn 1 or 2 (context_limit too small) — restart with `context_limit=6500`.
+A `"type":"error"` is acceptable here only if it is NOT `"nothing to summarise"` (that error
+has been fixed — `Select()` now summarises all messages when turns ≤ tailTurns).
 Any other error or `"type":"done"` is acceptable here.
 
 ---
@@ -172,7 +171,7 @@ for m in d['messages']:
 - `compaction_boundaries` ≥ 1 → ✓ PASS
 - `recent_context_parts` ≥ 1 → ✓ PASS (confirms Step 6 of `Compact()` ran)
 - `recent_context_parts` = 0 → ✗ FAIL: `PartTypeRecentContext` not written
-  (check `tailStartTurnIdx > 2` guard in `Select()`)
+  (check `tailStartTurnIdx >= 1` guard in `Select()`)
 - RC excerpt contains recognizable content (not empty) → ✓ PASS
 - RC excerpt does NOT contain "7531" is acceptable here — the anchor turn
   may have been kept in the tail verbatim, not in the head
@@ -253,6 +252,7 @@ for m in d['messages']:
 - `recent_context_parts` = 0 → ✗ FAIL: Step 6 of `Compact()` is not running
 - Each boundary message that has a `recent-context:` part: verify its excerpt
   is non-empty and contains recognizable text (user message content or tool names)
+- Both boundary messages should have RC parts now (guard is `tailStartTurnIdx >= 1`)
 
 **⚠️ HARD GATE: Do NOT proceed to STEP 9 or STEP 9b unless `compaction_boundaries` ≥ 2.
 The entire point of this test is to verify topic continuity across TWO compaction rounds.
@@ -503,8 +503,22 @@ Note: FAIL or ABORTED at [B] means the test did not run — rerun with lower con
 | `PartTypeRecentContext` constant | `store/store.go` | `PartType*` block |
 | `RecentContextPartData` struct | `store/store.go` | after `CompactionPartData` |
 | `SelectResult.RecentHead` | `session/compaction.go` | `Select()` return |
-| `RecentHead` guard `tailStartTurnIdx > 2` | `session/compaction.go` | after `tailMsgIdx` check |
+| `tailStartTurnIdx >= 1` guard | `session/compaction.go` | `Select()` RecentHead block |
+| RecentHead in AllHead path | `session/compaction.go` | `Select()` `len(turns) <= tailTurns` branch |
 | Step 6 excerpt write + token update | `session/compaction.go` | `Compact()` Step 6 |
+| `context.WithoutCancel` in Compact | `session/compaction.go` | top of `Compact()` |
+| `context.WithoutCancel` in handleChat | `cmd/knowledge-api/main.go` | `handleChat()` ctx setup |
 | `buildRecentContextExcerpt` | `session/compaction.go` | after `Compact()` |
 | `buildUserParts` opts + StripMedia | `session/context.go` | `buildUserParts()` |
 | `/sessions/{id}/messages` RC rendering | `cmd/knowledge-api/main.go` | `handleSession()` |
+
+## Known Fixed Bugs
+
+| Bug | Root Cause | Fix |
+|-----|-----------|-----|
+| RC part missing on 2nd compaction | `tailStartTurnIdx >= 2` guard too strict | Changed to `>= 1`, clamp to 0 |
+| SSE stream truncated after tool_result | `sseProvider` goroutine had `case <-ctx.Done(): return` | Removed; loop `for ev := range inner` only |
+| "nothing to summarise" after repeated compaction | `len(turns) <= tailTurns` returned `Head: nil` | Changed to `Head: msgs` (AllHead) |
+| Compaction fails with `context canceled` | `Compact()` used HTTP request context for LLM call | `ctx = context.WithoutCancel(ctx)` at top of `Compact()` |
+| RunLoop aborted mid-step on SSE disconnect | `handleChat` passed `r.Context()` to RunLoop | `ctx := context.WithoutCancel(r.Context())` |
+| RC part missing in AllHead path | AllHead returned `RecentHead: nil` | Compute last ≤2 turns as RecentHead in AllHead path |

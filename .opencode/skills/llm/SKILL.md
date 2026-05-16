@@ -104,14 +104,14 @@ flowchart TD
     ListMsgs --> FilterCompacted["FilterCompacted()\nskip pre-compaction history"]
     FilterCompacted --> Select["Select(msgs, allParts, model, cfg)\nhead / tail split"]
 
-    Select --> NothingToSummarise{"len(head) == 0?"}
+    Select --> NothingToSummarise{"Head empty?\n(msgs itself empty)"}
     NothingToSummarise -- Yes --> CompactFail["Compact() returns error\nRunLoop returns error"]
     NothingToSummarise -- No --> BuildHead["Build head messages\nstripMedia=true\ntoolOutputMaxChars=2000"]
 
     BuildHead --> SummaryLLM["LLM call (summaryModel)\ncontext=200000, output=8192\nSummaryTemplate prompt"]
     SummaryLLM --> SummaryMsg["store.Message\nsummary=true"]
 
-    Select --> Tail["Tail messages\n~25% of Usable\nmin 2000 / max 8000 tokens\n≥ 1 user turn always kept"]
+    Select --> Tail["Tail messages (TailStartID != '')\n~25% of Usable\nmin 2000 / max 8000 tokens\n≥ 1 user turn always kept\nOR empty tail when all msgs summarised"]
 
     SummaryMsg --> NextTurn["Next RunLoop iteration\nFilterCompacted skips head\nonly summary + tail sent to LLM"]
     Tail --> NextTurn
@@ -140,13 +140,13 @@ Usable          = 128000 - 8192   = 119,808  ← compact triggers here
 
 `Select(msgs, allParts, model, cfg)` — note `allParts` is now required. It uses `hasPartType(allParts[m.ID], PartTypeCompaction)` to identify compaction boundary user messages, consistent with `FilterCompacted`. The old positional heuristic (`msgs[i+1].Summary`) has been removed.
 
-`SelectResult` now carries a `RecentHead` field — the messages belonging to the last 2 real user turns within `Head` (immediately before the tail). These are the turns most likely to be mis-summarised. `RecentHead` is `nil` when `Head` has ≤ 2 real turns (guard: `tailStartTurnIdx > 2`).
+`SelectResult` now carries a `RecentHead` field — the messages belonging to the last ≤2 real user turns within `Head` (immediately before the tail). `RecentHead` is populated in **all** compaction paths including the AllHead path (`len(turns) <= tailTurns` or `tailMsgIdx == 0`). It is `nil` only when `Head` is truly empty (no user turns at all). When head has only 1 turn, `recentTurnIdx` clamps to 0 so that single turn is still captured.
 
 ```go
 type SelectResult struct {
     Head        []*store.Message
     TailStartID string
-    RecentHead  []*store.Message // last 2 turns of Head closest to tail; nil if head is too short
+    RecentHead  []*store.Message // last ≤2 turns of Head closest to tail; nil only when Head has no user turns
 }
 ```
 
@@ -154,17 +154,19 @@ type SelectResult struct {
 flowchart LR
     Msgs["All messages\n(post-FilterCompacted)"] --> Turns["Identify user turns\nskip boundary msgs\n(PartTypeCompaction check)"]
     Turns --> Enough{"len(turns) > tailTurns\n(default 2)?"}
-    Enough -- No --> NoSplit["SelectResult{Head:nil}\nnothing to summarise"]
+    Enough -- No --> AllHead["SelectResult{Head:msgs, TailStartID:''}\nsummarise ALL — aligned with opencode\nRecentHead = last ≤2 turns of msgs"]
     Enough -- Yes --> WalkBack["Walk last tailTurns turns backward\nestimate token size per turn"]
     WalkBack --> Budget{"fits in PreserveRecentBudget?"}
     Budget -- Yes --> KeepInTail["Keep turn in tail"]
     Budget -- No --> PushForward["tailStartTurnIdx moves forward\n(drop turn from tail)"]
     KeepInTail --> TailStart["tail = msgs[tailStartTurnIdx:]"]
     PushForward --> TailStart
-    TailStart --> Head["head = msgs[:tailStartIdx]\n→ summarised by LLM"]
-    TailStart --> Tail["tail → preserved verbatim"]
-    Head --> RecentHead{"tailStartTurnIdx > 2?"}
-    RecentHead -- Yes --> RH["RecentHead = msgs[turns[tailStartTurnIdx-2].StartIdx : tailMsgIdx]\n(last 2 turns of head)"]
+    TailStart --> TailMsgIdx{"tailMsgIdx == 0?"}
+    TailMsgIdx -- Yes --> AllHead
+    TailMsgIdx -- No --> Head["head = msgs[:tailMsgIdx]\n→ summarised by LLM"]
+    TailMsgIdx -- No --> Tail["tail → preserved verbatim"]
+    Head --> RecentHead{"tailStartTurnIdx >= 1?"}
+    RecentHead -- Yes --> RH["recentTurnIdx = max(0, tailStartTurnIdx-2)\nRecentHead = msgs[turns[recentTurnIdx].StartIdx : tailMsgIdx]"]
     RecentHead -- No --> RHNil["RecentHead = nil"]
 ```
 
@@ -198,7 +200,7 @@ Excerpt format (rendered by `buildRecentContextExcerpt`):
 
 - Text is truncated at rune boundaries (not byte boundaries) using `utf8.RuneCountInString`.
 - Role labels are only written when the message has actual text or tool content (`hasContent` guard).
-- If `RecentHead` is nil or produces no content, Step 6 is skipped entirely.
+- If `RecentHead` is nil (no user turns in head) or produces no text/tool content, Step 6 is skipped entirely.
 
 After writing the part, `Compact()` calls `store.GetMessage` + `store.UpdateMessage` to set `boundary.Tokens.Input = len(excerpt)/4` — preventing `estimateTurnTokens` from under-counting the boundary message on the next compaction round (fallback would be 100 tokens).
 
@@ -237,6 +239,32 @@ When `opts.StripMedia = true` (used in the summary generation path), `PartTypeRe
 [head turn B] ...
 [SummaryTemplate prompt]
 ```
+
+### Context lifetime — `context.WithoutCancel` in Compact() and handleChat
+
+Both `Compact()` and the `knowledge-api` HTTP handler use `context.WithoutCancel` to decouple their work from the caller's cancellation signal:
+
+**`session/compaction.go:Compact()`**
+```go
+func (c *Compactor) Compact(ctx context.Context, ...) (string, error) {
+    // Detach: compaction must complete even if the HTTP request context is cancelled
+    // (e.g. SSE client disconnects mid-stream while the summary LLM call is in flight).
+    ctx = context.WithoutCancel(ctx)
+    ...
+}
+```
+
+**`cmd/knowledge-api/main.go:handleChat()`**
+```go
+// Detach: RunLoop must not be cancelled when the SSE client disconnects.
+ctx := context.WithoutCancel(r.Context())
+```
+
+**Why this matters:** When `$(curl -s ...)` is used to capture an SSE response and the server writes `tool_result` events then goes quiet for 10–15 s (LLM summary call), the OS may detect a half-close on the TCP connection and cancel `r.Context()`. Without `context.WithoutCancel`, the compaction LLM call fails immediately with `context canceled`, the RunLoop returns an error, and the `done` event is never written.
+
+**Rule:** Any long-running work that must survive HTTP client disconnection should derive its context with `context.WithoutCancel(ctx)`. The `context.WithoutCancel` function (Go 1.21+) inherits all values from the parent context but ignores cancellation.
+
+---
 
 ### MaxSteps — graceful termination
 
