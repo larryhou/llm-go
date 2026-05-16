@@ -21,7 +21,7 @@ func TestMaxOutputTokens(t *testing.T) {
 		{32000, 32000},
 		{32001, 32000}, // capped at 32 000
 		{65536, 32000},
-		{0, 0},
+		{0, 4096},  // unset → fallback to 4096 (avoids sending max_tokens=0 to provider)
 	}
 	for _, c := range cases {
 		m := llm.Model{Limit: llm.ModelLimit{Output: c.output}}

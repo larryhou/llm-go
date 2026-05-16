@@ -14,21 +14,25 @@ It exposes external knowledge backends to the model as two tool calls
 
 ```
 llm-go/
-└── knowledge/
-    ├── knowledge.go             QueryType, Query, Result, CompactionHook — core types
-    ├── source.go                Source interface           — backend contract
+├── knowledge/
+│   ├── knowledge.go             QueryType, Query, Result, Source, Manager types
+│   ├── source.go                Source interface           — backend contract
+│   ├── manager.go               Manager                   — routing & dispatch
+│   ├── search_tool.go           knowledge_search          — tool.Tool impl
+│   ├── fetch_tool.go            knowledge_fetch           — tool.Tool impl
+│   ├── knowledge_test.go        unit tests (Manager, routing, priority, truncation)
+│   ├── gsetokenizer/
+│   │   └── gsetokenizer.go      gse bleve tokenizer adapter (Chinese segmentation)
+│   └── source/
+│       └── bleve/
+│           └── bleve.go         BleveSource               — reference impl
+└── store/
+    ├── store.go                 Store interface, Message, Part, Session types
     ├── persist.go               PersistStore interface + Record type — L2 persistence contract
-    ├── manager.go               Manager                   — routing & dispatch
-    ├── search_tool.go           knowledge_search          — tool.Tool impl
-    ├── fetch_tool.go            knowledge_fetch           — tool.Tool impl
     ├── session_history.go       SessionHistorySource      — L0/L1/L2 cache + P3 Peek
-    ├── knowledge_test.go        unit tests (Manager, routing, priority, truncation)
     ├── session_history_test.go  19 layered tests (pure-memory → stub → invariants)
-    ├── gsetokenizer/
-    │   └── gsetokenizer.go      gse bleve tokenizer adapter (Chinese segmentation)
-    └── source/
-        └── bleve/
-            └── bleve.go         BleveSource               — reference impl
+    ├── memory/                  in-memory store.Store impl
+    └── sqlite/                  SQLite store.Store + PersistStore + HistorySource impl
 ```
 
 ---
@@ -63,7 +67,8 @@ type Result struct {
 // and their parts. Used by SessionHistorySource to index compacted history.
 // Note: parts contains all session parts, not just head — only access parts[m.ID]
 // for m in head.
-type CompactionHook func(head []*store.Message, parts map[string][]*store.Part)
+// Defined in store package: type CompactionHook func(head []*Message, parts map[string][]*Part)
+type CompactionHook = store.CompactionHook
 ```
 
 ---
@@ -151,7 +156,7 @@ flowchart TD
 
 ---
 
-## Session History Recall (`session_history.go`)
+## Session History Recall (`store/session_history.go`)
 
 `SessionHistorySource` is a `knowledge.Source` that makes compacted conversation
 history searchable via `knowledge_search` / `knowledge_fetch`. It uses a
@@ -179,16 +184,11 @@ Invariant: `loadedSeqs (L1) ⊆ compactionDocs (L0) ⊆ SQLite (L2)`
 ### Record structure
 
 ```go
-// Record is the unit stored at every layer (renamed from HistoryDoc).
-type Record struct {
-    ID            string   // store.Message.ID — Bleve doc ID
-    Role          string   // "user" | "assistant"
-    Text          string   // all text parts concatenated
-    ToolCalls     []string // tool names invoked in this turn
-    TurnIndex     int      // position in compaction head (0-based)
-    CompactionSeq int      // which compaction round (monotonically increasing)
-    CreatedAt     int64    // unix ms
-}
+// Record is the unit stored at every layer (defined in store package).
+type Record = store.Record
+
+// PersistStore is the L2 persistence interface (defined in store package).
+type PersistStore = store.PersistStore
 ```
 
 ### Constructor
@@ -196,12 +196,12 @@ type Record struct {
 ```go
 // ps = nil → pure-memory (no SQLite, history lost on restart)
 // ps = sqlite.NewHistorySource(st, sessID, 0) → full three-layer mode
-func NewSessionHistorySource(
+func store.NewSessionHistorySource(
     sessionID      string,
-    maxCompactions int,    // L1 cap; 0 → DefaultMaxCompactions (8)
-    maxIndexedSeqs int,    // L0 cap; 0 → DefaultMaxIndexedSeqs (80)
-    ps             PersistStore,
-) (*SessionHistorySource, error)
+    maxCompactions int,    // L1 cap; 0 → store.DefaultMaxCompactions (8)
+    maxIndexedSeqs int,    // L0 cap; 0 → store.DefaultMaxIndexedSeqs (80)
+    ps             store.PersistStore,
+) (*store.SessionHistorySource, error)
 ```
 
 ### Lifecycle
@@ -258,16 +258,16 @@ On a `Fetch(refID)` call:
 ### Wiring (with SQLite store)
 
 ```go
-// -store sqlite:./data.db → sessionStore implements knowledge.PersistStore
-var ps knowledge.PersistStore
-if p, ok := sessionStore.(knowledge.PersistStore); ok {
-    ps = p  // sqlite.Store satisfies PersistStore
+// -store sqlite:./data.db → sessionStore implements store.PersistStore
+var ps store.PersistStore
+if p, ok := sessionStore.(store.PersistStore); ok {
+    ps = p  // sqlite.Store satisfies store.PersistStore
 }
 
-historySrc, _ := knowledge.NewSessionHistorySource(
+historySrc, _ := store.NewSessionHistorySource(
     sessionID,
-    knowledge.DefaultMaxCompactions,
-    knowledge.DefaultMaxIndexedSeqs,
+    store.DefaultMaxCompactions,
+    store.DefaultMaxIndexedSeqs,
     ps,
 )
 compactionHook = historySrc.Hook()   // cache once
@@ -495,7 +495,7 @@ blevesource.New(idx, "docs", 0, &blevesource.Config{
 - `maxIndexedSeqs` (L0 cap, default 80) controls compactionDocs RAM (trivial: ~36 B/entry).
 - `maxIndexedSeqs` must be ≥ `maxCompactions` — constructor enforces this silently.
 - The gse tokenizer loads its dictionary on first use via `seg.LoadDict()`.
-- `CompactionHook` is called synchronously inside `Compact()` — keep it fast.
+- `CompactionHook` (`store.CompactionHook`) is called synchronously inside `Compact()` — keep it fast.
 - `sess.hook` must be cached on `chatSession` (not re-created per request).
 
 ### Session reset (`session_reset` tool)
@@ -510,17 +510,16 @@ blevesource.New(idx, "docs", 0, &blevesource.Config{
 
 | File | Purpose |
 |------|---------|
-| `knowledge/knowledge.go` | `QueryType`, `Query`, `Result`, `CompactionHook` — edit when adding query types or result fields |
+| `knowledge/knowledge.go` | `QueryType`, `Query`, `Result` — edit when adding query types or result fields |
 | `knowledge/source.go` | `Source` interface — the only contract all backends must satisfy |
-| `knowledge/persist.go` | `PersistStore` interface + `Record` type — L2 persistence contract |
 | `knowledge/manager.go` | Routing, priority groups, concurrency, truncation — core dispatch engine |
 | `knowledge/search_tool.go` | `knowledge_search` tool exposed to LLM — input schema + Peek invocation |
 | `knowledge/fetch_tool.go` | `knowledge_fetch` tool exposed to LLM — input schema + Fetch invocation |
-| `knowledge/session_history.go` | `SessionHistorySource` — L0/L1 cache, P3 Peek, page-in Fetch, LRU eviction |
-| `knowledge/gsetokenizer/gsetokenizer.go` | gse Bleve tokenizer adapter — registered via `init()` |
 | `knowledge/knowledge_test.go` | Manager routing, priority, truncation, timeout, partial failure tests |
-| `knowledge/session_history_test.go` | 19 layered tests: pure-memory → PersistStore stub → invariants |
 | `knowledge/source/bleve/bleve.go` | Reference Source implementation — use as template for new sources |
+| `store/persist.go` | `store.PersistStore` interface + `store.Record` type — L2 persistence contract |
+| `store/session_history.go` | `store.SessionHistorySource` — L0/L1 cache, P3 Peek, page-in Fetch, LRU eviction |
+| `store/session_history_test.go` | 19 layered tests: pure-memory → PersistStore stub → invariants |
 | `store/sqlite/sqlite.go` | `Store` (PersistStore impl) + `HistorySource` (Source + PersistStore impl) |
 | `store/sqlite/migrations/001_init.sql` | `history_docs` table schema |
 | `session/reset_tool.go` | `session_reset` built-in tool — atomic store delete + index reset via callback |

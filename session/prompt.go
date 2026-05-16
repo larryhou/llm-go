@@ -9,7 +9,6 @@ import (
 	"time"
 
 	"github.com/larryhou/llm-go/config"
-	"github.com/larryhou/llm-go/knowledge"
 	"github.com/larryhou/llm-go/llm"
 	"github.com/larryhou/llm-go/store"
 	"github.com/larryhou/llm-go/tool"
@@ -63,10 +62,10 @@ type RunInput struct {
 	MaxSteps int
 
 	// OnCompact, when non-nil, is called after each successful Compact().
-	// Use knowledge.SessionHistorySource.Hook() to index compacted history
+	// Use store.SessionHistorySource.Hook() to index compacted history
 	// for later retrieval via knowledge_search / knowledge_fetch.
 	// Nil is a no-op — existing callers are unaffected.
-	OnCompact knowledge.CompactionHook
+	OnCompact store.CompactionHook
 
 	// WaitFor, when non-nil, is waited on before loadMessages is called.
 	// Use the previous turn's StoreDone so the new turn starts immediately

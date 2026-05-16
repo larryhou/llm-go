@@ -24,7 +24,6 @@ import (
 	"strings"
 
 	llmconfig "github.com/larryhou/llm-go/config"
-	"github.com/larryhou/llm-go/knowledge"
 	"github.com/larryhou/llm-go/llm"
 	"github.com/larryhou/llm-go/session"
 	"github.com/larryhou/llm-go/store"
@@ -91,7 +90,7 @@ func main() {
 	}
 
 	compactionCount := 0
-	onCompact := knowledge.CompactionHook(func(head []*store.Message, parts map[string][]*store.Part) {
+	onCompact := store.CompactionHook(func(head []*store.Message, parts map[string][]*store.Part) {
 		compactionCount++
 		fmt.Printf("\n╔══ COMPACTION #%d ══════════════════════════════════════\n", compactionCount)
 		fmt.Printf("║  head: %d messages\n", len(head))

@@ -1,4 +1,4 @@
-package knowledge_test
+package store_test
 
 // session_history_test.go — layered tests for SessionHistorySource.
 //
@@ -47,12 +47,12 @@ import (
 
 // ── stub PersistStore + Source ────────────────────────────────────────────────
 
-// memPersist is an in-memory implementation of knowledge.PersistStore that
+// memPersist is an in-memory implementation of store.PersistStore that
 // also implements knowledge.Source (so it can serve as an L2 search backend).
 // All data is keyed by (sessionID, seq, docID).
 type memPersist struct {
 	mu   sync.Mutex
-	data map[string]map[int][]knowledge.Record // sessionID → seq → []Record
+	data map[string]map[int][]store.Record // sessionID → seq → []Record
 
 	// call counters for assertions
 	saveCount         int
@@ -63,12 +63,12 @@ type memPersist struct {
 }
 
 func newMemPersist() *memPersist {
-	return &memPersist{data: make(map[string]map[int][]knowledge.Record)}
+	return &memPersist{data: make(map[string]map[int][]store.Record)}
 }
 
-func (m *memPersist) sesData(sessionID string) map[int][]knowledge.Record {
+func (m *memPersist) sesData(sessionID string) map[int][]store.Record {
 	if m.data[sessionID] == nil {
-		m.data[sessionID] = make(map[int][]knowledge.Record)
+		m.data[sessionID] = make(map[int][]store.Record)
 	}
 	return m.data[sessionID]
 }
@@ -106,12 +106,12 @@ func (m *memPersist) LoadSeqIndex(_ context.Context, sessionID string, limit int
 	return result, nil
 }
 
-func (m *memPersist) LoadRecordsBySeq(_ context.Context, sessionID string, seq int) ([]knowledge.Record, error) {
+func (m *memPersist) LoadRecordsBySeq(_ context.Context, sessionID string, seq int) ([]store.Record, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.loadBySeqCount++
 	recs := m.sesData(sessionID)[seq]
-	out := make([]knowledge.Record, len(recs))
+	out := make([]store.Record, len(recs))
 	copy(out, recs)
 	return out, nil
 }
@@ -130,7 +130,7 @@ func (m *memPersist) FindSeqByDocID(_ context.Context, sessionID string, docID s
 	return 0, false, nil
 }
 
-func (m *memPersist) SaveRecord(_ context.Context, sessionID string, rec knowledge.Record) error {
+func (m *memPersist) SaveRecord(_ context.Context, sessionID string, rec store.Record) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.saveCount++
@@ -240,18 +240,18 @@ func (m *memPersist) totalRecords(sessionID string) int {
 
 const testSessID = "test-session"
 
-func newPureMemSrc(t *testing.T, maxL1, maxL0 int) *knowledge.SessionHistorySource {
+func newPureMemSrc(t *testing.T, maxL1, maxL0 int) *store.SessionHistorySource {
 	t.Helper()
-	src, err := knowledge.NewSessionHistorySource(testSessID, maxL1, maxL0, nil)
+	src, err := store.NewSessionHistorySource(testSessID, maxL1, maxL0, nil)
 	if err != nil {
 		t.Fatalf("NewSessionHistorySource: %v", err)
 	}
 	return src
 }
 
-func newSrcWithPS(t *testing.T, maxL1, maxL0 int, ps knowledge.PersistStore) *knowledge.SessionHistorySource {
+func newSrcWithPS(t *testing.T, maxL1, maxL0 int, ps store.PersistStore) *store.SessionHistorySource {
 	t.Helper()
-	src, err := knowledge.NewSessionHistorySource(testSessID, maxL1, maxL0, ps)
+	src, err := store.NewSessionHistorySource(testSessID, maxL1, maxL0, ps)
 	if err != nil {
 		t.Fatalf("NewSessionHistorySource: %v", err)
 	}
@@ -282,7 +282,7 @@ func makeMsg(id, text, sessID string) (*store.Message, map[string][]*store.Part)
 }
 
 // fireHook runs a compaction hook with a set of (id, text) pairs.
-func fireHook(hook knowledge.CompactionHook, sessID string, msgs []struct{ id, text string }) {
+func fireHook(hook store.CompactionHook, sessID string, msgs []struct{ id, text string }) {
 	var head []*store.Message
 	allParts := make(map[string][]*store.Part)
 	for _, m := range msgs {
@@ -295,7 +295,7 @@ func fireHook(hook knowledge.CompactionHook, sessID string, msgs []struct{ id, t
 	hook(head, allParts)
 }
 
-func peek(t *testing.T, src *knowledge.SessionHistorySource, query string) []knowledge.Result {
+func peek(t *testing.T, src *store.SessionHistorySource, query string) []knowledge.Result {
 	t.Helper()
 	results, err := src.Peek(context.Background(), knowledge.Query{
 		Type:       knowledge.QueryTypeSearch,
@@ -308,7 +308,7 @@ func peek(t *testing.T, src *knowledge.SessionHistorySource, query string) []kno
 	return results
 }
 
-func fetchDoc(t *testing.T, src *knowledge.SessionHistorySource, refID string) knowledge.Result {
+func fetchDoc(t *testing.T, src *store.SessionHistorySource, refID string) knowledge.Result {
 	t.Helper()
 	results, err := src.Fetch(context.Background(), knowledge.Query{
 		Type:  knowledge.QueryTypeFetch,

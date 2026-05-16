@@ -206,10 +206,10 @@ func TestBleveIndex_SearchAndFetch(t *testing.T) {
 		}
 	})
 
-	t.Run("search_effect_skill", func(t *testing.T) {
+	t.Run("search_llm_skill", func(t *testing.T) {
 		results, err := src.Peek(ctx, knowledge.Query{
 			Type:       knowledge.QueryTypeSearch,
-			Input:      "Effect TypeScript composable",
+			Input:      "RunLoop RecordProvider replay ndjson provider",
 			MaxResults: 3,
 		})
 		if err != nil {
@@ -221,8 +221,9 @@ func TestBleveIndex_SearchAndFetch(t *testing.T) {
 		for _, r := range results {
 			t.Logf("  [%.2f] %s", r.Score, r.Title)
 		}
-		if !strings.Contains(strings.ToLower(results[0].Title), "effect") {
-			t.Errorf("expected effect skill to rank first, got: %s", results[0].Title)
+		if !strings.Contains(strings.ToLower(results[0].Title), "llm") &&
+			!strings.Contains(strings.ToLower(results[0].Title), "replay") {
+			t.Errorf("expected llm or replay skill to rank first, got: %s", results[0].Title)
 		}
 	})
 

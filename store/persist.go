@@ -1,6 +1,4 @@
-// Package knowledge provides session history recall via a per-session Bleve
-// in-memory index, integrated with the knowledge_search / knowledge_fetch tools.
-package knowledge
+package store
 
 import "context"
 

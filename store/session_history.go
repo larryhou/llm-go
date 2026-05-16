@@ -1,6 +1,4 @@
-// Package knowledge provides session history recall via a per-session Bleve
-// in-memory index, integrated with the knowledge_search / knowledge_fetch tools.
-package knowledge
+package store
 
 import (
 	"context"
@@ -15,7 +13,7 @@ import (
 	index "github.com/blevesearch/bleve_index_api"
 
 	_ "github.com/larryhou/llm-go/knowledge/gsetokenizer" // register "gse" tokenizer
-	"github.com/larryhou/llm-go/store"
+	"github.com/larryhou/llm-go/knowledge"
 )
 
 // htmlTagRe matches any HTML tag so highlight markup can be stripped from
@@ -49,7 +47,7 @@ const DefaultMaxIndexedSeqs = DefaultMaxCompactions * 10
 
 // CompactionHook is called after a successful Compact(), receiving the head
 // messages that were compacted and their associated parts.
-type CompactionHook func(head []*store.Message, parts map[string][]*store.Part)
+type CompactionHook func(head []*Message, parts map[string][]*Part)
 
 // Record is the document indexed per message at compaction time.
 type Record struct {
@@ -181,8 +179,8 @@ func (s *SessionHistorySource) ID() string { return sessionHistorySourceID }
 func (s *SessionHistorySource) Priority() int { return 0 }
 
 // Accepts implements knowledge.Source.
-func (s *SessionHistorySource) Accepts(q Query) bool {
-	return q.Type == QueryTypeSearch || q.Type == QueryTypeFetch
+func (s *SessionHistorySource) Accepts(q knowledge.Query) bool {
+	return q.Type == knowledge.QueryTypeSearch || q.Type == knowledge.QueryTypeFetch
 }
 
 // Reset discards all cache state and — if a PersistStore is configured —
@@ -225,7 +223,7 @@ func (s *SessionHistorySource) Reset() error {
 //  2. SQLite.Peek  → full-history hits via SQL LIKE
 //  3. Merge: Bleve hits first (sorted by score), then unique SQLite hits appended
 //  4. Touch LRU for every seq that appeared in Bleve results
-func (s *SessionHistorySource) Peek(ctx context.Context, q Query) ([]Result, error) {
+func (s *SessionHistorySource) Peek(ctx context.Context, q knowledge.Query) ([]knowledge.Result, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -247,16 +245,16 @@ func (s *SessionHistorySource) Peek(ctx context.Context, q Query) ([]Result, err
 	}
 
 	// ── L2: SQLite search (via persistStore as Source) ────────────────────────
-	var sqlResults []Result
+	var sqlResults []knowledge.Result
 	if s.persistStore != nil {
-		if src, ok := s.persistStore.(Source); ok {
+		if src, ok := s.persistStore.(knowledge.Source); ok {
 			sqlResults, _ = src.Peek(ctx, q)
 		}
 	}
 
 	// ── Merge: Bleve first, then unique SQLite supplements ────────────────────
 	seen := make(map[string]struct{}, len(bleveResults))
-	merged := make([]Result, 0, size)
+	merged := make([]knowledge.Result, 0, size)
 
 	for _, r := range bleveResults {
 		seen[r.RefID] = struct{}{}
@@ -280,7 +278,7 @@ func (s *SessionHistorySource) Peek(ctx context.Context, q Query) ([]Result, err
 //
 // Locates the owning seq for docID (L0 → SQLite FindSeqByDocID on miss),
 // page-ins that seq into Bleve if needed, then returns the full text.
-func (s *SessionHistorySource) Fetch(ctx context.Context, q Query) ([]Result, error) {
+func (s *SessionHistorySource) Fetch(ctx context.Context, q knowledge.Query) ([]knowledge.Result, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -329,7 +327,7 @@ func (s *SessionHistorySource) Fetch(ctx context.Context, q Query) ([]Result, er
 // Each new compaction round is persisted to SQLite (L2) and indexed in Bleve
 // (L1), then LRU eviction is applied to both L0 and L1 if caps are exceeded.
 func (s *SessionHistorySource) Hook() CompactionHook {
-	return func(head []*store.Message, parts map[string][]*store.Part) {
+	return func(head []*Message, parts map[string][]*Part) {
 		s.mu.Lock()
 		defer s.mu.Unlock()
 
@@ -514,7 +512,7 @@ func (s *SessionHistorySource) seqForDoc(docID string) (int, bool) {
 // bleveSearch runs a search against the Bleve index and returns results +
 // the set of seqs that contributed hits.
 // Must be called with s.mu held.
-func (s *SessionHistorySource) bleveSearch(ctx context.Context, input string, size int) ([]Result, map[int]struct{}) {
+func (s *SessionHistorySource) bleveSearch(ctx context.Context, input string, size int) ([]knowledge.Result, map[int]struct{}) {
 	input = strings.TrimSpace(input)
 	var bq bquery.Query
 	if input == "" {
@@ -533,7 +531,7 @@ func (s *SessionHistorySource) bleveSearch(ctx context.Context, input string, si
 		return nil, nil
 	}
 
-	results := make([]Result, 0, len(res.Hits))
+	results := make([]knowledge.Result, 0, len(res.Hits))
 	seqs := make(map[int]struct{})
 
 	for _, hit := range res.Hits {
@@ -556,7 +554,7 @@ func (s *SessionHistorySource) bleveSearch(ctx context.Context, input string, si
 		}
 
 		title := fmt.Sprintf("[来源：历史对话 第%d轮 turn#%d role=%s]", seq, turnIdx, role)
-		results = append(results, Result{
+		results = append(results, knowledge.Result{
 			RefID:   sessionHistorySourceID + ":" + hit.ID,
 			Title:   title,
 			Source:  sessionHistorySourceID,
@@ -569,7 +567,7 @@ func (s *SessionHistorySource) bleveSearch(ctx context.Context, input string, si
 
 // fetchFromBleve retrieves the full document from Bleve by docID.
 // Must be called with s.mu held.
-func (s *SessionHistorySource) fetchFromBleve(docID string) ([]Result, error) {
+func (s *SessionHistorySource) fetchFromBleve(docID string) ([]knowledge.Result, error) {
 	doc, err := s.index.Document(docID)
 	if err != nil || doc == nil {
 		return nil, fmt.Errorf("session history fetch %q: not found in bleve", docID)
@@ -597,7 +595,7 @@ func (s *SessionHistorySource) fetchFromBleve(docID string) ([]Result, error) {
 	text := get(fieldText)
 	title := fmt.Sprintf("[来源：历史对话 第%s轮 turn#%s role=%s]", seq, turnIdx, role)
 
-	return []Result{{
+	return []knowledge.Result{{
 		RefID:   sessionHistorySourceID + ":" + docID,
 		Title:   title,
 		Source:  sessionHistorySourceID,
@@ -614,16 +612,16 @@ func (s *SessionHistorySource) fetchFromBleve(docID string) ([]Result, error) {
 // fetchFromSQLite falls back to the persistStore Source.Fetch when Bleve
 // page-in failed. Must be called with s.mu held (releases mu temporarily
 // is not needed since SQLite access is via the store, not re-entrant).
-func (s *SessionHistorySource) fetchFromSQLite(ctx context.Context, docID string) ([]Result, error) {
+func (s *SessionHistorySource) fetchFromSQLite(ctx context.Context, docID string) ([]knowledge.Result, error) {
 	if s.persistStore == nil {
 		return nil, fmt.Errorf("session history fetch %q: no fallback available", docID)
 	}
-	src, ok := s.persistStore.(Source)
+	src, ok := s.persistStore.(knowledge.Source)
 	if !ok {
 		return nil, fmt.Errorf("session history fetch %q: persist store is not a Source", docID)
 	}
-	return src.Fetch(ctx, Query{
-		Type:  QueryTypeFetch,
+	return src.Fetch(ctx, knowledge.Query{
+		Type:  knowledge.QueryTypeFetch,
 		Input: sessionHistorySourceID + ":" + docID,
 	})
 }
@@ -649,19 +647,19 @@ func (s *SessionHistorySource) storedText(docID string) string {
 
 // ── document builder ──────────────────────────────────────────────────────────
 
-func buildDoc(m *store.Message, parts []*store.Part, seq, turnIdx int) Record {
+func buildDoc(m *Message, parts []*Part, seq, turnIdx int) Record {
 	var textParts []string
 	var toolCalls []string
 
 	for _, p := range parts {
 		switch p.Type {
-		case store.PartTypeText:
-			d, ok := store.DataAs[*store.TextPartData](p)
+		case PartTypeText:
+			d, ok := DataAs[*TextPartData](p)
 			if ok && d.Text != "" {
 				textParts = append(textParts, d.Text)
 			}
-		case store.PartTypeTool:
-			d, ok := store.DataAs[*store.ToolPartData](p)
+		case PartTypeTool:
+			d, ok := DataAs[*ToolPartData](p)
 			if ok && d.Tool != "" {
 				toolCalls = append(toolCalls, d.Tool)
 			}

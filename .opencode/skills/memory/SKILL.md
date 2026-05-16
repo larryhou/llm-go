@@ -58,7 +58,7 @@ Bleve **before** removing it from compactionDocs.
 ## Key Types
 
 ```go
-// Record is the unit stored at every layer.
+// store.Record is the unit stored at every layer (store/persist.go).
 type Record struct {
     ID            string   // store.Message.ID — used as Bleve doc ID
     Role          string   // "user" | "assistant"
@@ -69,8 +69,8 @@ type Record struct {
     CreatedAt     int64    // unix ms
 }
 
-// PersistStore is the L2 persistence interface.
-// sqlite.Store implements it; sqlite.HistorySource also implements Source
+// store.PersistStore is the L2 persistence interface (store/persist.go).
+// sqlite.Store implements it; sqlite.HistorySource also implements knowledge.Source
 // so it can be registered with Manager for SQL-backed search.
 type PersistStore interface {
     LoadSeqIndex(ctx, sessionID string, limit int) (map[int][]string, error)
@@ -229,12 +229,12 @@ maxIndexedSeqs MUST be ≥ maxCompactions
 ```go
 // ps = nil → pure-memory mode (history lost on restart)
 // ps = sqlite.NewHistorySource(st, sessID, 0) → L2 persistent
-func NewSessionHistorySource(
+func store.NewSessionHistorySource(
     sessionID      string,
-    maxCompactions int,    // L1 cap; 0 → DefaultMaxCompactions (8)
-    maxIndexedSeqs int,    // L0 cap; 0 → DefaultMaxIndexedSeqs (80)
-    ps             PersistStore,
-) (*SessionHistorySource, error)
+    maxCompactions int,    // L1 cap; 0 → store.DefaultMaxCompactions (8)
+    maxIndexedSeqs int,    // L0 cap; 0 → store.DefaultMaxIndexedSeqs (80)
+    ps             store.PersistStore,
+) (*store.SessionHistorySource, error)
 ```
 
 **Defaults:**
@@ -249,7 +249,7 @@ func NewSessionHistorySource(
 ## Wiring in cmd/control and cmd/llm-api
 
 Both commands support `-store sqlite:<path>` to enable L2 persistence.
-The `HistorySource` object serves as both `PersistStore` (for the cache)
+The `HistorySource` object serves as both `store.PersistStore` (for the cache)
 and `knowledge.Source` (registered with Manager for direct SQL search).
 
 ```go
@@ -257,16 +257,16 @@ and `knowledge.Source` (registered with Manager for direct SQL search).
 sessionStore, _ = sqlitestore.Open(path)    // or memory.New()
 
 // Inject PersistStore via interface assertion — no concrete type leak
-var ps knowledge.PersistStore
-if p, ok := sessionStore.(knowledge.PersistStore); ok {
-    ps = p   // sqlite.Store implements PersistStore
+var ps store.PersistStore
+if p, ok := sessionStore.(store.PersistStore); ok {
+    ps = p   // sqlite.Store implements store.PersistStore
 }
 
 // Create SessionHistorySource with L2 backend
-historySrc, _ = knowledge.NewSessionHistorySource(
+historySrc, _ = store.NewSessionHistorySource(
     sessionID,
-    knowledge.DefaultMaxCompactions,
-    knowledge.DefaultMaxIndexedSeqs,
+    store.DefaultMaxCompactions,
+    store.DefaultMaxIndexedSeqs,
     ps,
 )
 
@@ -274,9 +274,9 @@ historySrc, _ = knowledge.NewSessionHistorySource(
 compactionHook = historySrc.Hook()
 
 // Register with Manager
-km.Register(historySrc)  // SessionHistorySource as Source (priority 0)
+km.Register(historySrc)  // SessionHistorySource as knowledge.Source (priority 0)
 // Optional: also register HistorySource directly for SQL-backed search
-// (if ps also implements Source, which sqlite.HistorySource does)
+// (if ps also implements knowledge.Source, which sqlite.HistorySource does)
 ```
 
 ---
@@ -300,7 +300,7 @@ sqlite.HistorySource  (scoped to one sessionID)
 classDiagram
     class Store {
         +store.Store
-        +knowledge.PersistStore
+        +store.PersistStore
         +LoadSeqIndex()
         +LoadRecordsBySeq()
         +FindSeqByDocID()
@@ -312,7 +312,7 @@ classDiagram
         -sessionID string
         -priority int
         +knowledge.Source
-        +knowledge.PersistStore
+        +store.PersistStore
         +ID() string
         +Priority() int
         +Accepts() bool
@@ -403,7 +403,7 @@ all three layers from scratch.
 
 ## Testing
 
-Tests live in `knowledge/session_history_test.go` with 19 cases across 3 levels:
+Tests live in `store/session_history_test.go` (package `store_test`) with 19 cases across 3 levels:
 
 | Level | Focus |
 |-------|-------|
@@ -436,11 +436,11 @@ split into individual characters by gse and cannot be used as search terms.
 
 | File | Purpose |
 |------|---------|
-| `knowledge/session_history.go` | `SessionHistorySource` — L0/L1 cache, P3 Peek, page-in Fetch, LRU |
-| `knowledge/persist.go` | `PersistStore` interface + `Record` type |
-| `knowledge/session_history_test.go` | 19 layered tests (pure-memory → stub → invariants) |
-| `store/sqlite/sqlite.go` | `Store` (store.Store + PersistStore) and `HistorySource` (Source + PersistStore) |
+| `store/session_history.go` | `store.SessionHistorySource` — L0/L1 cache, P3 Peek, page-in Fetch, LRU |
+| `store/persist.go` | `store.PersistStore` interface + `store.Record` type |
+| `store/session_history_test.go` | 19 layered tests (pure-memory → stub → invariants), package `store_test` |
+| `store/sqlite/sqlite.go` | `Store` (store.Store + store.PersistStore) and `HistorySource` (knowledge.Source + store.PersistStore) |
 | `store/sqlite/migrations/001_init.sql` | `history_docs` table schema |
 | `store/sqlite/sqlite_test.go` | SQLite PersistStore tests + HistorySource Peek/Fetch tests |
-| `cmd/control/main.go` | `-store` flag wiring; `sessionStore.(knowledge.PersistStore)` injection |
+| `cmd/control/main.go` | `-store` flag wiring; `sessionStore.(store.PersistStore)` injection |
 | `cmd/llm-api/main.go` | Same pattern as control |

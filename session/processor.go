@@ -13,7 +13,6 @@ import (
 	"time"
 
 	"github.com/larryhou/llm-go/config"
-	"github.com/larryhou/llm-go/knowledge"
 	"github.com/larryhou/llm-go/llm"
 	"github.com/larryhou/llm-go/store"
 	"github.com/larryhou/llm-go/tool"
@@ -48,7 +47,7 @@ type ProcessInput struct {
 
 	// OnCompact, when non-nil, is called after each successful Compact().
 	// Passed through from RunInput so the compaction hook reaches Compactor.Compact().
-	OnCompact knowledge.CompactionHook
+	OnCompact store.CompactionHook
 }
 
 // Processor handles one LLM streaming turn, managing the lifecycle of

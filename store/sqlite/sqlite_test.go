@@ -327,7 +327,7 @@ func TestPersistStore_saveAndLoad(t *testing.T) {
 	s := newStore(t)
 	ctx := context.Background()
 
-	docs := []knowledge.Record{
+	docs := []store.Record{
 		{ID: "d1", Role: "user", Text: "hello world", TurnIndex: 0, CompactionSeq: 1, CreatedAt: time.Now().UnixMilli()},
 		{ID: "d2", Role: "assistant", Text: "hi there", TurnIndex: 1, CompactionSeq: 1, CreatedAt: time.Now().UnixMilli()},
 	}
@@ -351,7 +351,7 @@ func TestPersistStore_deleteBySeq(t *testing.T) {
 	ctx := context.Background()
 
 	for seq := 1; seq <= 3; seq++ {
-		_ = s.SaveRecord(ctx, "sess1", knowledge.Record{
+		_ = s.SaveRecord(ctx, "sess1", store.Record{
 			ID: fmt.Sprintf("d%d", seq), Role: "user",
 			Text: "msg", CompactionSeq: seq, CreatedAt: time.Now().UnixMilli(),
 		})
@@ -374,7 +374,7 @@ func TestPersistStore_toolCalls(t *testing.T) {
 	s := newStore(t)
 	ctx := context.Background()
 
-	doc := knowledge.Record{
+	doc := store.Record{
 		ID: "d1", Role: "assistant",
 		Text:          "using tools",
 		ToolCalls:     []string{"shell", "read", "write"},
@@ -394,8 +394,8 @@ func TestPersistStore_sessionIsolation(t *testing.T) {
 	s := newStore(t)
 	ctx := context.Background()
 
-	_ = s.SaveRecord(ctx, "sess1", knowledge.Record{ID: "d1", CompactionSeq: 1, CreatedAt: time.Now().UnixMilli()})
-	_ = s.SaveRecord(ctx, "sess2", knowledge.Record{ID: "d1", CompactionSeq: 1, CreatedAt: time.Now().UnixMilli()})
+	_ = s.SaveRecord(ctx, "sess1", store.Record{ID: "d1", CompactionSeq: 1, CreatedAt: time.Now().UnixMilli()})
+	_ = s.SaveRecord(ctx, "sess2", store.Record{ID: "d1", CompactionSeq: 1, CreatedAt: time.Now().UnixMilli()})
 
 	r1, _ := s.LoadRecords(ctx, "sess1")
 	r2, _ := s.LoadRecords(ctx, "sess2")
@@ -412,7 +412,7 @@ func TestHistorySource_peek(t *testing.T) {
 	ctx := context.Background()
 	hs := newHistorySource(t, s, "sess1")
 
-	docs := []knowledge.Record{
+	docs := []store.Record{
 		{ID: "d1", Role: "user", Text: "golang concurrency patterns", CompactionSeq: 1, TurnIndex: 0, CreatedAt: time.Now().UnixMilli()},
 		{ID: "d2", Role: "assistant", Text: "use goroutines and channels", CompactionSeq: 1, TurnIndex: 1, CreatedAt: time.Now().UnixMilli()},
 		{ID: "d3", Role: "user", Text: "python decorators explained", CompactionSeq: 2, TurnIndex: 0, CreatedAt: time.Now().UnixMilli()},
@@ -444,7 +444,7 @@ func TestHistorySource_peek_empty_query(t *testing.T) {
 	hs := newHistorySource(t, s, "sess1")
 
 	for i := 0; i < 3; i++ {
-		_ = s.SaveRecord(ctx, "sess1", knowledge.Record{
+		_ = s.SaveRecord(ctx, "sess1", store.Record{
 			ID: fmt.Sprintf("d%d", i), Role: "user",
 			Text: fmt.Sprintf("message %d", i), CompactionSeq: 1,
 			TurnIndex: i, CreatedAt: time.Now().UnixMilli(),
@@ -466,7 +466,7 @@ func TestHistorySource_fetch(t *testing.T) {
 	ctx := context.Background()
 	hs := newHistorySource(t, s, "sess1")
 
-	_ = s.SaveRecord(ctx, "sess1", knowledge.Record{
+	_ = s.SaveRecord(ctx, "sess1", store.Record{
 		ID: "doc42", Role: "assistant",
 		Text:          "the full answer is here",
 		CompactionSeq: 1, TurnIndex: 0,
@@ -543,7 +543,7 @@ func TestPersistStore_survivesReopen(t *testing.T) {
 
 	// Write records in first open.
 	st1, _ := sqlite.Open(path)
-	_ = st1.SaveRecord(ctx, "sess1", knowledge.Record{
+	_ = st1.SaveRecord(ctx, "sess1", store.Record{
 		ID: "d1", Role: "user", Text: "remember this",
 		CompactionSeq: 1, CreatedAt: time.Now().UnixMilli(),
 	})
@@ -592,7 +592,7 @@ func TestLoadSeqIndex_basic(t *testing.T) {
 	// Write 5 seqs with 2 docs each.
 	for seq := 1; seq <= 5; seq++ {
 		for i := 0; i < 2; i++ {
-			_ = s.SaveRecord(ctx, "sess1", knowledge.Record{
+			_ = s.SaveRecord(ctx, "sess1", store.Record{
 				ID:            fmt.Sprintf("d%d-%d", seq, i),
 				Role:          "user",
 				Text:          fmt.Sprintf("seq %d doc %d", seq, i),
@@ -640,7 +640,7 @@ func TestLoadSeqIndex_limitLargerThanData(t *testing.T) {
 	s := newStore(t)
 	ctx := context.Background()
 	for seq := 1; seq <= 3; seq++ {
-		_ = s.SaveRecord(ctx, "sess1", knowledge.Record{
+		_ = s.SaveRecord(ctx, "sess1", store.Record{
 			ID: fmt.Sprintf("d%d", seq), CompactionSeq: seq, CreatedAt: time.Now().UnixMilli(),
 		})
 	}
@@ -660,7 +660,7 @@ func TestLoadRecordsBySeq_basic(t *testing.T) {
 	s := newStore(t)
 	ctx := context.Background()
 
-	want := []knowledge.Record{
+	want := []store.Record{
 		{ID: "a", Role: "user", Text: "hello", TurnIndex: 0, CompactionSeq: 2, ToolCalls: []string{"shell"}, CreatedAt: time.Now().UnixMilli()},
 		{ID: "b", Role: "assistant", Text: "world", TurnIndex: 1, CompactionSeq: 2, CreatedAt: time.Now().UnixMilli()},
 	}
@@ -668,7 +668,7 @@ func TestLoadRecordsBySeq_basic(t *testing.T) {
 		_ = s.SaveRecord(ctx, "sess1", r)
 	}
 	// Write a decoy in a different seq.
-	_ = s.SaveRecord(ctx, "sess1", knowledge.Record{ID: "c", CompactionSeq: 9, CreatedAt: time.Now().UnixMilli()})
+	_ = s.SaveRecord(ctx, "sess1", store.Record{ID: "c", CompactionSeq: 9, CreatedAt: time.Now().UnixMilli()})
 
 	got, err := s.LoadRecordsBySeq(ctx, "sess1", 2)
 	if err != nil {
@@ -701,7 +701,7 @@ func TestLoadRecordsBySeq_noMatch(t *testing.T) {
 func TestFindSeqByDocID_found(t *testing.T) {
 	s := newStore(t)
 	ctx := context.Background()
-	_ = s.SaveRecord(ctx, "sess1", knowledge.Record{
+	_ = s.SaveRecord(ctx, "sess1", store.Record{
 		ID: "doc-42", CompactionSeq: 7, CreatedAt: time.Now().UnixMilli(),
 	})
 
@@ -731,7 +731,7 @@ func TestFindSeqByDocID_notFound(t *testing.T) {
 func TestFindSeqByDocID_sessionIsolation(t *testing.T) {
 	s := newStore(t)
 	ctx := context.Background()
-	_ = s.SaveRecord(ctx, "sessA", knowledge.Record{
+	_ = s.SaveRecord(ctx, "sessA", store.Record{
 		ID: "doc-1", CompactionSeq: 3, CreatedAt: time.Now().UnixMilli(),
 	})
 
@@ -747,24 +747,24 @@ func TestFindSeqByDocID_sessionIsolation(t *testing.T) {
 
 // ── SessionHistorySource integration (L0/L1 caps + LRU) ──────────────────────
 
-func newHistSrc(t *testing.T, st *sqlite.Store, sessID string, maxL1, maxL0 int) *knowledge.SessionHistorySource {
+func newHistSrc(t *testing.T, st *sqlite.Store, sessID string, maxL1, maxL0 int) *store.SessionHistorySource {
 	t.Helper()
 	ps := sqlite.NewHistorySource(st, sessID, 0)
-	src, err := knowledge.NewSessionHistorySource(sessID, maxL1, maxL0, ps)
+	src, err := store.NewSessionHistorySource(sessID, maxL1, maxL0, ps)
 	if err != nil {
 		t.Fatalf("NewSessionHistorySource: %v", err)
 	}
 	return src
 }
 
-func saveAndHook(t *testing.T, src *knowledge.SessionHistorySource, st *sqlite.Store, sessID string, seq int, msgs []string) {
+func saveAndHook(t *testing.T, src *store.SessionHistorySource, st *sqlite.Store, sessID string, seq int, msgs []string) {
 	t.Helper()
 	ctx := context.Background()
 	// Simulate the compaction hook by calling Hook() indirectly:
 	// save records to SQLite directly (as SaveRecord does in Hook) and
 	// also exercise the Hook path via a fake compaction message set.
 	for i, text := range msgs {
-		_ = st.SaveRecord(ctx, sessID, knowledge.Record{
+		_ = st.SaveRecord(ctx, sessID, store.Record{
 			ID:            fmt.Sprintf("%s-seq%d-doc%d", sessID, seq, i),
 			Role:          "user",
 			Text:          text,
@@ -782,7 +782,7 @@ func TestSessionHistorySource_peekFallsBackToSQLite(t *testing.T) {
 
 	// Write 3 seqs directly to SQLite (simulate prior sessions).
 	for seq := 1; seq <= 3; seq++ {
-		_ = s.SaveRecord(ctx, "sess1", knowledge.Record{
+		_ = s.SaveRecord(ctx, "sess1", store.Record{
 			ID:            fmt.Sprintf("d%d", seq),
 			Role:          "user",
 			Text:          fmt.Sprintf("golang concurrency seq %d", seq),
@@ -814,7 +814,7 @@ func TestSessionHistorySource_fetchTriggersPageIn(t *testing.T) {
 	s := newStore(t)
 	ctx := context.Background()
 
-	_ = s.SaveRecord(ctx, "sess1", knowledge.Record{
+	_ = s.SaveRecord(ctx, "sess1", store.Record{
 		ID:            "target-doc",
 		Role:          "assistant",
 		Text:          "the answer is 42",
@@ -847,7 +847,7 @@ func TestSessionHistorySource_l0Eviction(t *testing.T) {
 	sessID := "sess-evict"
 
 	// maxL1=2, maxL0=3
-	src, err := knowledge.NewSessionHistorySource(sessID, 2, 3, sqlite.NewHistorySource(s, sessID, 0))
+	src, err := store.NewSessionHistorySource(sessID, 2, 3, sqlite.NewHistorySource(s, sessID, 0))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -911,7 +911,7 @@ func TestSessionHistorySource_restoreFromSQLite(t *testing.T) {
 
 	// First "process": write 5 seqs via Hook.
 	st1, _ := sqlite.Open(path)
-	src1, _ := knowledge.NewSessionHistorySource(sessID, 2, 4, sqlite.NewHistorySource(st1, sessID, 0))
+	src1, _ := store.NewSessionHistorySource(sessID, 2, 4, sqlite.NewHistorySource(st1, sessID, 0))
 	hook1 := src1.Hook()
 	for seq := 1; seq <= 5; seq++ {
 		msgs := []*store.Message{{
@@ -937,7 +937,7 @@ func TestSessionHistorySource_restoreFromSQLite(t *testing.T) {
 	defer st2.Close()
 
 	// maxL0=4 means only 4 most recent seqs are in compactionDocs at startup.
-	src2, err := knowledge.NewSessionHistorySource(sessID, 2, 4, sqlite.NewHistorySource(st2, sessID, 0))
+	src2, err := store.NewSessionHistorySource(sessID, 2, 4, sqlite.NewHistorySource(st2, sessID, 0))
 	if err != nil {
 		t.Fatal(err)
 	}

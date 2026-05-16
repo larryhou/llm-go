@@ -262,9 +262,9 @@ type server struct {
 type chatSession struct {
 	id         string
 	store      store.Store // per-session isolated store
-	historySrc *knowledge.SessionHistorySource
+	historySrc *store.SessionHistorySource
 	km         *knowledge.Manager // per-session manager: skills source + history source
-	hook       knowledge.CompactionHook // cached hook from historySrc
+	hook       store.CompactionHook // cached hook from historySrc
 	resetTool  tool.Tool                // cached session_reset tool
 
 	// activeHandle tracks the in-flight RunLoopAsync handle for this session.
@@ -443,14 +443,14 @@ func (s *server) handleChat(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
 	sess, exists := s.sessions[sessID]
 	if !exists {
-		// If the store implements knowledge.PersistStore, wire it as the
+		// If the store implements store.PersistStore, wire it as the
 		// L2 backend so compacted history survives process restarts.
-		var ps knowledge.PersistStore
-		if p, ok := s.sessionStore.(knowledge.PersistStore); ok {
+		var ps store.PersistStore
+		if p, ok := s.sessionStore.(store.PersistStore); ok {
 			ps = p
 		}
 
-		historySrc, histErr := knowledge.NewSessionHistorySource(sessID, knowledge.DefaultMaxCompactions, knowledge.DefaultMaxIndexedSeqs, ps)
+		historySrc, histErr := store.NewSessionHistorySource(sessID, store.DefaultMaxCompactions, store.DefaultMaxIndexedSeqs, ps)
 		if histErr != nil {
 			s.mu.Unlock()
 			sendEvent(map[string]any{"type": "error", "error": "create history source: " + histErr.Error()})

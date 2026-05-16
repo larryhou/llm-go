@@ -363,8 +363,8 @@ func main() {
 	}
 
 	// compactionHook and historySrc are set when SessionHistorySource is created.
-	var compactionHook knowledge.CompactionHook
-	var historySrc *knowledge.SessionHistorySource
+	var compactionHook store.CompactionHook
+	var historySrc *store.SessionHistorySource
 
 	if _, statErr := os.Stat(skillsAbsDir); os.IsNotExist(statErr) {
 		fmt.Fprintf(os.Stderr, "[warn] skills directory not found: %s, skipping knowledge index\n", skillsAbsDir)
@@ -375,14 +375,14 @@ func main() {
 		} else {
 			skillsCount = n
 
-			// If the store implements knowledge.PersistStore, wire it as the
+			// If the store implements store.PersistStore, wire it as the
 			// L2 backend so compacted history survives process restarts.
-			var ps knowledge.PersistStore
-			if p, ok := sessionStore.(knowledge.PersistStore); ok {
+			var ps store.PersistStore
+			if p, ok := sessionStore.(store.PersistStore); ok {
 				ps = p
 			}
 			var histErr error
-			historySrc, histErr = knowledge.NewSessionHistorySource(sessionID, knowledge.DefaultMaxCompactions, knowledge.DefaultMaxIndexedSeqs, ps)
+			historySrc, histErr = store.NewSessionHistorySource(sessionID, store.DefaultMaxCompactions, store.DefaultMaxIndexedSeqs, ps)
 			if histErr != nil {
 				fmt.Fprintf(os.Stderr, "[warn] failed to create session history source: %v\n", histErr)
 			} else {
