@@ -17,11 +17,13 @@ llm-go/
 └── knowledge/
     ├── knowledge.go             QueryType, Query, Result, CompactionHook — core types
     ├── source.go                Source interface           — backend contract
+    ├── persist.go               PersistStore interface + Record type — L2 persistence contract
     ├── manager.go               Manager                   — routing & dispatch
     ├── search_tool.go           knowledge_search          — tool.Tool impl
     ├── fetch_tool.go            knowledge_fetch           — tool.Tool impl
-    ├── session_history.go       SessionHistorySource      — compacted history recall
-    ├── knowledge_test.go        unit tests (14 cases)
+    ├── session_history.go       SessionHistorySource      — L0/L1/L2 cache + P3 Peek
+    ├── knowledge_test.go        unit tests (Manager, routing, priority, truncation)
+    ├── session_history_test.go  19 layered tests (pure-memory → stub → invariants)
     ├── gsetokenizer/
     │   └── gsetokenizer.go      gse bleve tokenizer adapter (Chinese segmentation)
     └── source/
@@ -151,10 +153,12 @@ flowchart TD
 
 ## Session History Recall (`session_history.go`)
 
-`SessionHistorySource` is a `knowledge.Source` that indexes compacted messages
-into a private in-memory Bleve index per session. After each `Compact()`, the
-head messages are indexed; the LLM can then retrieve them via the standard
-`knowledge_search` / `knowledge_fetch` tools without any new LLM-facing APIs.
+`SessionHistorySource` is a `knowledge.Source` that makes compacted conversation
+history searchable via `knowledge_search` / `knowledge_fetch`. It uses a
+**three-layer cache** — see the **memory** skill for the complete architecture.
+
+> **For full details on L0/L1/L2, LRU eviction, P3 Peek strategy, SQLite schema,
+> and wiring, load the `memory` skill.**
 
 ### Why it exists
 
@@ -162,164 +166,119 @@ After `Compact()`, `FilterCompacted` hides all messages before the compaction
 boundary. The LLM only sees `[summary + recent N turns]` and cannot reach older
 context. `SessionHistorySource` makes those hidden turns searchable on demand.
 
-### Memory model
+### Three-layer summary
 
-- Each session owns one `bleve.NewMemOnly` index — no cross-session leakage.
-- **`maxCompactions = 8`** (default): retains at most 8 compaction rounds.
-  Each round ≈ 5–6 MB → index cap ≈ **50 MB per session**.
-- On overflow, the oldest round's documents are deleted via `index.Delete(docID)`.
-- Index is released when the `SessionHistorySource` is GC'd (session end).
-- 100 concurrent sessions × 50 MB = 5 GB — safe on a 64 GB server.
+```
+L0  compactionDocs  map[int][]string   seq→docID index   cap: maxIndexedSeqs=80
+L1  Bleve in-memory full-text index    gse + lowercase   cap: maxCompactions=8 seqs ≈ 50 MB
+L2  SQLite history_docs                SQL LIKE search   cap: disk, permanent until Reset()
+```
 
-### Chinese-first indexing
+Invariant: `loadedSeqs (L1) ⊆ compactionDocs (L0) ⊆ SQLite (L2)`
 
-The `gsetokenizer` package (in `knowledge/gsetokenizer/`) registers a Bleve
-tokenizer backed by `go-ego/gse` (Go port of jieba). The `Text` field uses a
-custom `gse_lowercase` analyzer (gse tokenizer + lowercase filter), giving
-accurate Chinese word segmentation instead of the noisy CJK unigram fallback.
-
-### HistoryDoc structure
+### Record structure
 
 ```go
-type HistoryDoc struct {
-    ID            string   // store message ID
+// Record is the unit stored at every layer (renamed from HistoryDoc).
+type Record struct {
+    ID            string   // store.Message.ID — Bleve doc ID
     Role          string   // "user" | "assistant"
     Text          string   // all text parts concatenated
     ToolCalls     []string // tool names invoked in this turn
     TurnIndex     int      // position in compaction head (0-based)
-    CompactionSeq int      // which compaction round (for pruning)
+    CompactionSeq int      // which compaction round (monotonically increasing)
     CreatedAt     int64    // unix ms
 }
+```
+
+### Constructor
+
+```go
+// ps = nil → pure-memory (no SQLite, history lost on restart)
+// ps = sqlite.NewHistorySource(st, sessID, 0) → full three-layer mode
+func NewSessionHistorySource(
+    sessionID      string,
+    maxCompactions int,    // L1 cap; 0 → DefaultMaxCompactions (8)
+    maxIndexedSeqs int,    // L0 cap; 0 → DefaultMaxIndexedSeqs (80)
+    ps             PersistStore,
+) (*SessionHistorySource, error)
 ```
 
 ### Lifecycle
 
 ```mermaid
 flowchart TD
-    A[session created] --> B["NewSessionHistorySource(sessID, maxCompactions=8)\nprivate bleve.NewMemOnly index\ngse_lowercase analyzer"]
-    B --> C["km := knowledge.NewManager()\nkm.Register(historySrc)  ← priority 0\nkm.Register(skillsSrc)   ← priority 1"]
-    C --> D["session.RunLoop(..., RunInput{\n  Tools:     km.Tools(),\n  OnCompact: sess.hook,\n})"]
-    D --> E{LLM turn}
-    E --> F{context full?}
-    F -- no --> E
-    F -- yes --> G["Compact() fires\n→ summary generated\n→ CompactionPart stored"]
-    G --> H["input.OnCompact(sel.Head, allParts)\n→ SessionHistorySource.Hook()"]
-    H --> I{len compactionDocs\n>= maxCompactions?}
-    I -- yes --> J["delete oldest round docs\nfrom Bleve index"]
-    I -- no --> K["index each head message\nas HistoryDoc\ntrack docIDs by CompactionSeq"]
-    J --> K
-    K --> E
-    E --> L[session ends]
-    L --> M[src GC'd → Bleve index released]
+    A([Process Start]) --> B["NewSessionHistorySource\nsessionID, maxL1=8, maxL0=80, ps"]
+    B --> C{PersistStore ps?}
+    C -- yes --> D["ps.LoadSeqIndex(limit=80)\nonly seq+id columns — no text\nRestore L0 compactionDocs\nBleve starts empty"]
+    C -- no --> E["Pure-memory mode\nL0 empty, Bleve empty"]
+    D --> G([Ready])
+    E --> G
+
+    G --> H{LLM turn}
+    H --> I{Context full?}
+    I -- no --> H
+    I -- yes --> J["session.Compact()"]
+    J --> K["CompactionHook fires"]
+    K --> L["L2: ps.SaveRecord() sync"]
+    L --> M["L1: Bleve.Index(m.ID, rec)"]
+    M --> N["L0: compactionDocs update\nlruOrder append\nevictL0/L1 if needed"]
+    N --> H
 ```
 
-### Recall flow (LLM retrieves compacted history)
+### Peek: P3 dual-path (always both L1 and L2)
 
 ```mermaid
 sequenceDiagram
     participant LLM
-    participant searchTool as knowledge_search
-    participant Manager
-    participant Hist as SessionHistorySource\n(pri=0, id="session-history")
-    participant Skills as BleveSource\n(pri=1, id="skills")
+    participant SHS as SessionHistorySource
+    participant Bleve as L1 Bleve
+    participant SQL as L2 SQLite HistorySource
 
-    note over LLM: Context only shows summary + recent turns.\nUser asks about earlier decision.
-
-    LLM->>searchTool: Execute({query:"上次讨论的接口设计"})
-    searchTool->>Manager: peek(Query{Input:"上次讨论的接口设计"})
-    Manager->>Manager: groupByPriority → [[Hist],[Skills]]
-
-    rect rgb(220,240,255)
-        note over Hist: Priority 0 — queried first
-        Manager->>Hist: Peek(ctx, q)
-        note over Hist: gse segments "上次讨论的接口设计"\n→ [上次, 讨论, 接口, 设计]\nBleve full-text search
-        Hist-->>Manager: []Result{snippet:"[来源：历史对话 第2轮 turn#14]...", refID:"session-history:msg-xyz"}
-    end
-
-    Manager->>Manager: accumulated=1 < MaxResults → continue to Skills
-    rect rgb(255,240,220)
-        Manager->>Skills: Peek(ctx, q)
-        Skills-->>Manager: []Result{}
-    end
-
-    Manager-->>searchTool: []Result (1 item)
-    searchTool-->>LLM: snippet + ref_id
-
-    LLM->>searchTool: Execute({ref_id:"session-history:msg-xyz"})
-    Note right of LLM: LLM decides to fetch full text
-    searchTool->>Manager: fetch(Query{Input:"session-history:msg-xyz"})
-    Manager->>Hist: Fetch(ctx, q)
-    Hist-->>Manager: []Result{Content:"[来源：历史对话 第2轮 turn#14 role=user]\n完整原文..."}
-    Manager-->>searchTool: result
-    searchTool-->>LLM: full original message text
+    LLM->>SHS: Peek("接口设计", maxResults=5)
+    SHS->>Bleve: SearchInContext(gse query)
+    Bleve-->>SHS: bleveHits (hot seqs, scored)
+    SHS->>SHS: touchLRU for each hit seq
+    SHS->>SQL: HistorySource.Peek(same query)
+    SQL-->>SHS: sqlHits (all seqs, SQL LIKE)
+    SHS->>SHS: Merge: bleveHits first\nthen unique sqlHits appended\nde-dup by RefID, cap to N
+    SHS-->>LLM: []Result
 ```
 
-### Wiring in `cmd/llm-api/main.go`
+Bleve results appear first (higher quality gse scoring). SQLite supplements
+cover seqs not currently in Bleve — **no historical memory is ever lost**.
 
-Each session creates its state once and caches it on `chatSession`:
+### Fetch: page-in on demand
+
+On a `Fetch(refID)` call:
+1. Find owning `seq` from L0 (`compactionDocs`) — or `FindSeqByDocID` on L0 miss
+2. If seq not in Bleve (`loadedSeqs`): `pageIn(seq)` → `LoadRecordsBySeq` → `Bleve.Index` → `touchLRU`
+3. Return full content from Bleve (`fetchFromBleve`)
+
+### Wiring (with SQLite store)
 
 ```go
-// On first request for a session:
-historySrc, _ := knowledge.NewSessionHistorySource(sessID, knowledge.DefaultMaxCompactions)
-
-sessKM := knowledge.NewManager(knowledge.ManagerConfig{
-    SourceTimeout:       10 * time.Second,
-    MaxResults:          10,
-    SnippetMaxChars:     cfg.snippetMax,
-    ContentMaxChars:     cfg.contentMax,
-    AllowPartialFailure: false,
-})
-sessKM.Register(blevesource.New(skillsIdx, "skills", 1, nil)) // priority 1
-sessKM.Register(historySrc)                                    // priority 0
-
-// resetFn holds s.mu so DeleteSession+CreateSession+Reset are atomic
-// with respect to concurrent /chat requests for the same session.
-resetFn := func(ctx context.Context) error {
-    s.mu.Lock()
-    defer s.mu.Unlock()
-    if err := st.DeleteSession(ctx, sessID); err != nil {
-        return err
-    }
-    if err := st.CreateSession(ctx, &store.Session{ID: sessID}); err != nil {
-        return err
-    }
-    return historySrc.Reset()
+// -store sqlite:./data.db → sessionStore implements knowledge.PersistStore
+var ps knowledge.PersistStore
+if p, ok := sessionStore.(knowledge.PersistStore); ok {
+    ps = p  // sqlite.Store satisfies PersistStore
 }
 
-sess = &chatSession{
-    historySrc: historySrc,
-    km:         sessKM,
-    hook:       historySrc.Hook(),                    // cached — not re-created per request
-    resetTool:  session.NewResetTool(resetFn),        // cached — not re-created per request
-}
+historySrc, _ := knowledge.NewSessionHistorySource(
+    sessionID,
+    knowledge.DefaultMaxCompactions,
+    knowledge.DefaultMaxIndexedSeqs,
+    ps,
+)
+compactionHook = historySrc.Hook()   // cache once
 
-// In RunLoop:
-kmTools := sess.km.Tools()
-allTools := make([]tool.Tool, 0, len(kmTools)+1)
-allTools = append(allTools, kmTools...)
-allTools = append(allTools, sess.resetTool) // explicit make avoids km.Tools() array aliasing
+km.Register(historySrc)  // priority 0 — queried before skills
 
 session.RunLoop(ctx, store, session.RunInput{
-    Tools:     allTools,
-    OnCompact: sess.hook,
+    Tools:     append(km.Tools(), resetTool),
+    OnCompact: compactionHook,
 })
 ```
-
-### Peek snippet format
-
-- **Fragment size**: 150 characters around each matched term
-- **Max fragments per document**: 3 (joined with ` … `)
-- **Max results**: 5 documents
-- **HTML tag stripping**: `<[^>]+>` regex (handles any highlighter style)
-- **Fallback**: if no highlight fragments, truncates stored text to 150 chars
-
-Snippet prefix:
-```
-[来源：历史对话 第{CompactionSeq}轮 turn#{TurnIndex} role={role}]
-```
-
-This tells the LLM the content is prior conversation (may be outdated), not
-authoritative knowledge-base content.
 
 ### System prompt guidance
 
@@ -531,7 +490,10 @@ blevesource.New(idx, "docs", 0, &blevesource.Config{
 ```
 
 ### SessionHistorySource tuning
-- `maxCompactions` controls memory cap per session (default 8 ≈ 50 MB).
+- See the **memory** skill for the complete L0/L1/L2 parameter reference.
+- `maxCompactions` (L1 cap, default 8) controls Bleve memory ≈ 50 MB per session.
+- `maxIndexedSeqs` (L0 cap, default 80) controls compactionDocs RAM (trivial: ~36 B/entry).
+- `maxIndexedSeqs` must be ≥ `maxCompactions` — constructor enforces this silently.
 - The gse tokenizer loads its dictionary on first use via `seg.LoadDict()`.
 - `CompactionHook` is called synchronously inside `Compact()` — keep it fast.
 - `sess.hook` must be cached on `chatSession` (not re-created per request).
@@ -550,12 +512,16 @@ blevesource.New(idx, "docs", 0, &blevesource.Config{
 |------|---------|
 | `knowledge/knowledge.go` | `QueryType`, `Query`, `Result`, `CompactionHook` — edit when adding query types or result fields |
 | `knowledge/source.go` | `Source` interface — the only contract all backends must satisfy |
+| `knowledge/persist.go` | `PersistStore` interface + `Record` type — L2 persistence contract |
 | `knowledge/manager.go` | Routing, priority groups, concurrency, truncation — core dispatch engine |
 | `knowledge/search_tool.go` | `knowledge_search` tool exposed to LLM — input schema + Peek invocation |
 | `knowledge/fetch_tool.go` | `knowledge_fetch` tool exposed to LLM — input schema + Fetch invocation |
-| `knowledge/session_history.go` | `SessionHistorySource` — per-session compaction history recall with gse |
+| `knowledge/session_history.go` | `SessionHistorySource` — L0/L1 cache, P3 Peek, page-in Fetch, LRU eviction |
 | `knowledge/gsetokenizer/gsetokenizer.go` | gse Bleve tokenizer adapter — registered via `init()` |
-| `knowledge/knowledge_test.go` | 14 unit tests covering routing, priority, truncation, timeout, partial failure |
+| `knowledge/knowledge_test.go` | Manager routing, priority, truncation, timeout, partial failure tests |
+| `knowledge/session_history_test.go` | 19 layered tests: pure-memory → PersistStore stub → invariants |
 | `knowledge/source/bleve/bleve.go` | Reference Source implementation — use as template for new sources |
+| `store/sqlite/sqlite.go` | `Store` (PersistStore impl) + `HistorySource` (Source + PersistStore impl) |
+| `store/sqlite/migrations/001_init.sql` | `history_docs` table schema |
 | `session/reset_tool.go` | `session_reset` built-in tool — atomic store delete + index reset via callback |
 | `session/knowledge-recall.txt` | Chinese system prompt guidance for `knowledge_search` recall |
