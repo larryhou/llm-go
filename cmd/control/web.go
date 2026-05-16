@@ -59,6 +59,7 @@ func runWebServer(app *appState) error {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", srv.handleUI)
 	mux.HandleFunc("/chat", srv.handleChat)
+	mux.HandleFunc("/cancel", srv.handleCancel)
 	mux.HandleFunc("/context", srv.handleContext)
 
 	fmt.Printf("Web UI: %s\n\n", url)
@@ -183,11 +184,29 @@ func (s *webServer) handleChat(w http.ResponseWriter, r *http.Request) {
 	s.mu.Unlock()
 
 	runErrStr := ""
-	if h.Err != nil {
+	if h.Err != nil && h.Err != context.Canceled {
 		runErrStr = h.Err.Error()
 		sendEvent(map[string]any{"type": "error", "error": runErrStr})
+	} else if h.Err == context.Canceled {
+		sendEvent(map[string]any{"type": "cancelled"})
 	}
+	_ = runErrStr
 	sendEvent(map[string]any{"type": "done"})
+}
+
+// ── /cancel — cancel the in-flight turn ──────────────────────────────────────
+
+func (s *webServer) handleCancel(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	s.mu.Lock()
+	h := s.activeHandle
+	s.mu.Unlock()
+	if h == nil {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	h.Cancel()
+	w.WriteHeader(http.StatusNoContent)
 }
 
 // ── /context — inspect current session context window ────────────────────────

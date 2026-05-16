@@ -382,7 +382,10 @@ func main() {
 	// ── session store ─────────────────────────────────────────────────────────
 
 	sessionStore := memory.New()
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	// ctx is cancelled on SIGTERM only. SIGINT (Ctrl-C) is handled per-turn
+	// by intSig below so that the user can cancel a running turn without
+	// exiting the whole process.
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM)
 	defer stop()
 	tool.StartCleanup(ctx)
 	if err := sessionStore.CreateSession(ctx, &store.Session{
@@ -477,6 +480,14 @@ func main() {
 
 	// ── REPL loop ─────────────────────────────────────────────────────────────
 
+	// intSig receives SIGINT (Ctrl-C). Buffered so the signal is not dropped
+	// if we are between turns (not blocking on the channel yet).
+	intSig := make(chan os.Signal, 1)
+	signal.Notify(intSig, syscall.SIGINT)
+	defer signal.Stop(intSig)
+
+	var activeHandle *session.RunHandle
+
 	scanner := bufio.NewScanner(os.Stdin)
 	for {
 		fmt.Print("> ")
@@ -493,8 +504,8 @@ func main() {
 			break
 		}
 
-		// Start printer goroutine before RunLoop so we consume evCh
-		// while RunLoop (and its provider goroutines) are running.
+		// Start printer goroutine before RunLoopAsync so we consume evCh
+		// while the turn (and its provider goroutines) are running.
 		done := make(chan struct{})
 		go func() {
 			defer close(done)
@@ -515,7 +526,7 @@ func main() {
 			}
 		}()
 
-		_, runErr := session.RunLoop(ctx, sessionStore, session.RunInput{
+		h := session.RunLoopAsync(ctx, sessionStore, session.RunInput{
 			SessionID:   sessionID,
 			UserMsg:     line,
 			Model:       model,
@@ -526,6 +537,22 @@ func main() {
 			Config:      sessionCfg,
 			OnCompact:   compactionHook,
 		})
+		activeHandle = h
+
+		// Wait for the turn to finish or for the user to press Ctrl-C.
+	wait:
+		for {
+			select {
+			case <-h.Done:
+				break wait
+			case <-intSig:
+				fmt.Fprintln(os.Stderr, "\n[cancelled]")
+				h.Cancel()
+				<-h.Done
+				break wait
+			}
+		}
+		activeHandle = nil
 
 		// Signal printer to drain and exit.
 		close(evCh)
@@ -533,8 +560,15 @@ func main() {
 		// Reset channel for next turn (closure captures evCh variable, not value).
 		evCh = make(chan llm.Event, 128)
 
-		if runErr != nil {
-			fmt.Fprintf(os.Stderr, "[error] %v\n", runErr)
+		if h.Err != nil && h.Err != context.Canceled {
+			fmt.Fprintf(os.Stderr, "[error] %v\n", h.Err)
 		}
+	}
+
+	// If the user exits while a turn is still running (shouldn't normally
+	// happen since the scanner blocks, but guard anyway).
+	if activeHandle != nil {
+		activeHandle.Cancel()
+		<-activeHandle.Done
 	}
 }

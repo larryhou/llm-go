@@ -48,6 +48,7 @@ const uiHTML = `<!DOCTYPE html>
   .tool-history-item { font-size: 11px; color: var(--subtext); background: var(--overlay); padding: 2px 8px; border-radius: 4px; }
   .tool-toggle { font-size: 10px; color: var(--subtext); cursor: pointer; padding: 1px 6px; border-radius: 3px; align-self: flex-start; }
   .tool-toggle:hover { color: var(--text); }
+  .cancelled-tag { font-size: 12px; color: var(--subtext); font-style: italic; margin-top: 2px; }
   .error-tag { font-size: 12px; color: var(--red); }
   .cursor { display: inline-block; width: 8px; height: 14px; background: var(--teal); vertical-align: text-bottom; animation: blink .8s step-end infinite; }
   @keyframes blink { 50% { opacity: 0; } }
@@ -141,6 +142,27 @@ const ctxRefresh= document.getElementById('ctx-refresh');
 const ctxMeta   = document.getElementById('ctx-meta');
 const ctxBody   = document.getElementById('ctx-body');
 const recBtn    = document.getElementById('rec-btn');
+
+// ── turn state ────────────────────────────────────────────────────────────────
+
+let turnActive = false;
+
+function setTurnActive(active) {
+  turnActive = active;
+}
+
+async function cancelTurn() {
+  if (!turnActive) return;
+  try { await fetch('/cancel', { method: 'POST' }); } catch (_) {}
+}
+
+// ESC cancels the active turn (anywhere on the page).
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape' && turnActive) {
+    e.preventDefault();
+    cancelTurn();
+  }
+});
 
 // ── recording ────────────────────────────────────────────────────────────────
 
@@ -350,6 +372,14 @@ function appendError(wrap, msg) {
   scrollBottom();
 }
 
+function appendCancelled(wrap) {
+  const tag = document.createElement('div');
+  tag.className = 'cancelled-tag';
+  tag.textContent = '⊘ cancelled';
+  wrap.appendChild(tag);
+  scrollBottom();
+}
+
 function escHtml(s) {
   return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
 }
@@ -360,6 +390,7 @@ async function send() {
   input.value = '';
   input.style.height = '44px';
   sendBtn.disabled = true;
+  setTurnActive(true);
 
   recEvent('user_message', { text });
   addUserMsg(text);
@@ -369,6 +400,7 @@ async function send() {
   const turnTools = makeTurnTools(wrap);
 
   let assistantText = '';
+  let wasCancelled  = false;
   const turnStart = Date.now();
 
   try {
@@ -409,8 +441,13 @@ async function send() {
           tokTotal.textContent = ev.total.toLocaleString();
           recEvent('usage', { input: ev.input, output: ev.output, total: ev.total });
         } else if (ev.type === 'error') {
-          appendError(wrap, ev.error);
-          recEvent('error', { error: ev.error });
+          // context.Canceled from a user-triggered cancel is not an error.
+          if (ev.error && ev.error.includes('context canceled')) {
+            wasCancelled = true;
+          } else {
+            appendError(wrap, ev.error);
+            recEvent('error', { error: ev.error });
+          }
         } else if (ev.type === 'done') {
           recEvent('assistant_message', {
             text: assistantText,
@@ -419,16 +456,25 @@ async function send() {
           });
           // Auto-refresh context panel if open
           if (ctxPanel.classList.contains('open')) loadContext();
+        } else if (ev.type === 'cancelled') {
+          wasCancelled = true;
         }
       }
     }
   } catch (e) {
-    appendError(wrap, e.message);
-    recEvent('error', { error: e.message });
+    // AbortError or network close after cancel — treat as cancelled.
+    if (e.name === 'AbortError') {
+      wasCancelled = true;
+    } else {
+      appendError(wrap, e.message);
+      recEvent('error', { error: e.message });
+    }
   }
 
   cursor.remove();
+  if (wasCancelled) appendCancelled(wrap);
   scrollBottom();
+  setTurnActive(false);
   sendBtn.disabled = false;
   input.focus();
 }
