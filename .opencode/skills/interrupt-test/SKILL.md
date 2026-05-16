@@ -36,9 +36,6 @@ around what the store contains after a cancelled or interrupted turn.
 
 ```bash
 # Working directory must be the repo root
-cd /Users/larryhou/Documents/opencode/llm-go
-
-# Verify build is clean before starting
 go build ./session/... && echo "BUILD OK"
 ```
 
@@ -328,13 +325,18 @@ from HTTP client disconnects.
 
 ```bash
 # Start server if not running
+# LLM connection — resolved in this order:
+#   1. Environment variables (preferred):
+#        TIMI_PROVIDER  — "openai" or "anthropic"  (default: anthropic)
+#        TIMI_BASE_URL  — provider base URL
+#        TIMI_API_KEY   — API key
+#        TIMI_MODEL     — model ID                  (default: claude-sonnet-4.6)
+#   2. Hardcoded defaults in cmd/knowledge-api/main.go (flag.StringVar lines)
+#   3. If still unresolved (e.g. main.go defaults unavailable), ask the user.
+
 lsof -ti:7700 | xargs kill -9 2>/dev/null; sleep 1
-cd /Users/larryhou/Documents/opencode/llm-go
 nohup go run ./cmd/knowledge-api/ \
   -skills .opencode -addr 127.0.0.1:7700 \
-  -provider openai \
-  -llm-url http://192.168.3.119:8080/timi-claude/v1 \
-  -llm-key sk-zzz6FtyLMyuobNNOukwgobP0l1F3TjMO \
   > /tmp/kapi.log 2>&1 &
 sleep 6 && curl -s http://127.0.0.1:7700/health
 ```
@@ -379,7 +381,7 @@ for m in d['messages']:
 go test ./session/... -count=1 -timeout 60s 2>&1 | tail -3
 ```
 
-Must end with `ok  github.com/larryhou/llm-go/session`.
+Must end with `ok  <module-path>/session`.
 
 ---
 

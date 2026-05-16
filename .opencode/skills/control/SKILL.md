@@ -104,9 +104,11 @@ knowledge tools are simply not registered — the REPL still works without them.
 | Flag | Env | Default | Description |
 |------|-----|---------|-------------|
 | `-provider` | `TIMI_PROVIDER` | `openai` | LLM provider: `openai` or `anthropic` |
-| `-llm-url` | `TIMI_BASE_URL` | `http://192.168.3.119:8080/timi-claude/v1` | Base URL (openai needs `/v1`; anthropic must NOT end with `/v1`) |
-| `-llm-key` | `TIMI_API_KEY` | `sk-zzz6...` | API key |
+| `-llm-url` | `TIMI_BASE_URL` | see `cmd/control/main.go` | Base URL (openai needs `/v1`; anthropic must NOT end with `/v1`) |
+| `-llm-key` | `TIMI_API_KEY` | see `cmd/control/main.go` | API key |
 | `-model` | `TIMI_MODEL` | `claude-sonnet-4.6` | Model ID |
+
+Resolution order: CLI flag → env var → hardcoded default in `main.go` → ask the user.
 | `-max-steps` | — | `20` | Max agentic steps per turn |
 | `-context-limit` | — | `128000` | Context window token limit |
 | `-skills` | — | `.opencode` | Skills root directory to index |
@@ -256,11 +258,11 @@ Always work within <cwd> unless explicitly instructed otherwise.
 # with defaults (openai, local endpoint)
 go run ./cmd/control
 
-# explicit flags
+# explicit flags — values read from TIMI_* env vars if not specified
 go run ./cmd/control \
     -provider anthropic \
-    -llm-url  http://192.168.3.119:8080/claude \
-    -llm-key  sk-... \
+    -llm-url  $TIMI_BASE_URL \
+    -llm-key  $TIMI_API_KEY \
     -model    claude-sonnet-4.6 \
     -skills   .opencode
 

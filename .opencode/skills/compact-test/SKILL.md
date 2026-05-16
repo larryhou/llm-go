@@ -36,20 +36,23 @@ at Step 6 of `session/compaction.go:Compact()`.
 
 ```
 Base URL  : http://127.0.0.1:7700
-Provider  : openai (timi proxy)
-LLM URL   : http://192.168.3.119:8080/timi-claude/v1
-API key   : sk-zzz6FtyLMyuobNNOukwgobP0l1F3TjMO
+Provider  : openai-compatible
 ```
 
 Start if not running:
 ```bash
+# LLM connection — resolved in this order:
+#   1. Environment variables (preferred):
+#        TIMI_PROVIDER  — "openai" or "anthropic"  (default: anthropic)
+#        TIMI_BASE_URL  — provider base URL
+#        TIMI_API_KEY   — API key
+#        TIMI_MODEL     — model ID                  (default: claude-sonnet-4.6)
+#   2. Hardcoded defaults in cmd/knowledge-api/main.go (flag.StringVar lines)
+#   3. If still unresolved (e.g. main.go defaults unavailable), ask the user.
+
 lsof -ti:7700 | xargs kill -9 2>/dev/null; sleep 1
-cd /Users/larryhou/Documents/opencode/llm-go
 nohup go run ./cmd/knowledge-api/ \
   -skills .opencode -addr 127.0.0.1:7700 \
-  -provider openai \
-  -llm-url http://192.168.3.119:8080/timi-claude/v1 \
-  -llm-key sk-zzz6FtyLMyuobNNOukwgobP0l1F3TjMO \
   > /tmp/kapi.log 2>&1 &
 sleep 6 && curl -s http://127.0.0.1:7700/health
 ```
