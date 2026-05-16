@@ -176,6 +176,13 @@ type turnGroup struct {
 
 // groupTurns groups steps by last-user-message: a new turn begins whenever the
 // last user message in a step's request changes from the previous step.
+//
+// Two special cases both merge into the current turn rather than starting a new one:
+//  1. No user message at all in the request.
+//  2. The last user message is a compaction summary prompt (starts with
+//     session.SummaryTemplate prefix) — this step is the summary-generation
+//     LLM call issued internally by Compact() and must be fed to the same
+//     ReplayProvider as the turn that triggered compaction.
 func groupTurns(steps []llm.Record) []turnGroup {
 	var turns []turnGroup
 	var cur *turnGroup
@@ -183,8 +190,8 @@ func groupTurns(steps []llm.Record) []turnGroup {
 
 	for _, s := range steps {
 		key := lastUserMsg(s.Request.Messages)
-		if key == "" {
-			// No user message (e.g. compaction summary call) — belongs to current turn.
+		if key == "" || isSummaryStep(key) {
+			// No user message or compaction summary call — belongs to current turn.
 			if cur != nil {
 				cur.steps = append(cur.steps, s)
 			}
@@ -198,6 +205,13 @@ func groupTurns(steps []llm.Record) []turnGroup {
 		cur.steps = append(cur.steps, s)
 	}
 	return turns
+}
+
+// isSummaryStep reports whether the last-user-message key is a compaction
+// summary prompt generated internally by session.Compact(). These steps must
+// stay in the same turn as the one that triggered compaction.
+func isSummaryStep(key string) bool {
+	return strings.HasPrefix(key, session.SummaryTemplate[:60])
 }
 
 // lastUserMsg returns the text of the last user message in msgs.
