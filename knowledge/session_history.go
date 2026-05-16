@@ -357,6 +357,8 @@ func (s *SessionHistorySource) Hook() CompactionHook {
 		s.evictL0IfNeeded()
 
 		// Mark as loaded in L1.
+		// NOTE: loadedSeqs is updated AFTER evictL0IfNeeded so that the new seq
+		// is not considered a candidate for L1 eviction in the same hook call.
 		s.loadedSeqs[seq] = struct{}{}
 		s.evictL1IfNeeded()
 	}
@@ -387,8 +389,9 @@ func (s *SessionHistorySource) evictL0IfNeeded() {
 			break
 		}
 		// If also in L1, evict from Bleve first to maintain L1 ⊆ L0.
+		ids := s.compactionDocs[oldest]
 		if _, inL1 := s.loadedSeqs[oldest]; inL1 {
-			for _, id := range s.compactionDocs[oldest] {
+			for _, id := range ids {
 				_ = s.index.Delete(id)
 			}
 			delete(s.loadedSeqs, oldest)
@@ -462,6 +465,9 @@ func (s *SessionHistorySource) pageIn(ctx context.Context, seq int) error {
 		_ = s.index.Index(rec.ID, rec)
 	}
 	s.loadedSeqs[seq] = struct{}{}
+	// Touch LRU so the freshly page-in'd seq is treated as most recently used
+	// and is not immediately evicted by evictL1IfNeeded.
+	s.touchLRU(seq)
 	s.evictL1IfNeeded()
 	return nil
 }
