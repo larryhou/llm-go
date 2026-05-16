@@ -140,6 +140,16 @@ Usable          = 128000 - 8192   = 119,808  ← compact triggers here
 
 `Select(msgs, allParts, model, cfg)` — note `allParts` is now required. It uses `hasPartType(allParts[m.ID], PartTypeCompaction)` to identify compaction boundary user messages, consistent with `FilterCompacted`. The old positional heuristic (`msgs[i+1].Summary`) has been removed.
 
+`SelectResult` now carries a `RecentHead` field — the messages belonging to the last 2 real user turns within `Head` (immediately before the tail). These are the turns most likely to be mis-summarised. `RecentHead` is `nil` when `Head` has ≤ 2 real turns (guard: `tailStartTurnIdx > 2`).
+
+```go
+type SelectResult struct {
+    Head        []*store.Message
+    TailStartID string
+    RecentHead  []*store.Message // last 2 turns of Head closest to tail; nil if head is too short
+}
+```
+
 ```mermaid
 flowchart LR
     Msgs["All messages\n(post-FilterCompacted)"] --> Turns["Identify user turns\nskip boundary msgs\n(PartTypeCompaction check)"]
@@ -153,6 +163,79 @@ flowchart LR
     PushForward --> TailStart
     TailStart --> Head["head = msgs[:tailStartIdx]\n→ summarised by LLM"]
     TailStart --> Tail["tail → preserved verbatim"]
+    Head --> RecentHead{"tailStartTurnIdx > 2?"}
+    RecentHead -- Yes --> RH["RecentHead = msgs[turns[tailStartTurnIdx-2].StartIdx : tailMsgIdx]\n(last 2 turns of head)"]
+    RecentHead -- No --> RHNil["RecentHead = nil"]
+```
+
+#### Recent-context anchor (`PartTypeRecentContext`, `store/store.go`)
+
+After compaction, the LLM only sees `[summary + recent tail turns]`. The turns immediately before the tail are the ones most likely to be mis-summarised by the summary LLM, yet they are the most relevant to the current topic.
+
+**Step 6** of `Compact()` (non-fatal, does not roll back compaction) writes a `PartTypeRecentContext` part onto the boundary message containing a verbatim excerpt of `sel.RecentHead`:
+
+```go
+// store/store.go
+PartTypeRecentContext = "recent-context"
+
+type RecentContextPartData struct {
+    Excerpt string // verbatim rendered excerpt of the last 2 turns of head
+}
+```
+
+Excerpt format (rendered by `buildRecentContextExcerpt`):
+```
+---
+以下是压缩前最近的对话原文：
+
+**[用户]**
+<user text, max 300 runes>...
+
+**[助手]**
+- 调用工具: <tool_name> → <output, max 120 runes>...
+<assistant text, max 300 runes>...
+```
+
+- Text is truncated at rune boundaries (not byte boundaries) using `utf8.RuneCountInString`.
+- Role labels are only written when the message has actual text or tool content (`hasContent` guard).
+- If `RecentHead` is nil or produces no content, Step 6 is skipped entirely.
+
+After writing the part, `Compact()` calls `store.GetMessage` + `store.UpdateMessage` to set `boundary.Tokens.Input = len(excerpt)/4` — preventing `estimateTurnTokens` from under-counting the boundary message on the next compaction round (fallback would be 100 tokens).
+
+#### `buildUserParts` and `StripMedia` (`session/context.go`)
+
+`buildUserParts` now accepts a `ToModelOptions` parameter:
+
+```go
+func buildUserParts(ps []*store.Part, opts ToModelOptions) []llm.ContentPart
+```
+
+When `opts.StripMedia = true` (used in the summary generation path), `PartTypeRecentContext` parts are skipped. This prevents the previous round's verbatim excerpt from being fed into the summary LLM on subsequent compactions, where it would add token cost and semantic noise.
+
+| Call site | opts passed |
+|-----------|-------------|
+| `ToModelMessages` (normal RunLoop path) | `ToModelOptions{}` — excerpt rendered |
+| `ToModelMessagesWithOptions` (summary generation) | caller's opts — `StripMedia:true` strips excerpt |
+
+**Post-compaction context seen by LLM (with fix):**
+```
+[boundary user msg]
+  "What did we do so far?"
+  ---
+  以下是压缩前最近的对话原文：
+  **[用户]** <verbatim user turn N-1>
+  **[助手]** - 调用工具: X → ...  <verbatim assistant turn N-1>
+[summary assistant msg: high-level summary]
+[tail: last 2 turns verbatim]
+```
+
+**Summary LLM input (StripMedia strips the excerpt):**
+```
+[boundary msg] "What did we do so far?"   ← excerpt stripped
+[previous summary] ...
+[head turn A] ...
+[head turn B] ...
+[SummaryTemplate prompt]
 ```
 
 ### MaxSteps — graceful termination
