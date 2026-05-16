@@ -343,6 +343,12 @@ func (s *processorState) executeTool(ctx context.Context, callID, toolName, part
 	}
 
 	result, err := t.Execute(ctx, input)
+	// Guard: if cleanup already marked this part as interrupted (Status=error, Interrupted=true),
+	// do not overwrite — cleanup's mark takes precedence because the tool goroutine
+	// outlived the cleanup window and is no longer considered part of the session.
+	if isAlreadyInterrupted(s.store, partID) {
+		return
+	}
 	if err != nil {
 		if tf, ok := tool.IsToolFailure(err); ok {
 			_ = s.updateToolStatus(ctx, partID, store.ToolStatusError, nil, tf.Message)
@@ -353,6 +359,21 @@ func (s *processorState) executeTool(ctx context.Context, callID, toolName, part
 	}
 
 	_ = s.updateToolCompleted(ctx, partID, toolName, callID, input, result)
+}
+
+// isAlreadyInterrupted returns true if the part has already been marked as
+// interrupted by cleanup (Status=error AND Interrupted=true). Used to prevent
+// executeTool from overwriting cleanup's authoritative interrupted state.
+func isAlreadyInterrupted(s store.Store, partID string) bool {
+	p, err := s.GetPart(context.Background(), partID)
+	if err != nil {
+		return false
+	}
+	d, ok := store.DataAs[*store.ToolPartData](p)
+	if !ok {
+		return false
+	}
+	return d.Status == store.ToolStatusError && d.Interrupted
 }
 
 // checkDoomLoop returns true if the same tool with same args has been called

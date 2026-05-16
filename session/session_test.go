@@ -2,6 +2,7 @@ package session_test
 
 import (
 	"context"
+	"sync"
 	"testing"
 	"time"
 
@@ -361,6 +362,7 @@ func TestFilterCompacted_withCompaction(t *testing.T) {
 // ---- doom-loop detection ----
 
 type countingTool struct {
+	mu    sync.Mutex
 	calls int
 }
 
@@ -370,7 +372,9 @@ func (c *countingTool) InputSchema() map[string]any {
 	return map[string]any{"type": "object", "properties": map[string]any{}}
 }
 func (c *countingTool) Execute(_ context.Context, _ map[string]any) (tool.Result, error) {
+	c.mu.Lock()
 	c.calls++
+	c.mu.Unlock()
 	return tool.Result{Output: "ok"}, nil
 }
 

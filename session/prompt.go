@@ -262,6 +262,14 @@ func runLoopInternal(ctx context.Context, s store.Store, input RunInput) (RunRes
 			}
 			return RunResultStop, err
 		}
+		// Even when Process() returns a nil error, the session may have been
+		// cancelled during the LLM turn (e.g. h.Cancel() called while cleanup()
+		// was running its 250ms tool-goroutine wait). Check ctx.Err() and treat
+		// cancellation as an interrupt so we don't start a new iteration.
+		if ctx.Err() != nil {
+			markAssistantCancelled(s, assistantMsgID)
+			return RunResultStop, ctx.Err()
+		}
 
 		// Refresh the cached parts for this assistant message now that the
 		// LLM call has written its parts to the store.
