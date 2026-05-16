@@ -254,37 +254,103 @@ LLM 连接通过环境变量 `TIMI_PROVIDER` / `TIMI_BASE_URL` / `TIMI_API_KEY` 
 ### 测试序列
 
 使用同一 session（格式 `hmix-<timestamp>`）贯穿全部轮次。
-三种中断类型各出现**两次**，顺序随机打乱，中间穿插正常轮次植入和验证锚点。
 
-| 轮次 | 类型 | 目的 | 关键数值 |
-|------|------|------|----------|
-| T1 | **normal** | `calc(7*8)` | 植入锚点 **56** |
-| T2 | **cancelled** | LLM 响应前中断（0.3s 内发下一轮） | — |
-| T2-int | **normal** | 验证 cancelled 后 history 连贯 | 回复应含 **56** |
-| T3 | **normal** | `counter set anchor=9973` | 植入锚点 **9973** |
-| T4 | **interrupted+tool** | `calc(99*99)` 后让 LLM 写长文；在 tool_result 出现、LLM step-2 开始输出后发下一轮 | — |
-| T4-int | **normal** | 验证 tool 结果保留 | 回复应含 **9801** |
-| T5 | **normal** | `calc(12*34)` | 植入锚点 **408** |
-| T6 | **interrupted-text** | 让 LLM 写长文；第一个 text delta 出现后发下一轮 | — |
-| T6-int | **normal** | 验证 history 连贯 | 回复应含 **9973** |
-| T7 | **cancelled** | 再次在 LLM 响应前中断 | — |
-| T7-int | **normal** | 验证多锚点均可知 | 回复应含 **56** 和 **408** |
-| T8 | **interrupted+tool** | `calc(56+408)` 后让 LLM 写长文；tool_result 后 step-2 开始时发下一轮 | — |
-| T8-int | **normal** | 验证 tool 结果保留 | 回复应含 **464** |
-| T9 | **interrupted-text** | 再次在 text streaming 时中断 | — |
-| T9-int | **normal** | 验证三个锚点均可知 | 回复应含 **56**、**9973**、**408** |
-| T10 | **normal（CRITICAL）** | 要求 LLM 列出本会话所有 calc 结果和 counter 值 | 必须含 **56 / 9801 / 408 / 464 / 9973** |
+#### 固定锚点（每次运行相同）
+
+| 锚点 | 来源 | 数值 |
+|------|------|------|
+| A1 | `calc(7*8)` | **56** |
+| A2 | `counter set anchor=9973` | **9973** |
+| A3 | `calc(99*99)`（interrupted+tool 第一次的工具结果） | **9801** |
+| A4 | `calc(12*34)` | **408** |
+| A5 | `calc(56+408)`（interrupted+tool 第二次的工具结果） | **464** |
+
+#### 序列构造规则（agent 每次运行时执行）
+
+**第一步：随机打乱 6 个中断槽**
+
+将以下 6 个中断类型标记随机排列（每种出现 2 次）：
+
+```
+[cancelled, cancelled, interrupted-text, interrupted-text, interrupted+tool, interrupted+tool]
+```
+
+用 python 或任意方式打乱，得到一个随机序列，例如：
+`[interrupted-text, cancelled, interrupted+tool, interrupted-text, interrupted+tool, cancelled]`
+
+记录为 `INTERRUPT_ORDER`，在报告中输出。
+
+**第二步：按以下模板展开成完整轮次序列**
+
+```
+T0   : normal  — calc(7*8)，植入 A1=56
+T1   : normal  — counter set anchor=9973，植入 A2=9973
+--- 中断槽 1：INTERRUPT_ORDER[0] ---
+T2   : <中断类型>  （见下方中断槽说明）
+T2-v : normal  — 验证 history 连贯（询问已知锚点，必须回复正确）
+--- 中断槽 2：INTERRUPT_ORDER[1] ---
+T3   : <中断类型>
+T3-v : normal  — 验证 history 连贯
+--- 中断槽 3：INTERRUPT_ORDER[2] ---
+T4   : <中断类型>
+T4-v : normal  — 验证 history 连贯
+--- 中断槽 4：INTERRUPT_ORDER[3] ---
+T5   : <中断类型>
+T5-v : normal  — 验证 history 连贯
+--- 中断槽 5：INTERRUPT_ORDER[4] ---
+T6   : <中断类型>
+T6-v : normal  — 验证 history 连贯
+--- 中断槽 6：INTERRUPT_ORDER[5] ---
+T7   : <中断类型>
+T7-v : normal  — 验证 history 连贯
+T8   : normal（CRITICAL）— 要求 LLM 列出本会话所有 calc 结果和 counter 值
+```
+
+**第三步：为每个中断槽分配具体内容**
+
+| 中断类型 | 第一次出现（第 N 个 interrupted+tool/text/cancelled） | 第二次出现 |
+|----------|------------------------------------------------------|------------|
+| **cancelled** | 让 LLM 写长文（无工具），0.3s 内发下一轮 | 同上 |
+| **interrupted-text** | 让 LLM 写长文（无工具），第一个 text delta 后发下一轮 | 同上 |
+| **interrupted+tool** | 第一次：`calc(99*99)` + 写长文，tool_result + step-2 text 后发下一轮，**植入 A3=9801** | 第二次：`calc(56+408)` + 写长文，同样时机触发，**植入 A5=464** |
+
+**验证轮（T*-v）规则：**
+- 询问当前 session 中**已植入的所有锚点**
+- 回复必须包含所有已植入的锚点数值
+- 例：第 3 个中断槽执行完后，已植入 A1=56、A2=9973，若第二个 interrupted+tool 也已完成则还有 A3/A5，验证轮回复必须含全部已知锚点
+
+#### 示例展开（仅示意，实际顺序每次不同）
+
+```
+INTERRUPT_ORDER = [interrupted-text, cancelled, interrupted+tool,
+                   interrupted-text, interrupted+tool, cancelled]
+
+T0   normal  calc(7*8)=56
+T1   normal  counter anchor=9973
+T2   interrupted-text  + T2-v: recalled 56, 9973
+T3   cancelled         + T3-v: recalled 56, 9973
+T4   interrupted+tool (99*99=9801) + T4-v: recalled 56, 9973, 9801
+T5   interrupted-text  + T5-v: recalled 56, 9973, 9801
+T6   interrupted+tool (56+408=464) + T6-v: recalled 56, 9973, 9801, 408, 464  ← 先植入 A4
+T7   cancelled         + T7-v: recalled 56, 9973, 9801, 408, 464
+T8   CRITICAL: recalled 56, 9801, 408, 464, 9973
+```
+
+> **注意：** A4=408（`calc(12*34)`）必须在**第二个 interrupted+tool 之前**作为一个 normal 轮次植入，以便 A5=464（`calc(56+408)`）的计算有意义。agent 在排布序列时，若第二个 interrupted+tool 槽出现时 A4 尚未植入，须在该槽前插入一个 `calc(12*34)` 的 normal 轮次。
 
 ---
 
 ### 执行规则
 
-1. 按顺序执行，不得跳过或重排。
-2. 每步检查 ABORT 条件；触发则立即停止并报告 `ABORTED at T<N>: <原因>`。
-3. 每次 `/chat` 请求超时 120 秒。
-4. 中断场景：被中断的轮次**后台**发出，中断触发请求（下一轮）**同步等待完成**并即时验证 SSE 输出。
-5. 若 interrupted+tool 场景中 LLM 未调用工具（`tool_result` 未出现），agent 自行判断并记为 `SKIPPED`，继续下一步。
-6. 服务器日志 `/tmp/kapi.log` 中可用 `[INTERRUPT]` 关键字确认中断触发。
+1. **开始前用 python 生成 `INTERRUPT_ORDER`**，打印并记录到报告。
+2. 按构造出的序列顺序执行，不得跳过或重排。
+3. 每步检查 ABORT 条件；触发则立即停止并报告 `ABORTED at T<N>: <原因>`。
+4. 每次 `/chat` 请求超时 120 秒。
+5. 中断场景：被中断的轮次**后台**发出，中断触发请求**同步等待完成**并即时验证 SSE 输出。
+6. 若 interrupted+tool 场景中 LLM 未调用工具（`tool_result` 未出现），记为 `SKIPPED`，继续下一步，但报告中标记。
+7. 服务器日志 `/tmp/kapi.log` 中可用 `[INTERRUPT]` 关键字确认中断触发。
+8. macOS 上无 `timeout` 命令，用 `curl --max-time N` 代替。
+9. 用 `grep -c` 检测 SSE 文件时注意 zsh 换行问题，改用 `grep -q pattern file && echo 1 || echo 0`。
 
 ---
 
@@ -308,19 +374,19 @@ LLM 连接通过环境变量 `TIMI_PROVIDER` / `TIMI_BASE_URL` / `TIMI_API_KEY` 
 
 ---
 
-### STEP H 最终断言（T10 后执行）
+### STEP H 最终断言（T8 后执行）
 
 查询 `GET /sessions/$SESS/messages`，对 assistant 消息序列验证：
 
 | 断言 | 期望 |
 |------|------|
 | `cancelled` 出现次数 | ≥ 2 |
-| `interrupted` 且含 tool part | ≥ 1 次 |
-| `interrupted` 且含 text part | ≥ 1 次 |
-| `status=''`（正常完成）出现次数 | ≥ 6 |
+| `interrupted` 且含 text part | ≥ 2 次 |
+| `interrupted` 且含 tool part（completed） | ≥ 1 次 |
+| `status=''`（正常完成）出现次数 | ≥ 8 |
 | 最后一轮 assistant status | `''`（正常完成） |
 
-**CRITICAL：** T10 的 SSE 文本同时含 `56`、`9801`、`408`、`464`、`9973` → PASS
+**CRITICAL：** T8 的 SSE 文本同时含 `56`、`9801`、`408`、`464`、`9973` → PASS
 
 ---
 
@@ -331,22 +397,23 @@ LLM 连接通过环境变量 `TIMI_PROVIDER` / `TIMI_BASE_URL` / `TIMI_API_KEY` 
 Date    : <date>
 Session : <SESS>
 
-T1  normal  calc(7*8)=56                         : PASS / FAIL
-T2  cancelled + T2-int recalled 56               : PASS / FAIL
-T3  normal  counter anchor=9973                  : PASS / FAIL
-T4  interrupted+tool + T4-int recalled 9801      : PASS / FAIL / SKIPPED
-T5  normal  calc(12*34)=408                      : PASS / FAIL
-T6  interrupted-text + T6-int recalled 9973      : PASS / FAIL
-T7  cancelled + T7-int recalled 56+408           : PASS / FAIL
-T8  interrupted+tool + T8-int recalled 464       : PASS / FAIL / SKIPPED
-T9  interrupted-text + T9-int recalled 56/9973/408 : PASS / FAIL
-T10 CRITICAL: recalled 56/9801/408/464/9973      : PASS / FAIL
+INTERRUPT_ORDER = [<随机顺序，6个元素>]
+
+T0   normal  calc(7*8)=56                          : PASS / FAIL
+T1   normal  counter anchor=9973                   : PASS / FAIL
+T2   <type>  + T2-v: recalled <anchors>            : PASS / FAIL / SKIPPED
+T3   <type>  + T3-v: recalled <anchors>            : PASS / FAIL / SKIPPED
+T4   <type>  + T4-v: recalled <anchors>            : PASS / FAIL / SKIPPED
+T5   <type>  + T5-v: recalled <anchors>            : PASS / FAIL / SKIPPED
+T6   <type>  + T6-v: recalled <anchors>            : PASS / FAIL / SKIPPED
+T7   <type>  + T7-v: recalled <anchors>            : PASS / FAIL / SKIPPED
+T8   CRITICAL: recalled 56/9801/408/464/9973       : PASS / FAIL
 
 Structure (final store):
-  cancelled × 2              : PASS / FAIL
-  interrupted+tool × 1       : PASS / FAIL
-  interrupted+text × 1       : PASS / FAIL
-  normal ≥ 6                 : PASS / FAIL
+  cancelled ≥ 2              : PASS / FAIL
+  interrupted+text ≥ 2       : PASS / FAIL
+  interrupted+tool ≥ 1       : PASS / FAIL
+  normal ≥ 8                 : PASS / FAIL
   last turn normal            : PASS / FAIL
 
 VERDICT: PASS / FAIL / ABORTED at T<N>
@@ -392,17 +459,12 @@ STEP F — emptyTextPart classification:    PASS / FAIL
 STEP G — race detector (×10 runs):        PASS / FAIL
 
 STEP H — HTTP 对话式中断 E2E:
-  T1  normal calc(7*8)=56                      : PASS / FAIL
-  T2  cancelled + T2-int recalled 56           : PASS / FAIL
-  T3  normal counter anchor=9973               : PASS / FAIL
-  T4  interrupted+tool + T4-int recalled 9801  : PASS / FAIL / SKIPPED
-  T5  normal calc(12*34)=408                   : PASS / FAIL
-  T6  interrupted-text + T6-int recalled 9973  : PASS / FAIL
-  T7  cancelled + T7-int recalled 56+408       : PASS / FAIL
-  T8  interrupted+tool + T8-int recalled 464   : PASS / FAIL / SKIPPED
-  T9  interrupted-text + T9-int 56/9973/408    : PASS / FAIL
-  T10 CRITICAL: recalled 56/9801/408/464/9973  : PASS / FAIL
-  Structure: cancelled×2 / int+tool×1 / int+text×1 / normal≥6 / last-normal : PASS / FAIL
+  INTERRUPT_ORDER                              : <打印随机顺序>
+  T0  normal calc(7*8)=56                      : PASS / FAIL
+  T1  normal counter anchor=9973               : PASS / FAIL
+  T2–T7 各中断槽 + 验证轮                      : PASS / FAIL / SKIPPED (each)
+  T8  CRITICAL: recalled 56/9801/408/464/9973  : PASS / FAIL
+  Structure: cancelled≥2 / int+text≥2 / int+tool≥1 / normal≥8 / last-normal : PASS / FAIL
 
 STEP I — final full suite:                PASS / ABORT
 
