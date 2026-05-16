@@ -72,7 +72,7 @@ func (p *ReplayProvider) Records() []Record { return p.steps }
 func (p *ReplayProvider) Stream(_ context.Context, _ Request) (<-chan Event, error) {
 	i := int(p.idx.Add(1) - 1)
 	if i >= len(p.steps) {
-		return nil, fmt.Errorf("replay provider: no more steps (have %d, requested %d)", len(p.steps), i)
+		return nil, fmt.Errorf("replay provider: no more steps (have %d, attempted step %d)", len(p.steps), i+1)
 	}
 	step := p.steps[i]
 
