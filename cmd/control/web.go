@@ -21,11 +21,12 @@ import (
 // ── web server ────────────────────────────────────────────────────────────────
 
 type webServer struct {
-	app       *appState
-	mu        sync.Mutex // serialise concurrent /chat requests
-	sessStore store.Store
-	sessID    string
-	debugDir  string     // non-empty when -debug is set
+	app          *appState
+	mu           sync.Mutex // guards activeHandle
+	activeHandle *session.RunHandle
+	sessStore    store.Store
+	sessID       string
+	debugDir     string // non-empty when -debug is set
 }
 
 // appState holds shared state initialised once in main.
@@ -111,16 +112,23 @@ func (s *webServer) handleChat(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
 	w.Header().Set("Access-Control-Allow-Origin", "*")
-	flusher, ok := w.(http.Flusher)
-	if !ok {
+	flusher, canFlush := w.(http.Flusher)
+	if !canFlush {
 		http.Error(w, "streaming not supported", http.StatusInternalServerError)
 		return
 	}
+	w.WriteHeader(http.StatusOK)
 
+	// sseMu serialises all writes to w. http.ResponseWriter is not
+	// goroutine-safe; concurrent tool-execution goroutines can call sendEvent
+	// simultaneously, which corrupts chunked-encoding framing.
+	var sseMu sync.Mutex
 	sendEvent := func(payload any) {
 		b, _ := json.Marshal(payload)
+		sseMu.Lock()
 		fmt.Fprintf(w, "data: %s\n\n", b)
 		flusher.Flush()
+		sseMu.Unlock()
 	}
 
 	// Debug recording: collect each LLM input request for this turn.
@@ -149,10 +157,10 @@ func (s *webServer) handleChat(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Drain events → SSE in a goroutine while RunLoop blocks.
-	done := make(chan struct{})
+	// Drain events → SSE in a goroutine while RunLoopAsync runs in background.
+	evDone := make(chan struct{})
 	go func() {
-		defer close(done)
+		defer close(evDone)
 		for ev := range evCh {
 			switch ev.Type {
 			case llm.EventTextDelta:
@@ -179,8 +187,21 @@ func (s *webServer) handleChat(w http.ResponseWriter, r *http.Request) {
 		}
 	}()
 
+	// Detach from the HTTP request context so that RunLoop is not cancelled
+	// when the SSE client disconnects mid-stream.
+	ctx := context.WithoutCancel(r.Context())
+
+	// Cancel any in-flight turn for this session before starting a new one.
+	// New user message implicitly interrupts the previous turn.
 	s.mu.Lock()
-	_, runErr := session.RunLoop(r.Context(), s.sessStore, session.RunInput{
+	prev := s.activeHandle
+	s.mu.Unlock()
+	if prev != nil {
+		prev.Cancel()
+		<-prev.Done
+	}
+
+	h := session.RunLoopAsync(ctx, s.sessStore, session.RunInput{
 		SessionID:   s.sessID,
 		UserMsg:     req.Message,
 		Model:       s.app.model,
@@ -190,14 +211,26 @@ func (s *webServer) handleChat(w http.ResponseWriter, r *http.Request) {
 		MaxSteps:    20,
 		Config:      s.app.cfg,
 	})
+
+	s.mu.Lock()
+	s.activeHandle = h
+	s.mu.Unlock()
+
+	// Wait for the async turn to finish.
+	<-h.Done
+
+	s.mu.Lock()
+	if s.activeHandle == h {
+		s.activeHandle = nil
+	}
 	s.mu.Unlock()
 
 	close(evCh)
-	<-done
+	<-evDone
 
-	if runErr != nil {
-		rec.RunError = runErr.Error()
-		sendEvent(map[string]any{"type": "error", "error": runErr.Error()})
+	if h.Err != nil {
+		rec.RunError = h.Err.Error()
+		sendEvent(map[string]any{"type": "error", "error": h.Err.Error()})
 	}
 	sendEvent(map[string]any{"type": "done"})
 
