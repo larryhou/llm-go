@@ -404,9 +404,9 @@ async function send() {
           textNode = document.createTextNode('');
           bubble.insertBefore(textNode, cursor);
         } else if (ev.type === 'usage') {
-          if (ev.input  > 0) tokIn.textContent    = ev.input.toLocaleString();
-          if (ev.output > 0) tokOut.textContent   = ev.output.toLocaleString();
-          if (ev.total  > 0) tokTotal.textContent = ev.total.toLocaleString();
+          tokIn.textContent    = ev.input.toLocaleString();
+          tokOut.textContent   = ev.output.toLocaleString();
+          tokTotal.textContent = ev.total.toLocaleString();
           recEvent('usage', { input: ev.input, output: ev.output, total: ev.total });
         } else if (ev.type === 'error') {
           appendError(wrap, ev.error);

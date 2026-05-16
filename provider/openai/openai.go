@@ -115,14 +115,10 @@ func buildParams(req llm.Request) (openai.ChatCompletionNewParams, error) {
 		Model: openai.ChatModel(req.Model.APIID),
 	}
 
-	// StreamOptions.IncludeUsage is an OpenAI-specific extension that requests
-	// usage statistics in the final stream chunk. Only send it when talking to
-	// the official OpenAI API; third-party compatible proxies may reject requests
-	// with unknown fields.
-	if req.Model.ProviderID == ProviderID {
-		params.StreamOptions = openai.ChatCompletionStreamOptionsParam{
-			IncludeUsage: openai.Bool(true),
-		}
+	// StreamOptions.IncludeUsage requests usage statistics in the final stream
+	// chunk. Most OpenAI-compatible proxies support this; send it unconditionally.
+	params.StreamOptions = openai.ChatCompletionStreamOptionsParam{
+		IncludeUsage: openai.Bool(true),
 	}
 
 	if req.Options.MaxTokens > 0 {

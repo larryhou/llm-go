@@ -166,11 +166,12 @@ func (s *webServer) handleChat(w http.ResponseWriter, r *http.Request) {
 					"input": toolPath(ev.ToolName, ev.Input),
 				})
 			case llm.EventStepFinish:
+				u := ev.Usage
 				sendEvent(map[string]any{
 					"type":   "usage",
-					"input":  ev.Usage.Input,
-					"output": ev.Usage.Output,
-					"total":  ev.Usage.Effective(),
+					"input":  u.Input,
+					"output": u.Output,
+					"total":  u.Effective(),
 				})
 			case llm.EventError:
 				sendEvent(map[string]any{"type": "error", "error": fmt.Sprintf("%v", ev.Err)})

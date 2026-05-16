@@ -10,6 +10,7 @@ package gsetokenizer
 
 import (
 	"github.com/blevesearch/bleve/v2/analysis"
+	_ "github.com/blevesearch/bleve/v2/analysis/analyzer/custom" // register "custom" analyzer type
 	"github.com/blevesearch/bleve/v2/registry"
 	"github.com/go-ego/gse"
 )

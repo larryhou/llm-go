@@ -502,7 +502,8 @@ func main() {
 				case llm.EventStepFinish:
 					// nothing — newline will come with EventRequestFinish
 				case llm.EventRequestFinish:
-					fmt.Println()
+					u := ev.Usage
+					fmt.Printf("\n[in:%d out:%d total:%d]\n", u.Input, u.Output, u.Effective())
 				case llm.EventError:
 					fmt.Fprintf(os.Stderr, "\n[error] %v\n", ev.Err)
 				}
