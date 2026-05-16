@@ -449,6 +449,15 @@ VERDICT: PASS / FAIL / ABORTED at step N
 | Cancel with all-incomplete tools | `context.go:190` | entire turn dropped; ` ` placeholder inserted |
 | Cancel during compaction | `compaction.go:254` | `context.WithoutCancel` shields compaction; cancel takes effect only after compaction finishes |
 | Empty text part (`Text=""`) | `context.go:327` | `hasRealContent=false` → classified as `cancelled`, not `interrupted` |
-| Tool goroutine outlives 250ms window | `processor.go:414–419` | goroutine may write `ToolStatusCompleted` after `markAssistantCancelled` reads `ListParts` — race documented in `prompt.go:428` |
-| `Cancel()` after loop completion | `prompt.go:100–105` | `sync.Once` makes it a no-op; no panic |
+| Tool goroutine outlives 250ms window | `processor.go` `isAlreadyInterrupted()` | cleanup marks part `error+Interrupted=true`; executeTool guards with `isAlreadyInterrupted()` to prevent overwrite |
+| Cancel() after loop completion | `prompt.go:100–105` | `sync.Once` makes it a no-op; no panic |
 | HTTP disconnect | `main.go` `handleChat` | `context.WithoutCancel` — RunLoop is NOT cancelled; completes normally |
+| Cancel during cleanup 250ms wait | `prompt.go` `runLoopInternal` | Even when Process() returns (nil, nil), ctx.Err() check prevents a new iteration from starting |
+
+## Fixed Bugs (discovered by interrupt-test run)
+
+| Bug | Fix | Commit |
+|-----|-----|--------|
+| `executeTool` could overwrite `Interrupted=true` set by cleanup's 250ms timeout | Added `isAlreadyInterrupted()` guard in `session/processor.go` before writing tool result | `da15367` |
+| RunLoop continued iterating after Cancel() when cleanup ran its 250ms wait (Process returned nil error) | Added `ctx.Err()` check after `Process()` returns in `runLoopInternal` | `da15367` |
+| DATA RACE in `countingTool.Execute` (test helper) — `calls` field written by concurrent goroutines | Added `sync.Mutex` to `countingTool` | `da15367` |
