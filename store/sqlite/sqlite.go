@@ -725,9 +725,91 @@ func (h *HistorySource) Fetch(ctx context.Context, q knowledge.Query) ([]knowled
 	}}, nil
 }
 
-// LoadRecords implements knowledge.PersistStore.
+// LoadRecords is kept for internal use; external callers should prefer
+// LoadSeqIndex + LoadRecordsBySeq for bounded memory access.
 func (s *Store) LoadRecords(ctx context.Context, sessionID string) (map[int][]knowledge.Record, error) {
 	return s.LoadHistoryDocs(ctx, sessionID)
+}
+
+// LoadSeqIndex implements knowledge.PersistStore.
+// Returns a seq→[]docID map for the most recent `limit` compaction sequences.
+// Only the two index columns are read — no text payload.
+func (s *Store) LoadSeqIndex(ctx context.Context, sessionID string, limit int) (map[int][]string, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT compaction_seq, id
+		FROM history_docs
+		WHERE session_id = ?
+		  AND compaction_seq IN (
+		      SELECT DISTINCT compaction_seq
+		      FROM history_docs
+		      WHERE session_id = ?
+		      ORDER BY compaction_seq DESC
+		      LIMIT ?
+		  )
+		ORDER BY compaction_seq DESC, turn_index ASC`,
+		sessionID, sessionID, limit)
+	if err != nil {
+		return nil, fmt.Errorf("LoadSeqIndex %q: %w", sessionID, err)
+	}
+	defer rows.Close()
+
+	result := make(map[int][]string)
+	for rows.Next() {
+		var seq int
+		var id string
+		if err := rows.Scan(&seq, &id); err != nil {
+			return nil, fmt.Errorf("LoadSeqIndex scan: %w", err)
+		}
+		result[seq] = append(result[seq], id)
+	}
+	return result, rows.Err()
+}
+
+// LoadRecordsBySeq implements knowledge.PersistStore.
+// Returns all Records for exactly one compaction sequence.
+func (s *Store) LoadRecordsBySeq(ctx context.Context, sessionID string, seq int) ([]knowledge.Record, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT id, role, text, tool_calls, turn_index, compaction_seq, created_at
+		FROM history_docs
+		WHERE session_id = ? AND compaction_seq = ?
+		ORDER BY turn_index ASC`,
+		sessionID, seq)
+	if err != nil {
+		return nil, fmt.Errorf("LoadRecordsBySeq %q seq=%d: %w", sessionID, seq, err)
+	}
+	defer rows.Close()
+
+	var out []knowledge.Record
+	for rows.Next() {
+		var rec knowledge.Record
+		var toolCallsJSON string
+		if err := rows.Scan(
+			&rec.ID, &rec.Role, &rec.Text, &toolCallsJSON,
+			&rec.TurnIndex, &rec.CompactionSeq, &rec.CreatedAt,
+		); err != nil {
+			return nil, fmt.Errorf("LoadRecordsBySeq scan: %w", err)
+		}
+		_ = json.Unmarshal([]byte(toolCallsJSON), &rec.ToolCalls)
+		out = append(out, rec)
+	}
+	return out, rows.Err()
+}
+
+// FindSeqByDocID implements knowledge.PersistStore.
+// Returns the compaction_seq that owns docID, or found=false if not present.
+func (s *Store) FindSeqByDocID(ctx context.Context, sessionID string, docID string) (int, bool, error) {
+	var seq int
+	err := s.db.QueryRowContext(ctx,
+		`SELECT compaction_seq FROM history_docs WHERE session_id = ? AND id = ?`,
+		sessionID, docID,
+	).Scan(&seq)
+	if err == sql.ErrNoRows {
+		return 0, false, nil
+	}
+	if err != nil {
+		return 0, false, fmt.Errorf("FindSeqByDocID %q: %w", docID, err)
+	}
+	return seq, true, nil
 }
 
 // SaveRecord implements knowledge.PersistStore.
@@ -738,6 +820,39 @@ func (s *Store) SaveRecord(ctx context.Context, sessionID string, rec knowledge.
 // DeleteRecordsBySeq implements knowledge.PersistStore.
 func (s *Store) DeleteRecordsBySeq(ctx context.Context, sessionID string, seq int) error {
 	return s.DeleteHistoryDocsForSeq(ctx, sessionID, seq)
+}
+
+// ── HistorySource: knowledge.PersistStore delegation ─────────────────────────
+//
+// HistorySource implements the full knowledge.PersistStore interface by
+// delegating to its embedded *Store, always scoping to h.sessionID.
+// This makes HistorySource the single object that callers pass to both
+// knowledge.Manager.Register() (as Source) and NewSessionHistorySource (as
+// PersistStore), without any concrete type leaking into the knowledge package.
+
+// LoadSeqIndex implements knowledge.PersistStore.
+func (h *HistorySource) LoadSeqIndex(ctx context.Context, sessionID string, limit int) (map[int][]string, error) {
+	return h.store.LoadSeqIndex(ctx, sessionID, limit)
+}
+
+// LoadRecordsBySeq implements knowledge.PersistStore.
+func (h *HistorySource) LoadRecordsBySeq(ctx context.Context, sessionID string, seq int) ([]knowledge.Record, error) {
+	return h.store.LoadRecordsBySeq(ctx, sessionID, seq)
+}
+
+// FindSeqByDocID implements knowledge.PersistStore.
+func (h *HistorySource) FindSeqByDocID(ctx context.Context, sessionID string, docID string) (int, bool, error) {
+	return h.store.FindSeqByDocID(ctx, sessionID, docID)
+}
+
+// SaveRecord implements knowledge.PersistStore.
+func (h *HistorySource) SaveRecord(ctx context.Context, sessionID string, rec knowledge.Record) error {
+	return h.store.SaveRecord(ctx, sessionID, rec)
+}
+
+// DeleteRecordsBySeq implements knowledge.PersistStore.
+func (h *HistorySource) DeleteRecordsBySeq(ctx context.Context, sessionID string, seq int) error {
+	return h.store.DeleteRecordsBySeq(ctx, sessionID, seq)
 }
 
 // sqlLikeEscape escapes special LIKE characters in a search term.

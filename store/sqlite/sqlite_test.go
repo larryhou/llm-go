@@ -582,3 +582,377 @@ func TestOpen_createsFile(t *testing.T) {
 		t.Errorf("db file not created: %v", err)
 	}
 }
+
+// ── LoadSeqIndex ──────────────────────────────────────────────────────────────
+
+func TestLoadSeqIndex_basic(t *testing.T) {
+	s := newStore(t)
+	ctx := context.Background()
+
+	// Write 5 seqs with 2 docs each.
+	for seq := 1; seq <= 5; seq++ {
+		for i := 0; i < 2; i++ {
+			_ = s.SaveRecord(ctx, "sess1", knowledge.Record{
+				ID:            fmt.Sprintf("d%d-%d", seq, i),
+				Role:          "user",
+				Text:          fmt.Sprintf("seq %d doc %d", seq, i),
+				CompactionSeq: seq,
+				TurnIndex:     i,
+				CreatedAt:     time.Now().UnixMilli(),
+			})
+		}
+	}
+
+	// Load only the 3 most recent seqs.
+	idx, err := s.LoadSeqIndex(ctx, "sess1", 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(idx) != 3 {
+		t.Errorf("LoadSeqIndex limit=3: got %d seqs, want 3", len(idx))
+	}
+	// Should contain seqs 3, 4, 5 (most recent).
+	for _, seq := range []int{3, 4, 5} {
+		if ids, ok := idx[seq]; !ok || len(ids) != 2 {
+			t.Errorf("seq %d: got %v, want 2 ids", seq, ids)
+		}
+	}
+	// Seq 1 and 2 should be absent (too old).
+	for _, seq := range []int{1, 2} {
+		if _, ok := idx[seq]; ok {
+			t.Errorf("seq %d should not be in index (limit=3)", seq)
+		}
+	}
+}
+
+func TestLoadSeqIndex_empty(t *testing.T) {
+	s := newStore(t)
+	idx, err := s.LoadSeqIndex(context.Background(), "nosess", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(idx) != 0 {
+		t.Errorf("expected empty index, got %d seqs", len(idx))
+	}
+}
+
+func TestLoadSeqIndex_limitLargerThanData(t *testing.T) {
+	s := newStore(t)
+	ctx := context.Background()
+	for seq := 1; seq <= 3; seq++ {
+		_ = s.SaveRecord(ctx, "sess1", knowledge.Record{
+			ID: fmt.Sprintf("d%d", seq), CompactionSeq: seq, CreatedAt: time.Now().UnixMilli(),
+		})
+	}
+	// Limit larger than actual seqs — should return all.
+	idx, err := s.LoadSeqIndex(ctx, "sess1", 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(idx) != 3 {
+		t.Errorf("got %d seqs, want 3", len(idx))
+	}
+}
+
+// ── LoadRecordsBySeq ──────────────────────────────────────────────────────────
+
+func TestLoadRecordsBySeq_basic(t *testing.T) {
+	s := newStore(t)
+	ctx := context.Background()
+
+	want := []knowledge.Record{
+		{ID: "a", Role: "user", Text: "hello", TurnIndex: 0, CompactionSeq: 2, ToolCalls: []string{"shell"}, CreatedAt: time.Now().UnixMilli()},
+		{ID: "b", Role: "assistant", Text: "world", TurnIndex: 1, CompactionSeq: 2, CreatedAt: time.Now().UnixMilli()},
+	}
+	for _, r := range want {
+		_ = s.SaveRecord(ctx, "sess1", r)
+	}
+	// Write a decoy in a different seq.
+	_ = s.SaveRecord(ctx, "sess1", knowledge.Record{ID: "c", CompactionSeq: 9, CreatedAt: time.Now().UnixMilli()})
+
+	got, err := s.LoadRecordsBySeq(ctx, "sess1", 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("got %d records, want 2", len(got))
+	}
+	if got[0].ID != "a" || got[1].ID != "b" {
+		t.Errorf("order or IDs wrong: %v", got)
+	}
+	if len(got[0].ToolCalls) != 1 || got[0].ToolCalls[0] != "shell" {
+		t.Errorf("ToolCalls not preserved: %v", got[0].ToolCalls)
+	}
+}
+
+func TestLoadRecordsBySeq_noMatch(t *testing.T) {
+	s := newStore(t)
+	got, err := s.LoadRecordsBySeq(context.Background(), "sess1", 99)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 0 {
+		t.Errorf("expected empty, got %d", len(got))
+	}
+}
+
+// ── FindSeqByDocID ────────────────────────────────────────────────────────────
+
+func TestFindSeqByDocID_found(t *testing.T) {
+	s := newStore(t)
+	ctx := context.Background()
+	_ = s.SaveRecord(ctx, "sess1", knowledge.Record{
+		ID: "doc-42", CompactionSeq: 7, CreatedAt: time.Now().UnixMilli(),
+	})
+
+	seq, found, err := s.FindSeqByDocID(ctx, "sess1", "doc-42")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !found {
+		t.Fatal("expected found=true")
+	}
+	if seq != 7 {
+		t.Errorf("seq = %d, want 7", seq)
+	}
+}
+
+func TestFindSeqByDocID_notFound(t *testing.T) {
+	s := newStore(t)
+	_, found, err := s.FindSeqByDocID(context.Background(), "sess1", "ghost")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if found {
+		t.Error("expected found=false for non-existent docID")
+	}
+}
+
+func TestFindSeqByDocID_sessionIsolation(t *testing.T) {
+	s := newStore(t)
+	ctx := context.Background()
+	_ = s.SaveRecord(ctx, "sessA", knowledge.Record{
+		ID: "doc-1", CompactionSeq: 3, CreatedAt: time.Now().UnixMilli(),
+	})
+
+	// Same docID exists in sessA but not in sessB.
+	_, found, err := s.FindSeqByDocID(ctx, "sessB", "doc-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if found {
+		t.Error("doc from sessA should not be found in sessB")
+	}
+}
+
+// ── SessionHistorySource integration (L0/L1 caps + LRU) ──────────────────────
+
+func newHistSrc(t *testing.T, st *sqlite.Store, sessID string, maxL1, maxL0 int) *knowledge.SessionHistorySource {
+	t.Helper()
+	ps := sqlite.NewHistorySource(st, sessID, 0)
+	src, err := knowledge.NewSessionHistorySource(sessID, maxL1, maxL0, ps)
+	if err != nil {
+		t.Fatalf("NewSessionHistorySource: %v", err)
+	}
+	return src
+}
+
+func saveAndHook(t *testing.T, src *knowledge.SessionHistorySource, st *sqlite.Store, sessID string, seq int, msgs []string) {
+	t.Helper()
+	ctx := context.Background()
+	// Simulate the compaction hook by calling Hook() indirectly:
+	// save records to SQLite directly (as SaveRecord does in Hook) and
+	// also exercise the Hook path via a fake compaction message set.
+	for i, text := range msgs {
+		_ = st.SaveRecord(ctx, sessID, knowledge.Record{
+			ID:            fmt.Sprintf("%s-seq%d-doc%d", sessID, seq, i),
+			Role:          "user",
+			Text:          text,
+			TurnIndex:     i,
+			CompactionSeq: seq,
+			CreatedAt:     time.Now().UnixMilli(),
+		})
+	}
+}
+
+func TestSessionHistorySource_peekFallsBackToSQLite(t *testing.T) {
+	// Verify that Peek returns results even when Bleve is empty (cold start).
+	s := newStore(t)
+	ctx := context.Background()
+
+	// Write 3 seqs directly to SQLite (simulate prior sessions).
+	for seq := 1; seq <= 3; seq++ {
+		_ = s.SaveRecord(ctx, "sess1", knowledge.Record{
+			ID:            fmt.Sprintf("d%d", seq),
+			Role:          "user",
+			Text:          fmt.Sprintf("golang concurrency seq %d", seq),
+			CompactionSeq: seq,
+			TurnIndex:     0,
+			CreatedAt:     time.Now().UnixMilli(),
+		})
+	}
+
+	// Create source after records exist — Bleve starts empty.
+	hs := newHistSrc(t, s, "sess1", 2, 5)
+
+	// SQLite HistorySource (L2) must cover all seqs even with cold Bleve.
+	results, err := hs.Peek(ctx, knowledge.Query{
+		Type:       knowledge.QueryTypeSearch,
+		Input:      "golang",
+		MaxResults: 10,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results) == 0 {
+		t.Error("expected results from SQLite fallback, got none")
+	}
+}
+
+func TestSessionHistorySource_fetchTriggersPageIn(t *testing.T) {
+	// Fetch on a cold docID should page-in from SQLite and return full content.
+	s := newStore(t)
+	ctx := context.Background()
+
+	_ = s.SaveRecord(ctx, "sess1", knowledge.Record{
+		ID:            "target-doc",
+		Role:          "assistant",
+		Text:          "the answer is 42",
+		CompactionSeq: 1,
+		TurnIndex:     0,
+		CreatedAt:     time.Now().UnixMilli(),
+	})
+
+	hs := newHistSrc(t, s, "sess1", 2, 5)
+
+	results, err := hs.Fetch(ctx, knowledge.Query{
+		Type:  knowledge.QueryTypeFetch,
+		Input: "session-history:target-doc",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results) == 0 {
+		t.Fatal("expected a result")
+	}
+	if results[0].Content == "" {
+		t.Error("Content must be populated for Fetch")
+	}
+}
+
+func TestSessionHistorySource_l0Eviction(t *testing.T) {
+	// When maxIndexedSeqs=3 and we add 5 seqs, only 3 should remain in L0.
+	s := newStore(t)
+	ctx := context.Background()
+	sessID := "sess-evict"
+
+	// maxL1=2, maxL0=3
+	src, err := knowledge.NewSessionHistorySource(sessID, 2, 3, sqlite.NewHistorySource(s, sessID, 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	hook := src.Hook()
+
+	// Simulate 5 compaction rounds via Hook.
+	for seq := 1; seq <= 5; seq++ {
+		msgs := []*store.Message{
+			{
+				ID:        fmt.Sprintf("msg-%d", seq),
+				SessionID: sessID,
+				Role:      store.RoleUser,
+				CreatedAt: time.Now(),
+				UpdatedAt: time.Now(),
+			},
+		}
+		parts := map[string][]*store.Part{
+			msgs[0].ID: {
+				{
+					ID:        fmt.Sprintf("part-%d", seq),
+					MessageID: msgs[0].ID,
+					SessionID: sessID,
+					Type:      store.PartTypeText,
+					Data:      &store.TextPartData{Text: fmt.Sprintf("turn %d content", seq)},
+				},
+			},
+		}
+		hook(msgs, parts)
+	}
+
+	// All 5 seqs should be in SQLite.
+	idx, _ := s.LoadSeqIndex(ctx, sessID, 100)
+	if len(idx) != 5 {
+		t.Errorf("SQLite has %d seqs, want 5", len(idx))
+	}
+
+	// L0 should have at most 3 seqs (maxIndexedSeqs).
+	// L1 should have at most 2 seqs (maxCompactions).
+	// We can't inspect internal fields directly, but we can verify:
+	// - Peek on recently added content still works (L1 or L2 coverage).
+	results, err := src.Peek(ctx, knowledge.Query{
+		Type:       knowledge.QueryTypeSearch,
+		Input:      "turn 5",
+		MaxResults: 5,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results) == 0 {
+		t.Error("expected result for 'turn 5' (most recent seq)")
+	}
+}
+
+func TestSessionHistorySource_restoreFromSQLite(t *testing.T) {
+	// Simulate restart: write records, close, reopen, verify Peek works.
+	dir := t.TempDir()
+	path := filepath.Join(dir, "restore.db")
+	ctx := context.Background()
+	sessID := "sess-restore"
+
+	// First "process": write 5 seqs via Hook.
+	st1, _ := sqlite.Open(path)
+	src1, _ := knowledge.NewSessionHistorySource(sessID, 2, 4, sqlite.NewHistorySource(st1, sessID, 0))
+	hook1 := src1.Hook()
+	for seq := 1; seq <= 5; seq++ {
+		msgs := []*store.Message{{
+			ID: fmt.Sprintf("m%d", seq), SessionID: sessID,
+			Role: store.RoleUser, CreatedAt: time.Now(), UpdatedAt: time.Now(),
+		}}
+		parts := map[string][]*store.Part{
+			msgs[0].ID: {{
+				ID: fmt.Sprintf("p%d", seq), MessageID: msgs[0].ID,
+				SessionID: sessID, Type: store.PartTypeText,
+				Data: &store.TextPartData{Text: fmt.Sprintf("ancient wisdom seq %d", seq)},
+			}},
+		}
+		hook1(msgs, parts)
+	}
+	st1.Close()
+
+	// Second "process": reopen and verify history is accessible.
+	st2, err := sqlite.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st2.Close()
+
+	// maxL0=4 means only 4 most recent seqs are in compactionDocs at startup.
+	src2, err := knowledge.NewSessionHistorySource(sessID, 2, 4, sqlite.NewHistorySource(st2, sessID, 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Seq 1 is the oldest and outside L0 (maxL0=4, seqs 2–5 loaded).
+	// But Peek should still find it via SQLite L2 path.
+	results, err := src2.Peek(ctx, knowledge.Query{
+		Type:       knowledge.QueryTypeSearch,
+		Input:      "ancient",
+		MaxResults: 10,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results) == 0 {
+		t.Error("expected results for 'ancient wisdom' after restart (via SQLite L2)")
+	}
+}

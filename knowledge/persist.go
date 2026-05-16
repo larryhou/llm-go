@@ -22,10 +22,21 @@ import "context"
 //	                                  sqlite.HistorySource implements Source)
 //	cmd/*        →  store/sqlite     (injection point — no cycle)
 type PersistStore interface {
-	// LoadRecords returns all persisted records for the session, grouped by
-	// compaction_seq. Called once at SessionHistorySource startup to restore
-	// the known seq map without loading content into Bleve (lazy page-in).
-	LoadRecords(ctx context.Context, sessionID string) (map[int][]Record, error)
+	// LoadSeqIndex returns a lightweight seq→[]docID map for the most recent
+	// `limit` compaction sequences. Only the two index columns (seq, id) are
+	// read — no text payload — so this is cheap even for large histories.
+	// Used at startup to restore the L0 compactionDocs map without loading
+	// document content into Bleve.
+	LoadSeqIndex(ctx context.Context, sessionID string, limit int) (map[int][]string, error)
+
+	// LoadRecordsBySeq returns all Records for a single compaction sequence.
+	// Called during a Bleve page-in (Fetch path) to load exactly one seq.
+	// Replaces the previous full-table LoadRecords call.
+	LoadRecordsBySeq(ctx context.Context, sessionID string, seq int) ([]Record, error)
+
+	// FindSeqByDocID returns the compaction_seq that owns docID.
+	// Called during Fetch when the docID is not yet in compactionDocs (L0 miss).
+	FindSeqByDocID(ctx context.Context, sessionID string, docID string) (seq int, found bool, err error)
 
 	// SaveRecord persists one record. Called synchronously inside the
 	// CompactionHook so a clean process exit never loses a round.

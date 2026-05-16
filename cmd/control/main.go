@@ -382,7 +382,7 @@ func main() {
 				ps = p
 			}
 			var histErr error
-			historySrc, histErr = knowledge.NewSessionHistorySource(sessionID, knowledge.DefaultMaxCompactions, ps)
+			historySrc, histErr = knowledge.NewSessionHistorySource(sessionID, knowledge.DefaultMaxCompactions, knowledge.DefaultMaxIndexedSeqs, ps)
 			if histErr != nil {
 				fmt.Fprintf(os.Stderr, "[warn] failed to create session history source: %v\n", histErr)
 			} else {
