@@ -323,6 +323,75 @@ instead of the original output. The tool call itself (name + input) is preserved
 
 `RunLoop` is a synchronous blocking call. `RunLoopAsync` wraps it in a goroutine and returns a `RunHandle` immediately, enabling callers to cancel an in-flight loop and start a new one safely.
 
+### Cancellation lifecycle
+
+```mermaid
+sequenceDiagram
+    participant Caller
+    participant Handle as RunHandle
+    participant goroutine as RunLoopAsync goroutine
+    participant Process as processor.Process()
+    participant cleanup as processorState.cleanup()
+    participant Store
+
+    Caller->>Handle: RunLoopAsync(ctx, store, input)
+    Handle-->>Caller: *RunHandle (Done channel)
+    Handle->>goroutine: go runLoopInternal(cancelCtx, ...)
+
+    goroutine->>Store: CreateMessage(userMsg)
+    goroutine->>Store: CreateMessage(assistantMsg placeholder)
+    goroutine->>Process: Process(cancelCtx, assistantMsgID, ...)
+    Note over Process: LLM stream + tool goroutines running
+
+    Caller->>Handle: Cancel()  [any time]
+    Handle->>goroutine: cancelCtx cancelled (sync.Once, idempotent)
+    goroutine->>Process: cancelCtx.Done() fires
+    Process->>cleanup: cleanup()  [uses context.Background()]
+    cleanup->>cleanup: toolCancel() — cancel tool goroutines
+    cleanup->>cleanup: wait up to 250ms for toolWg
+    cleanup->>Store: UpdatePart(pending→error, Interrupted=true)
+    Process-->>goroutine: return error (ctx cancelled)
+
+    goroutine->>Store: markAssistantCancelled(assistantMsgID)
+    Note over goroutine: Status = "cancelled" or "interrupted"\ndepends on whether parts exist
+
+    goroutine->>Store: Prune() [synchronous, 10s timeout]
+    goroutine->>Handle: close(Done)
+
+    Caller->>Handle: <-Done  [safe to start new RunLoop]
+    Caller->>Handle: RunLoopAsync(ctx, store, newInput)
+```
+
+### Message.Status state machine
+
+```mermaid
+stateDiagram-v2
+    [*] --> running : CreateMessage(assistantMsg)\nStatus=""
+    running --> normal : Process() returns nil\nprocessCommitted=true\nStatus stays ""
+    running --> interrupted : Cancel() fires\nctx.Err()!=nil\nparts exist (text or tools)
+    running --> cancelled : Cancel() fires\nctx.Err()!=nil\nno parts written yet
+    normal --> [*] : included in LLM context normally
+    interrupted --> [*] : buildAssistantPartsInterrupted()
+    cancelled --> [*] : skipped; " " placeholder injected\nbetween consecutive user messages
+```
+
+### Interrupted turn rendering (`buildAssistantPartsInterrupted`)
+
+```mermaid
+flowchart TD
+    Start["interrupted assistant message"] --> CheckTools{"hadAnyTool?"}
+
+    CheckTools -- No --> KeepText["Keep text/reasoning parts as-is\nLLM infers naturally from partial text"]
+
+    CheckTools -- Yes --> CheckCompleted{"len(completedToolCalls) > 0?"}
+
+    CheckCompleted -- No --> DropAll["return nil, nil\nEntire turn dropped\n(avoids dangling tool-call\nwith no tool-result)"]
+
+    CheckCompleted -- Yes --> Assemble["Assemble:\n① text/reasoning parts\n② '[Assistant turn was interrupted by user]'\n③ completed tool call parts\n(text-before-tool: Anthropic ordering)"]
+    Assemble --> ToolResults["toolResults: completed tool results only\n(matching the kept tool calls)"]
+    Assemble --> Out["out ← assistant message\nout ← tool-role message (if toolResults)"]
+```
+
 ### API
 
 ```go
@@ -352,13 +421,7 @@ When `Cancel()` fires mid-turn, the assistant message placeholder is marked with
 |--------|-----------|---------------|
 | `""` (normal) | Turn completed normally | Standard path |
 | `"cancelled"` | No content emitted before cancel | Skipped; silent `" "` placeholder inserted between consecutive user messages to satisfy Anthropic/OpenAI alternating-role protocol |
-| `"interrupted"` | Partial content emitted (text or tools) | Kept with special handling (see below) |
-
-**Interrupted turn handling in `ToModelMessages`:**
-
-- **Text only, no tool calls** (`hadAnyTool=false`): partial text kept as-is; LLM infers from context naturally.
-- **Has tool calls, some completed** (`hadAnyTool=true`, `len(toolCallParts) > 0`): only completed tool calls kept; ordering is `[text/reasoning] → "[Assistant turn was interrupted by user]" → [completed tool calls]`; text before tool use satisfies Anthropic validation.
-- **Has tool calls, none completed** (`hadAnyTool=true`, `len(toolCallParts) == 0`): entire turn dropped (`nil, nil` returned); text parts discarded to avoid a dangling turn with no tool-result.
+| `"interrupted"` | Partial content emitted (text or tools) | Kept with special handling (see above) |
 
 **Known race:** `cleanup()` waits up to 250ms for tool goroutines. After that timeout, a goroutine may still write `ToolStatusCompleted` after `markAssistantCancelled` reads `ListParts`. In that case the message may be classified `cancelled` instead of `interrupted`, losing the completed tool result from the next turn's context. This window is small; eliminating it requires unconditional goroutine drain (future work).
 
