@@ -38,6 +38,12 @@ github.com/larryhou/llm-go
 - **Bleve full-text source** — ready-made `knowledge/source/bleve` backed by
   an in-memory or on-disk Bleve index.
 
+- **Session record / replay** (`llm.RecordProvider`, `cmd/replay`) — wrap any
+  provider with `RecordProvider` to capture every `Stream()` call to an ndjson
+  file; replay offline with `cmd/replay` to reproduce compaction decisions,
+  verify `PartTypeRecentContext` injection, and diagnose context-window behaviour
+  without real LLM calls.
+
 - **HTTP knowledge API** (`cmd/llm-api`) — self-contained HTTP server
   that indexes a skills directory, exposes REST search/fetch endpoints, and
   streams LLM chat responses as Server-Sent Events.
@@ -70,7 +76,9 @@ github.com/larryhou/llm-go/
 ├── config/               Config schema, Load(), per-field accessors
 ├── auth/                 auth.json reader/writer (oauth / api / wellknown)
 └── cmd/
-    ├── llm-api/    HTTP server — Bleve index + /chat SSE endpoint
+    ├── control/      Interactive REPL + web UI — RunLoopAsync, SSE, cancel, -debug recording
+    ├── llm-api/      HTTP server — Bleve index + /chat SSE endpoint
+    ├── replay/       Offline session replay — reproduce compaction from ndjson recording
     └── index-skills/     CLI — build an on-disk Bleve index from a skills directory
 ```
 
