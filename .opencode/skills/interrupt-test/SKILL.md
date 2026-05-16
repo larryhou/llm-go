@@ -412,8 +412,12 @@ STEP F — emptyTextPart classification:    PASS / FAIL
 
 STEP G — race detector (×10 runs):        PASS / FAIL
 
-STEP H — HTTP disconnect isolation:
-  RunLoop completed despite disconnect   : PASS / FAIL / INDETERMINATE
+STEP H — HTTP Chat interrupt tests:
+  H-1  disconnect isolation             : PASS / FAIL / INDETERMINATE
+  H-2  slow tool survives disconnect    : PASS / FAIL / INDETERMINATE
+  H-3  max_steps normal stop (no interrupt) : PASS / FAIL
+  H-4  disconnect then next turn clean  : PASS / FAIL
+  H-5  session state after normal turn  : PASS / FAIL
 
 STEP I — final full suite:                PASS / ABORT
 
@@ -461,3 +465,518 @@ VERDICT: PASS / FAIL / ABORTED at step N
 | `executeTool` could overwrite `Interrupted=true` set by cleanup's 250ms timeout | Added `isAlreadyInterrupted()` guard in `session/processor.go` before writing tool result | `da15367` |
 | RunLoop continued iterating after Cancel() when cleanup ran its 250ms wait (Process returned nil error) | Added `ctx.Err()` check after `Process()` returns in `runLoopInternal` | `da15367` |
 | DATA RACE in `countingTool.Execute` (test helper) — `calls` field written by concurrent goroutines | Added `sync.Mutex` to `countingTool` | `da15367` |
+
+---
+
+# HTTP Chat 中断测试 (STEP H)
+
+通过 `/chat` HTTP 接口验证中断相关行为。
+
+> **为什么使用动态 curl 测试而非固定脚本？**
+> `RunLoopAsync.Cancel()` 在 HTTP 层不可调用（无 `/cancel` 端点），且
+> `context.WithoutCancel` 屏蔽了 HTTP disconnect 对 RunLoop 的影响。
+> 因此 HTTP 层的"中断"只能通过 **连接超时/断开** 和 **max_steps** 间接观察，
+> 需要结合 `/sessions/{id}/messages` 检查 store 内的 status 字段来判定。
+
+---
+
+## 执行规则
+
+**必须遵守，否则测试无效：**
+
+1. **按顺序执行每个步骤**，不得跳过或重排。
+2. **每步检查 ABORT 条件**，触发则立即停止并报告 `ABORTED at H-N: <原因>`。
+3. **将每次 curl 响应保存在命名变量** (`RH1`, `RH2`, …)。
+4. **每次请求超时 120 秒** (`--max-time 120`)。curl 退出码 28 = ABORT。
+5. **使用 `$SESS_H` 贯穿所有 `/chat` 调用**，不得中途更换。
+6. 测试结束后打印结构化 **H 测试报告**（见本节末尾）。
+
+---
+
+## 服务器启动
+
+```bash
+# LLM 连接解析顺序：
+#   1. 环境变量（优先）：
+#        TIMI_PROVIDER  — "openai" 或 "anthropic"  (默认: anthropic)
+#        TIMI_BASE_URL  — provider base URL
+#        TIMI_API_KEY   — API key
+#        TIMI_MODEL     — 模型 ID                  (默认: claude-sonnet-4.6)
+#   2. cmd/knowledge-api/main.go 中 flag.StringVar 的硬编码默认值
+#   3. 以上均不可用时询问用户
+
+lsof -ti:7700 | xargs kill -9 2>/dev/null; sleep 1
+nohup go run ./cmd/knowledge-api/ \
+  -skills .opencode -addr 127.0.0.1:7700 \
+  > /tmp/kapi.log 2>&1 &
+sleep 6 && curl -s http://127.0.0.1:7700/health
+```
+
+健康响应：`{"status":"ok","doc_count":N,"session_count":N}`
+
+**ABORT if:** 响应不含 `"status":"ok"`。
+
+---
+
+## STEP H-0 — 服务器健康检查
+
+```bash
+curl -s --max-time 10 http://127.0.0.1:7700/health
+```
+
+**ABORT if:** 响应不含 `"status":"ok"`。
+
+---
+
+## STEP H-1 — 断开连接隔离：RunLoop 不受 HTTP disconnect 影响
+
+**验证核心不变式：** `context.WithoutCancel` 保证 HTTP 客户端断开后，
+服务端 RunLoop 仍正常完成，session store 中留下完整 assistant 消息（`status=""`）。
+
+```bash
+SESS_H="itest-$(date +%s)"
+echo "SESSION: $SESS_H"
+
+# 启动请求后 2 秒强制断开（用 timeout 模拟客户端离开）
+timeout 2 curl -sN --max-time 30 -X POST http://127.0.0.1:7700/chat \
+  -H "Content-Type: application/json" \
+  -d "{\"message\":\"Please count from 1 to 20, one number per line, slowly.\",\"session_id\":\"$SESS_H\",\"context_limit\":20000,\"tools\":[],\"max_steps\":2}" \
+  || true   # timeout/kill 是预期的，不是错误
+
+# 等待服务端完成（RunLoop 在后台继续运行）
+echo "等待服务端完成（约 15 秒）..."
+sleep 15
+
+# 检查 session 状态
+RH1_STATE=$(curl -s http://127.0.0.1:7700/sessions/$SESS_H/messages)
+echo "$RH1_STATE" | python3 -c "
+import json, sys
+d = json.load(sys.stdin)
+print('messages:', d['message_count'])
+for m in d['messages']:
+    role = m['role']
+    status = m.get('status', '')
+    ptypes = [p['type'] for p in m['parts']]
+    summaries = [p.get('summary','') for p in m['parts']]
+    print(f'  {role} status={status!r} parts={ptypes}')
+    for s in summaries:
+        if s: print(f'    {s[:100]}')
+"
+```
+
+**ABORT if:** curl timeout（exit 28）在 2 秒强制断开之前触发（说明服务未启动）。
+
+**CHECK H-1:**
+
+```bash
+echo "$RH1_STATE" | python3 -c "
+import json, sys
+d = json.load(sys.stdin)
+msgs = d['messages']
+assistant_msgs = [m for m in msgs if m['role'] == 'assistant']
+if not assistant_msgs:
+    print('INDETERMINATE: no assistant message yet (server still processing?)')
+    sys.exit(0)
+last = assistant_msgs[-1]
+status = last.get('status', '')
+if status == '':
+    print('PASS: assistant status=empty (normal completion despite disconnect)')
+elif status in ('cancelled', 'interrupted'):
+    print(f'FAIL: assistant status={status!r} — HTTP disconnect propagated to RunLoop!')
+    print('Check: context.WithoutCancel in handleChat')
+else:
+    print(f'UNKNOWN: assistant status={status!r}')
+"
+```
+
+| 结果 | 含义 |
+|------|------|
+| `status=""` | ✓ **PASS** — `context.WithoutCancel` 生效，RunLoop 正常完成 |
+| `status="cancelled"` 或 `"interrupted"` | ✗ **FAIL** — disconnect 传播到了 RunLoop |
+| 无 assistant 消息 | **INDETERMINATE** — 增加 sleep 时间后重试（最多 2 次） |
+
+---
+
+## STEP H-2 — 慢工具存活：disconnect 期间工具继续执行直到完成
+
+**验证：** 客户端断开时 `slow_calc` 工具（睡 2 秒）能正常完成，
+结果写入 store，不被 cleanup 的 250ms 超时截断。
+
+> **原理：** `slow_calc` 用 `select { case <-time.After(2s): case <-ctx.Done(): }`
+> 实现。`context.WithoutCancel` 保证工具 ctx 不会因 HTTP disconnect 取消，
+> 所以工具能跑完整 2 秒。
+
+```bash
+SESS_H2="itest-slow-$(date +%s)"
+
+# 启动后 1 秒断开（工具还在睡眠中）
+timeout 1 curl -sN --max-time 30 -X POST http://127.0.0.1:7700/chat \
+  -H "Content-Type: application/json" \
+  -d "{\"message\":\"Use slow_calc to compute 13 * 17. Please wait for the result.\",\"session_id\":\"$SESS_H2\",\"context_limit\":20000,\"tools\":[\"slow_calc\"],\"max_steps\":3}" \
+  || true
+
+# 等待工具完成 + RunLoop 结束（工具需 2s，再加处理时间）
+echo "等待慢工具完成（约 10 秒）..."
+sleep 10
+
+RH2_STATE=$(curl -s http://127.0.0.1:7700/sessions/$SESS_H2/messages)
+echo "$RH2_STATE" | python3 -c "
+import json, sys
+d = json.load(sys.stdin)
+print('messages:', d['message_count'])
+for m in d['messages']:
+    role = m['role']
+    status = m.get('status', '')
+    for p in m['parts']:
+        s = p.get('summary', '')
+        if 'tool=' in s:
+            print(f'  {role} status={status!r} | {s}')
+        elif s:
+            print(f'  {role} status={status!r} | text: {s[:80]}')
+"
+```
+
+**CHECK H-2:**
+
+```bash
+echo "$RH2_STATE" | python3 -c "
+import json, sys
+d = json.load(sys.stdin)
+msgs = d['messages']
+
+# 找 slow_calc 工具 part
+tool_parts = []
+for m in msgs:
+    for p in m['parts']:
+        s = p.get('summary', '')
+        if 'tool=slow_calc' in s:
+            tool_parts.append((m['role'], m.get('status',''), s))
+
+if not tool_parts:
+    print('INDETERMINATE: no slow_calc tool part found (LLM may not have called it yet)')
+    sys.exit(0)
+
+for role, mstatus, summary in tool_parts:
+    print(f'slow_calc part: {summary}')
+    if 'status=completed' in summary:
+        print('PASS: slow_calc completed — tool survived disconnect (context.WithoutCancel working)')
+    elif 'status=error' in summary:
+        # 可能是工具执行出错（不是 interrupt）
+        print(f'CHECK: slow_calc status=error — verify Interrupted field')
+    else:
+        print(f'UNKNOWN: {summary}')
+
+# 检查 assistant 消息的 status
+assistant_msgs = [m for m in msgs if m['role'] == 'assistant']
+if assistant_msgs:
+    last_status = assistant_msgs[-1].get('status', '')
+    if last_status == '':
+        print('PASS: assistant message completed normally')
+    else:
+        print(f'FAIL: assistant status={last_status!r} — unexpected interrupt')
+"
+```
+
+| 结果 | 含义 |
+|------|------|
+| `slow_calc status=completed` + `assistant status=""` | ✓ **PASS** — 工具在 disconnect 后存活 |
+| `slow_calc status=error` (Interrupted=true) | ✗ **FAIL** — 工具被 cleanup 250ms 截断；检查 `context.WithoutCancel` |
+| 无 slow_calc part | **INDETERMINATE** — LLM 可能未调用工具；增加 sleep 重试 |
+
+---
+
+## STEP H-3 — max_steps 正常停止：不产生 interrupt/cancelled 状态
+
+**验证：** `max_steps=1` 不是中断，是正常停止。
+assistant 消息 `status=""` 且 SSE 流有 `"type":"done"` 事件。
+
+```bash
+RH3=$(curl -sN --max-time 120 -X POST http://127.0.0.1:7700/chat \
+  -H "Content-Type: application/json" \
+  -d '{"message":"Use calc for 2+2, then calc for 3+3, then calc for 4+4. Do all three.","tools":["calc"],"max_steps":1}')
+
+echo "Terminal event:"
+echo "$RH3" | grep '"type":"done"\|"type":"error"' | head -1
+
+SESS_H3=$(echo "$RH3" | grep '"session_id"' | sed 's/.*"session_id":"\([^"]*\)".*/\1/' | head -1)
+echo "Session: $SESS_H3"
+```
+
+**ABORT if:** curl exit 28（超时）。
+
+**CHECK H-3:**
+
+```bash
+echo "$RH3" | python3 -c "
+import json, sys
+lines = sys.stdin.read()
+# 检查终止事件
+if '\"type\":\"done\"' in lines:
+    print('PASS: done event received (normal stop)')
+elif '\"type\":\"error\"' in lines:
+    print('CHECK: error event — may be doom-loop or LLM error; check content')
+else:
+    print('FAIL: no terminal event')
+    sys.exit(1)
+
+# 统计 tool_call 数量
+tc = lines.count('\"type\":\"tool_call\"')
+print(f'tool_call events: {tc} (max_steps=1 limits LLM turns, not individual calls)')
+"
+
+# 检查 session store：assistant 消息 status 必须为空（正常完成）
+RH3_STATE=$(curl -s "http://127.0.0.1:7700/sessions/$SESS_H3/messages")
+echo "$RH3_STATE" | python3 -c "
+import json, sys
+d = json.load(sys.stdin)
+for m in d['messages']:
+    if m['role'] == 'assistant':
+        status = m.get('status', '')
+        if status == '':
+            print(f'PASS: assistant status=empty — max_steps stop is NOT an interrupt')
+        else:
+            print(f'FAIL: assistant status={status!r} — max_steps incorrectly produced interrupt state')
+"
+```
+
+| 结果 | 含义 |
+|------|------|
+| `done` 事件 + `assistant status=""` | ✓ **PASS** — max_steps 是正常停止，非中断 |
+| `assistant status="interrupted"` 或 `"cancelled"` | ✗ **FAIL** — max_steps 被误分类为中断 |
+
+---
+
+## STEP H-4 — Disconnect 后续轮次连贯：第一轮断开不污染 history
+
+**验证：** 第一轮被 disconnect（服务端完成后 status=""），
+第二轮能正常看到第一轮的结果并继续对话。
+
+```bash
+SESS_H4="itest-cont-$(date +%s)"
+
+# 第一轮：植入锚点 9973，然后 disconnect
+timeout 2 curl -sN --max-time 30 -X POST http://127.0.0.1:7700/chat \
+  -H "Content-Type: application/json" \
+  -d "{\"message\":\"Remember the special code 9973. Use counter to set key anchor=9973. Confirm.\",\"session_id\":\"$SESS_H4\",\"context_limit\":20000,\"tools\":[\"counter\"],\"max_steps\":3}" \
+  || true
+
+echo "等待第一轮完成（约 15 秒）..."
+sleep 15
+
+# 检查第一轮状态
+RH4_STATE1=$(curl -s "http://127.0.0.1:7700/sessions/$SESS_H4/messages")
+echo "第一轮后 session 状态:"
+echo "$RH4_STATE1" | python3 -c "
+import json, sys
+d = json.load(sys.stdin)
+print('messages:', d['message_count'])
+for m in d['messages']:
+    print(f'  {m[\"role\"]} status={m.get(\"status\",\"\")!r}')
+    for p in m['parts']:
+        s = p.get('summary','')
+        if s: print(f'    {s[:100]}')
+"
+
+# 第二轮：正常请求，验证 LLM 能回忆第一轮内容
+RH4=$(curl -sN --max-time 120 -X POST http://127.0.0.1:7700/chat \
+  -H "Content-Type: application/json" \
+  -d "{\"message\":\"What was the special code I gave you? And what is the current value of counter key anchor?\",\"session_id\":\"$SESS_H4\",\"context_limit\":20000,\"tools\":[\"counter\"],\"max_steps\":3}")
+
+echo "第二轮终止事件:"
+echo "$RH4" | grep '"type":"done"\|"type":"error"' | head -1
+```
+
+**ABORT if:** 第二轮 curl exit 28。
+
+**CHECK H-4:**
+
+```bash
+echo "$RH4" | python3 -c "
+import json, sys
+lines = sys.stdin.read()
+if '9973' in lines:
+    print('PASS: LLM recalled code 9973 — first turn (post-disconnect) preserved in history')
+else:
+    print('FAIL: LLM did not recall 9973 — disconnect may have broken history')
+    sys.exit(1)
+
+if '\"type\":\"done\"' in lines:
+    print('PASS: second turn completed cleanly')
+else:
+    print('WARN: no done event in second turn')
+"
+
+# 验证两轮均为 status="" (不是 cancelled/interrupted)
+RH4_STATE2=$(curl -s "http://127.0.0.1:7700/sessions/$SESS_H4/messages")
+echo "$RH4_STATE2" | python3 -c "
+import json, sys
+d = json.load(sys.stdin)
+print('final messages:', d['message_count'])
+bad = []
+for m in d['messages']:
+    if m['role'] == 'assistant':
+        s = m.get('status','')
+        if s in ('cancelled','interrupted'):
+            bad.append(f'{m[\"id\"][:8]} status={s!r}')
+if bad:
+    print('FAIL: interrupted assistant messages:', bad)
+else:
+    print('PASS: all assistant messages status=empty (clean history)')
+"
+```
+
+| 结果 | 含义 |
+|------|------|
+| 第二轮包含 `9973` + 所有 assistant `status=""` | ✓ **PASS** — disconnect 后 history 完整连贯 |
+| 第二轮未提到 `9973` | ✗ **FAIL** — 第一轮 history 未被正确保存 |
+| 有 assistant `status="cancelled"/"interrupted"` | ✗ **FAIL** — disconnect 触发了中断状态 |
+
+---
+
+## STEP H-5 — Session 状态结构验证：正常完成后 store 内容正确
+
+**验证：** 一次含工具调用的正常对话结束后，`/sessions/{id}/messages`
+中 assistant 消息 `status=""`，工具 part `status=completed`，
+不存在 `status=running` 的工具 part（Done 保证）。
+
+```bash
+RH5=$(curl -sN --max-time 120 -X POST http://127.0.0.1:7700/chat \
+  -H "Content-Type: application/json" \
+  -d '{"message":"Use calc to compute 42 * 100. Tell me the result.","tools":["calc"],"max_steps":3}')
+
+echo "终止事件:"
+echo "$RH5" | grep '"type":"done"\|"type":"error"' | head -1
+
+SESS_H5=$(echo "$RH5" | grep '"session_id"' | sed 's/.*"session_id":"\([^"]*\)".*/\1/' | head -1)
+echo "Session: $SESS_H5"
+
+RH5_STATE=$(curl -s "http://127.0.0.1:7700/sessions/$SESS_H5/messages")
+echo "$RH5_STATE" | python3 -c "
+import json, sys
+d = json.load(sys.stdin)
+print('messages:', d['message_count'])
+
+issues = []
+for m in d['messages']:
+    role = m['role']
+    mstatus = m.get('status', '')
+    for p in m['parts']:
+        s = p.get('summary', '')
+        # 检查工具 part 状态
+        if 'tool=' in s:
+            if 'status=running' in s:
+                issues.append(f'{role} tool part still running: {s}')
+            elif 'status=completed' in s:
+                print(f'  PASS: {role} | {s}')
+            elif 'status=error' in s and 'Interrupted=true' not in s:
+                print(f'  CHECK: {role} | {s} (tool error, not interrupt)')
+    # 检查 assistant message status
+    if role == 'assistant':
+        if mstatus == '':
+            print(f'  PASS: assistant status=empty (normal completion)')
+        else:
+            issues.append(f'assistant status={mstatus!r}')
+
+if issues:
+    print()
+    for i in issues: print(f'FAIL: {i}')
+else:
+    print()
+    print('PASS: all parts in terminal state, no running tools after Done')
+"
+```
+
+**ABORT if:** curl exit 28。
+
+**CHECK H-5 判定：**
+
+| 检查项 | 期望 | 结果 |
+|--------|------|------|
+| `done` 事件 | 存在 | PASS / FAIL |
+| `assistant status=""` | 空字符串 | PASS / FAIL |
+| `calc` tool part `status=completed` | completed | PASS / FAIL |
+| 无 `status=running` 的 tool part | 不存在 | PASS / FAIL |
+
+---
+
+## STEP H-6 — 最终 session 状态汇总
+
+```bash
+# 汇总所有测试 session 的最终状态
+for sess in "$SESS_H" "$SESS_H2" "$SESS_H4" "$SESS_H5"; do
+  echo "=== session: $sess ==="
+  curl -s "http://127.0.0.1:7700/sessions/$sess/messages" | python3 -c "
+import json, sys
+d = json.load(sys.stdin)
+print('  total messages:', d['message_count'])
+for m in d['messages']:
+    role = m['role']
+    status = m.get('status', '')
+    ptypes = [p['type'] for p in m['parts']]
+    print(f'  {role} status={status!r} parts={ptypes}')
+  " 2>/dev/null || echo "  (session not found)"
+done
+```
+
+此步骤仅供参考，无 ABORT 条件。
+
+---
+
+## H 测试报告模板
+
+```
+=== INTERRUPT-TEST STEP H REPORT ===
+Date    : <date>
+Server  : http://127.0.0.1:7700
+Session : SESS_H=<id>  SESS_H2=<id>  SESS_H4=<id>  SESS_H5=<id>
+
+H-1  断开连接隔离 (context.WithoutCancel)
+     assistant status="" after disconnect  : PASS / FAIL / INDETERMINATE
+
+H-2  慢工具存活 (slow_calc 2s, disconnect after 1s)
+     slow_calc status=completed            : PASS / FAIL / INDETERMINATE
+     assistant status="" (normal finish)   : PASS / FAIL / INDETERMINATE
+
+H-3  max_steps 正常停止 (不产生 interrupt)
+     done event received                   : PASS / FAIL
+     assistant status="" (not interrupted) : PASS / FAIL
+
+H-4  Disconnect 后续轮次连贯
+     second turn recalled code 9973        : PASS / FAIL
+     all assistant messages status=""      : PASS / FAIL
+
+H-5  Session 状态结构验证
+     done event                            : PASS / FAIL
+     assistant status=""                   : PASS / FAIL
+     calc tool status=completed            : PASS / FAIL
+     no running tool parts after Done      : PASS / FAIL
+
+VERDICT: PASS / FAIL / ABORTED at H-N
+```
+
+---
+
+## H 测试中断条件汇总
+
+| 步骤 | ABORT 触发条件 |
+|------|----------------|
+| H-0 | 服务器不健康 |
+| H-1 | curl exit 28 在 2s 强制断开之前 |
+| H-2 | curl exit 28 在 1s 强制断开之前 |
+| H-3 | curl exit 28（120s 超时） |
+| H-4 | 第二轮 curl exit 28 |
+| H-5 | curl exit 28 |
+
+---
+
+## H 测试关键代码位置
+
+| 概念 | 文件 | 位置 |
+|------|------|------|
+| `context.WithoutCancel` 屏蔽 disconnect | `cmd/knowledge-api/main.go` | `handleChat()` ctx 初始化 |
+| `slow_calc` 工具（ctx-aware 睡眠） | `cmd/knowledge-api/main.go` | `buildTestTools()` |
+| cleanup 250ms 工具超时 | `session/processor.go` | `cleanup()` |
+| `isAlreadyInterrupted()` 防竞争写 | `session/processor.go` | `executeTool()` |
+| `MessageStatus*` 常量 | `store/store.go` | `MessageStatus*` block |
+| `ToolStatus*` + `ToolPartData.Interrupted` | `store/store.go` | `ToolStatus*` block |
+| `/sessions/{id}/messages` 状态渲染 | `cmd/knowledge-api/main.go` | `handleSession()` |
