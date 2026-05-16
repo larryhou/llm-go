@@ -218,7 +218,7 @@ go run ./cmd/replay -recording debug-<ts>.ndjson -verbose
 flowchart TD
     FILE["debug-&lt;ts&gt;.ndjson"]
     LOAD["llm.NewReplayProvider(path)\nload all Records into memory"]
-    GROUP["groupTurns(records)\ndetect turn boundaries:\nnew turn when last user message changes\nsteps with no user msg → current turn"]
+    GROUP["groupTurns(records)\ndetect turn boundaries:\nnew turn when last user message changes\nsteps with no user msg → current turn\ncompaction summary steps → current turn"]
     INIT["reconstruct session config\nmodel from steps[0].Request.Model\nextraSystem from System[1:]\nprune=true, MaxSteps=20"]
     STORE["memory.Store\nsingle session ID 'replay'"]
 
@@ -245,11 +245,25 @@ flowchart TD
 
 ### Turn grouping logic
 
+A new turn begins when the last user message in `Request.Messages` changes from
+the previous step. Two special cases are merged into the **current** turn rather
+than starting a new one:
+
+1. **No user message** — step has no user message at all (rare).
+2. **Compaction summary step** — the last user message starts with
+   `session.SummaryTemplate` prefix. This step is the internal LLM call that
+   `session.Compact()` issues to generate the history summary. It must be fed to
+   the same per-turn `ReplayProvider` as the step that triggered compaction,
+   otherwise the provider runs out of steps before `Compact()` can finish.
+
 ```go
 func groupTurns(steps []llm.Record) []turnGroup {
-    // A new turn begins when the last user message in Request.Messages changes.
-    // Steps with no user message (e.g. compaction summary calls) are appended
-    // to the current turn.
+    // A new turn begins when last user message changes AND is not a summary step.
+    // Steps with no user msg or compaction summary prompt → current turn.
+}
+
+func isSummaryStep(key string) bool {
+    return strings.HasPrefix(key, session.SummaryTemplate[:60])
 }
 ```
 
@@ -305,6 +319,59 @@ func groupTurns(steps []llm.Record) []turnGroup {
 | Wiring in cmd/control | `cmd/control/main.go` | `-debug` block |
 | Turn grouping | `cmd/replay/main.go` | `groupTurns()` |
 | Config reconstruction | `cmd/replay/main.go` | model/extraSystem/sessionCfg setup |
+
+---
+
+## Verifying RC excerpt injection from the ndjson
+
+After compaction, the `PartTypeRecentContext` excerpt should appear in the
+**first step after compaction** as an extra content part on the compaction
+boundary user message. This can be verified directly from the ndjson without
+running replay:
+
+```python
+import json
+
+with open("debug-<ts>.ndjson") as f:
+    lines = f.readlines()
+
+# Find the first step whose input tokens dropped sharply (compaction happened)
+# then inspect its Request.Messages for the RC excerpt.
+for i, line in enumerate(lines):
+    rec = json.loads(line)
+    msgs = rec["request"]["Messages"]
+    for m in msgs:
+        if m.get("role") != "user":
+            continue
+        for cp in m.get("content", []):
+            text = cp.get("text", "")
+            if "以下是压缩前最近的对话原文" in text:
+                print(f"step {i+1}: RC excerpt found in boundary user message")
+                print(text[:400])
+```
+
+Expected output after a successful compaction:
+```
+step 29: RC excerpt found in boundary user message
+---
+以下是压缩前最近的对话原文：
+
+**[用户]**
+继续看下provider设计
+
+**[助手]**
+- 调用工具: read → ...
+
+**[用户]**
+把你发现的问题用规范的方式列出来...
+```
+
+The boundary user message has **two** content parts:
+1. The original user text (e.g. `"What did we do so far?"`)
+2. The RC excerpt starting with `---\n以下是压缩前最近的对话原文：`
+
+If the excerpt is missing, either compaction did not fire or `buildRecentContextExcerpt`
+produced an empty string (no user turns in `sel.RecentHead`).
 
 ---
 
