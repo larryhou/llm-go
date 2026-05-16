@@ -240,16 +240,16 @@ func runLoopInternal(ctx context.Context, s store.Store, input RunInput, h *RunH
 			return RunResultStop, fmt.Errorf("runloop: build messages: %w", err)
 		}
 
-		// On the last step, append a prefilled assistant message instructing the
-		// LLM to summarise instead of calling more tools — aligned with
-		// opencode packages/opencode/src/session/prompt.ts isLastStep handling.
+		// On the last step, append a user message instructing the LLM to
+		// summarise instead of calling more tools.
+		//
+		// NOTE: opencode's TypeScript implementation uses an assistant prefill
+		// here, but Anthropic's Messages API does not support assistant prefill
+		// in the standard (non-extended-thinking) route — the API silently
+		// returns an empty response with usage=0. Using a user message achieves
+		// the same effect and works across all providers.
 		if isLastStep {
-			modelMsgs = append(modelMsgs, llm.Message{
-				Role: "assistant",
-				Content: []llm.ContentPart{
-					{Type: "text", Text: PromptMaxSteps},
-				},
-			})
+			modelMsgs = append(modelMsgs, llm.NewUserMessage(PromptMaxSteps))
 		}
 
 		// Build system prompt
