@@ -95,138 +95,33 @@ a new test to write in STEP B.
 
 ---
 
-## STEP B — Write the boundary test file
+## STEP B — Verify boundary test file exists
 
-Write `session/interrupt_boundary_test.go` with tests for BC-1 through BC-8.
-
-Use the following template for each test. Only write tests that are NOT already
-covered by `cancel_test.go` (see the existing test list at the top of that file).
-
-```go
-package session_test
-
-import (
-    "context"
-    "sync"
-    "testing"
-    "time"
-
-    "github.com/larryhou/llm-go/llm"
-    "github.com/larryhou/llm-go/session"
-    "github.com/larryhou/llm-go/store"
-    "github.com/larryhou/llm-go/store/memory"
-    "github.com/larryhou/llm-go/tool"
-)
-
-// BC-1: Cancel while a slow tool is running (Status=running).
-// After <-h.Done, the tool part must have Status=error, Interrupted=true.
-func TestRunLoopAsync_cancelDuringToolExecution_toolMarkedInterrupted(t *testing.T) { … }
-
-// BC-2: Cancel immediately after a tool completes.
-// The race window between toolCancel() and cleanup()'s 250ms wait.
-// After <-h.Done, the completed tool part MUST still have Status=completed.
-func TestRunLoopAsync_cancelAfterToolCompletes_toolPreserved(t *testing.T) { … }
-
-// BC-3: Two consecutive cancels, then a normal turn.
-// Must produce valid alternating-role history for the third turn.
-func TestRunLoopAsync_twoConsecutiveCancels_thenNormalTurn_validHistory(t *testing.T) { … }
-
-// BC-4: Cancel during the second step of a multi-step loop.
-// First step completed normally; second step is interrupted.
-// After cancel, ListMessages must show exactly two assistant messages:
-// one with Status="" (normal) and one with Status=interrupted/cancelled.
-func TestRunLoopAsync_cancelDuringSecondStep_firstStepPreserved(t *testing.T) { … }
-
-// BC-5: Interrupted turn with all-incomplete tools → dropped from context.
-// Next turn must receive a " " placeholder assistant message, not a broken
-// assistant message with dangling tool calls.
-func TestRunLoopAsync_interruptedAllIncompleteTools_nextTurnSeesPlaceholder(t *testing.T) { … }
-
-// BC-6: Cancel after RunLoop already completed — must not panic.
-func TestRunLoopAsync_cancelAfterCompletion_noPanic(t *testing.T) { … }
-
-// BC-7: MaxSteps=1 exhausted, no cancel — Status must be "" (normal stop).
-func TestRunLoopAsync_maxStepsExhausted_notCancelled(t *testing.T) { … }
-
-// BC-8: After <-h.Done, no tool part is in Status=running.
-func TestRunLoopAsync_doneGuaranteesNoRunningToolParts(t *testing.T) { … }
-```
-
-### Provider helpers needed for BC-1, BC-2, BC-4
-
-These go at the bottom of the file, or in a `_helpers_test.go` if you prefer:
-
-```go
-// slowToolProvider emits a tool call and then blocks until ctx is cancelled,
-// simulating a slow external tool that never finishes.
-type slowToolProvider struct {
-    toolName string
-    callID   string
-    ready    chan struct{} // closed when tool call event is sent
-}
-
-func (p *slowToolProvider) ID() string { return "slow-tool" }
-func (p *slowToolProvider) Stream(ctx context.Context, _ llm.Request) (<-chan llm.Event, error) {
-    ch := make(chan llm.Event, 8)
-    go func() {
-        defer close(ch)
-        ch <- llm.Event{Type: llm.EventRequestStart}
-        ch <- llm.Event{Type: llm.EventStepStart}
-        ch <- llm.Event{Type: llm.EventToolInputStart, ToolName: p.toolName, ToolCallID: p.callID}
-        ch <- llm.Event{Type: llm.EventToolCall, ToolName: p.toolName, ToolCallID: p.callID,
-            Input: map[string]any{"arg": "value"}}
-        ch <- llm.Event{Type: llm.EventStepFinish, Usage: llm.TokenUsage{Input: 5, Output: 2},
-            FinishReason: llm.FinishReasonToolCalls}
-        ch <- llm.Event{Type: llm.EventRequestFinish, FinishReason: llm.FinishReasonToolCalls}
-        if p.ready != nil {
-            close(p.ready)
-        }
-        <-ctx.Done()
-    }()
-    return ch, nil
-}
-
-// twoStepProvider emits step 1 (text), then calls a tool in step 2, then blocks.
-// Used to test cancel-during-second-step scenarios.
-type twoStepProvider struct {
-    step1Text string
-    toolName  string
-    callID    string
-    step2Ready chan struct{} // closed when step 2 tool call event is sent
-}
-```
-
-**Important implementation notes:**
-
-- For **BC-1**: the tool must actually be registered with the `RunInput.Tools`
-  slice. Use a `tool.Tool` implementation that blocks until ctx is cancelled.
-  Then `Cancel()` after the `slowToolProvider.ready` channel is closed.
-  After `<-h.Done`, check that the part has `Status=store.ToolStatusError`
-  and `data.Interrupted == true`.
-
-- For **BC-2**: use the same `slowToolProvider` but register a **fast tool**
-  that completes in <1ms. Cancel immediately after the `ready` channel closes.
-  Verify that the part that completed keeps `Status=store.ToolStatusCompleted`.
-
-- For **BC-3** and **BC-5**: use the existing `captureProvider` pattern from
-  `cancel_test.go:496` to inspect the LLM request after the third turn.
-
-- For **BC-4**: use a `twoStepProvider` where step 1 completes and step 2
-  triggers a tool call, then blocks. Cancel after `step2Ready` closes.
-  After `<-h.Done`, `ListMessages` should return 2 assistant messages.
-
-- For **BC-7**: confirm `h.Err == nil` (no error) and `h.Result ==
-  session.RunResultStop` after `<-h.Done`. Message status must be `""`.
-
----
-
-## STEP C — Build the test file
+All BC-1 through BC-8 tests (plus STEP F's `TestMarkAssistantCancelled_emptyTextPart`)
+are pre-written in `session/interrupt_boundary_test.go`. Verify the file is present
+and the package builds:
 
 ```bash
-go build ./session/... 2>&1
+go build ./session/... && echo "BUILD OK"
 ```
 
-**ABORT if:** build fails. Fix errors before proceeding.
+**ABORT if:** build fails.
+
+The tests in that file cover:
+
+| Test function | BC |
+|---------------|----|
+| `TestRunLoopAsync_cancelDuringToolExecution_toolMarkedInterrupted` | BC-1 |
+| `TestRunLoopAsync_cancelAfterToolCompletes_toolPreserved` | BC-2 |
+| `TestRunLoopAsync_twoConsecutiveCancels_thenNormalTurn_validHistory` | BC-3 |
+| `TestRunLoopAsync_cancelDuringSecondStep_firstStepPreserved` | BC-4 |
+| `TestRunLoopAsync_interruptedAllIncompleteTools_nextTurnSeesPlaceholder` | BC-5 |
+| `TestRunLoopAsync_cancelAfterCompletion_noPanic` | BC-6 |
+| `TestRunLoopAsync_maxStepsExhausted_notCancelled` | BC-7 |
+| `TestRunLoopAsync_doneGuaranteesNoRunningToolParts` | BC-8 |
+| `TestMarkAssistantCancelled_emptyTextPart` | STEP F |
+
+If the file is missing or incomplete, write the missing tests before proceeding.
 
 ---
 
@@ -315,63 +210,136 @@ go test ./session/... -run "TestRunLoopAsync_doneAfterStoreConsistent" \
 
 ---
 
-## STEP H — HTTP layer isolation: disconnect does NOT cancel RunLoop
+## STEP H — HTTP 对话式中断 E2E 测试
 
-This is a documentation/verification test. Since `handleChat` uses
-`context.WithoutCancel(r.Context())`, the RunLoop is deliberately shielded
-from HTTP client disconnects.
+通过 `/chat` HTTP 接口验证对话式中断的全链路行为。
 
-**Verification procedure** (requires server running):
+> **执行方式：** 参考 compact-test skill 的风格——实时消费每轮的 SSE 流，
+> 流结束即验证，agent 自主选择实现手段（curl、脚本、工具调用均可）。
+> 不依赖 sleep + 轮询。
+
+### 服务器
+
+```
+Base URL : http://127.0.0.1:7700
+```
+
+启动方式（若未运行）：
 
 ```bash
-# Start server if not running
-# LLM connection — resolved in this order:
-#   1. Environment variables (preferred):
-#        TIMI_PROVIDER  — "openai" or "anthropic"  (default: anthropic)
-#        TIMI_BASE_URL  — provider base URL
-#        TIMI_API_KEY   — API key
-#        TIMI_MODEL     — model ID                  (default: claude-sonnet-4.6)
-#   2. Hardcoded defaults in cmd/knowledge-api/main.go (flag.StringVar lines)
-#   3. If still unresolved (e.g. main.go defaults unavailable), ask the user.
-
 lsof -ti:7700 | xargs kill -9 2>/dev/null; sleep 1
-nohup go run ./cmd/knowledge-api/ \
-  -skills .opencode -addr 127.0.0.1:7700 \
+nohup go run ./cmd/knowledge-api/ -skills .opencode -addr 127.0.0.1:7700 \
   > /tmp/kapi.log 2>&1 &
 sleep 6 && curl -s http://127.0.0.1:7700/health
 ```
 
-**Procedure:**
+LLM 连接通过环境变量 `TIMI_PROVIDER` / `TIMI_BASE_URL` / `TIMI_API_KEY` / `TIMI_MODEL` 配置，
+或读取 `cmd/knowledge-api/main.go` 中的默认值。
 
-```bash
-SESS_H="itest-$(date +%s)"
+**ABORT if:** `/health` 响应不含 `"status":"ok"`。
 
-# Start a long-running turn and kill curl after 2 seconds
-timeout 2 curl -sN --max-time 30 -X POST http://127.0.0.1:7700/chat \
-  -H "Content-Type: application/json" \
-  -d "{\"message\":\"Count from 1 to 100, one number per line.\",\"session_id\":\"$SESS_H\",\"context_limit\":20000,\"tools\":[],\"max_steps\":2}" \
-  || true   # timeout/kill is expected, not an error
+---
 
-# Wait for server to finish (it should, despite disconnect)
-sleep 10
+### 测试序列
 
-# Check session state
-curl -s http://127.0.0.1:7700/sessions/$SESS_H/messages | python3 -c "
-import json,sys
-d=json.load(sys.stdin)
-print('messages:', d['message_count'])
-for m in d['messages']:
-    role = m['role']
-    status = m.get('status','')
-    ptypes = [p['type'] for p in m['parts']]
-    print(f'  {role} status={status!r} parts={ptypes}')
-"
+使用同一 session（格式 `hmix-<timestamp>`）贯穿全部轮次。
+三种中断类型各出现**两次**，顺序随机打乱，中间穿插正常轮次植入和验证锚点。
+
+| 轮次 | 类型 | 目的 | 关键数值 |
+|------|------|------|----------|
+| T1 | **normal** | `calc(7*8)` | 植入锚点 **56** |
+| T2 | **cancelled** | LLM 响应前中断（0.3s 内发下一轮） | — |
+| T2-int | **normal** | 验证 cancelled 后 history 连贯 | 回复应含 **56** |
+| T3 | **normal** | `counter set anchor=9973` | 植入锚点 **9973** |
+| T4 | **interrupted+tool** | `calc(99*99)` 后让 LLM 写长文；在 tool_result 出现、LLM step-2 开始输出后发下一轮 | — |
+| T4-int | **normal** | 验证 tool 结果保留 | 回复应含 **9801** |
+| T5 | **normal** | `calc(12*34)` | 植入锚点 **408** |
+| T6 | **interrupted-text** | 让 LLM 写长文；第一个 text delta 出现后发下一轮 | — |
+| T6-int | **normal** | 验证 history 连贯 | 回复应含 **9973** |
+| T7 | **cancelled** | 再次在 LLM 响应前中断 | — |
+| T7-int | **normal** | 验证多锚点均可知 | 回复应含 **56** 和 **408** |
+| T8 | **interrupted+tool** | `calc(56+408)` 后让 LLM 写长文；tool_result 后 step-2 开始时发下一轮 | — |
+| T8-int | **normal** | 验证 tool 结果保留 | 回复应含 **464** |
+| T9 | **interrupted-text** | 再次在 text streaming 时中断 | — |
+| T9-int | **normal** | 验证三个锚点均可知 | 回复应含 **56**、**9973**、**408** |
+| T10 | **normal（CRITICAL）** | 要求 LLM 列出本会话所有 calc 结果和 counter 值 | 必须含 **56 / 9801 / 408 / 464 / 9973** |
+
+---
+
+### 执行规则
+
+1. 按顺序执行，不得跳过或重排。
+2. 每步检查 ABORT 条件；触发则立即停止并报告 `ABORTED at T<N>: <原因>`。
+3. 每次 `/chat` 请求超时 120 秒。
+4. 中断场景：被中断的轮次**后台**发出，中断触发请求（下一轮）**同步等待完成**并即时验证 SSE 输出。
+5. 若 interrupted+tool 场景中 LLM 未调用工具（`tool_result` 未出现），agent 自行判断并记为 `SKIPPED`，继续下一步。
+6. 服务器日志 `/tmp/kapi.log` 中可用 `[INTERRUPT]` 关键字确认中断触发。
+
+---
+
+### 中断触发时机说明
+
+| 类型 | 何时发送下一轮请求 |
+|------|--------------------|
+| **cancelled** | T 轮请求发出后约 0.3s 内立即发，LLM 尚未响应 |
+| **interrupted-text** | 监测 T 轮 SSE 流，出现第一个 `"type":"text"` 事件后立即发 |
+| **interrupted+tool** | 监测 T 轮 SSE 流，出现 `"type":"tool_result"` 且随后出现 `"type":"text"`（LLM step-2 开始）后立即发 |
+
+---
+
+### 每轮验证要点
+
+每轮（包括中断触发轮）结束后即时检查：
+
+1. **SSE 终止事件**：含 `"type":"done"` → 正常完成；含 `"type":"error"` → 需检查原因
+2. **SSE 文本内容**：中断触发轮的回复是否含预期锚点数值
+3. **store 状态**（可选，辅助确认）：`GET /sessions/$SESS/messages` 查看 assistant `status` 字段
+
+---
+
+### STEP H 最终断言（T10 后执行）
+
+查询 `GET /sessions/$SESS/messages`，对 assistant 消息序列验证：
+
+| 断言 | 期望 |
+|------|------|
+| `cancelled` 出现次数 | ≥ 2 |
+| `interrupted` 且含 tool part | ≥ 1 次 |
+| `interrupted` 且含 text part | ≥ 1 次 |
+| `status=''`（正常完成）出现次数 | ≥ 6 |
+| 最后一轮 assistant status | `''`（正常完成） |
+
+**CRITICAL：** T10 的 SSE 文本同时含 `56`、`9801`、`408`、`464`、`9973` → PASS
+
+---
+
+### STEP H 测试报告模板
+
 ```
+=== INTERRUPT-TEST STEP H REPORT ===
+Date    : <date>
+Session : <SESS>
 
-**CHECK H:**
-- Assistant message has `status=""` (not `"cancelled"` or `"interrupted"`) → ✓ PASS: `context.WithoutCancel` worked; RunLoop completed despite disconnect
-- Assistant message has `status="cancelled"` or `status="interrupted"` → ✗ FAIL: HTTP disconnect propagated to RunLoop — check `context.WithoutCancel` in `handleChat`
-- No assistant message at all → INDETERMINATE: server may still be processing; increase `sleep` and retry
+T1  normal  calc(7*8)=56                         : PASS / FAIL
+T2  cancelled + T2-int recalled 56               : PASS / FAIL
+T3  normal  counter anchor=9973                  : PASS / FAIL
+T4  interrupted+tool + T4-int recalled 9801      : PASS / FAIL / SKIPPED
+T5  normal  calc(12*34)=408                      : PASS / FAIL
+T6  interrupted-text + T6-int recalled 9973      : PASS / FAIL
+T7  cancelled + T7-int recalled 56+408           : PASS / FAIL
+T8  interrupted+tool + T8-int recalled 464       : PASS / FAIL / SKIPPED
+T9  interrupted-text + T9-int recalled 56/9973/408 : PASS / FAIL
+T10 CRITICAL: recalled 56/9801/408/464/9973      : PASS / FAIL
+
+Structure (final store):
+  cancelled × 2              : PASS / FAIL
+  interrupted+tool × 1       : PASS / FAIL
+  interrupted+text × 1       : PASS / FAIL
+  normal ≥ 6                 : PASS / FAIL
+  last turn normal            : PASS / FAIL
+
+VERDICT: PASS / FAIL / ABORTED at T<N>
+```
 
 ---
 
@@ -412,12 +380,18 @@ STEP F — emptyTextPart classification:    PASS / FAIL
 
 STEP G — race detector (×10 runs):        PASS / FAIL
 
-STEP H — HTTP Chat interrupt tests:
-  H-1  disconnect isolation             : PASS / FAIL / INDETERMINATE
-  H-2  slow tool survives disconnect    : PASS / FAIL / INDETERMINATE
-  H-3  max_steps normal stop (no interrupt) : PASS / FAIL
-  H-4  disconnect then next turn clean  : PASS / FAIL
-  H-5  session state after normal turn  : PASS / FAIL
+STEP H — HTTP 对话式中断 E2E:
+  T1  normal calc(7*8)=56                      : PASS / FAIL
+  T2  cancelled + T2-int recalled 56           : PASS / FAIL
+  T3  normal counter anchor=9973               : PASS / FAIL
+  T4  interrupted+tool + T4-int recalled 9801  : PASS / FAIL / SKIPPED
+  T5  normal calc(12*34)=408                   : PASS / FAIL
+  T6  interrupted-text + T6-int recalled 9973  : PASS / FAIL
+  T7  cancelled + T7-int recalled 56+408       : PASS / FAIL
+  T8  interrupted+tool + T8-int recalled 464   : PASS / FAIL / SKIPPED
+  T9  interrupted-text + T9-int 56/9973/408    : PASS / FAIL
+  T10 CRITICAL: recalled 56/9801/408/464/9973  : PASS / FAIL
+  Structure: cancelled×2 / int+tool×1 / int+text×1 / normal≥6 / last-normal : PASS / FAIL
 
 STEP I — final full suite:                PASS / ABORT
 
@@ -465,518 +439,185 @@ VERDICT: PASS / FAIL / ABORTED at step N
 | `executeTool` could overwrite `Interrupted=true` set by cleanup's 250ms timeout | Added `isAlreadyInterrupted()` guard in `session/processor.go` before writing tool result | `da15367` |
 | RunLoop continued iterating after Cancel() when cleanup ran its 250ms wait (Process returned nil error) | Added `ctx.Err()` check after `Process()` returns in `runLoopInternal` | `da15367` |
 | DATA RACE in `countingTool.Execute` (test helper) — `calls` field written by concurrent goroutines | Added `sync.Mutex` to `countingTool` | `da15367` |
+| `handleSession` response missing `status` field | Added `Status string` to `msgSummary` in `cmd/knowledge-api/main.go` | — |
+| `handleSession` response missing `Interrupted=true` flag on tool parts | Added `Interrupted=true` suffix to tool part summary | — |
+| `handleChat` used synchronous `session.RunLoop` — impossible to cancel in-flight turn via second `/chat` | Replaced with `RunLoopAsync`; added `activeHandle *session.RunHandle` to `chatSession` | — |
+| **`" "` space placeholder injected as assistant content after cancelled/error turns — proxies reject whitespace-only assistant content (400/EOF)** | **Root fix: pre-filter cancelled/error user+assistant pairs before building model messages in `ToModelMessages`. `cancelled` and `error` (no content) pairs are dropped entirely, never entering the alternating-role logic that inserts `" "`.** | — |
+| LLM transport error left assistant `Message.Error=nil` — errored message looked like normal empty turn, consecutive-user guard kept inserting `" "` on every retry | Set `Message.Error` in `runLoopInternal` when `Process()` returns error and `ctx.Err()==nil` | — |
 
 ---
 
-# HTTP Chat 中断测试 (STEP H)
+## " " Placeholder Bug (proxy rejects whitespace-only assistant content)
 
-通过 `/chat` HTTP 接口验证中断相关行为。
+**症状：** 同一 session 内，cancel 或 LLM 错误之后，后续所有请求持续返回
+`unexpected EOF`（实际是代理返回 400/422，SDK 解析成 EOF）。
 
-> **为什么使用动态 curl 测试而非固定脚本？**
-> `RunLoopAsync.Cancel()` 在 HTTP 层不可调用（无 `/cancel` 端点），且
-> `context.WithoutCancel` 屏蔽了 HTTP disconnect 对 RunLoop 的影响。
-> 因此 HTTP 层的"中断"只能通过 **连接超时/断开** 和 **max_steps** 间接观察，
-> 需要结合 `/sessions/{id}/messages` 检查 store 内的 status 字段来判定。
+**诊断过程：**
+1. 添加 HTTP middleware 打印 request body → 发现 `messages` 里有 `{"role":"assistant","content":[{"text":" "}]}`
+2. 代理端验证：纯空白 assistant content 被拒绝
 
----
+**根本原因：**
 
-## 执行规则
+`ToModelMessages` 在 `cancelled` assistant 被跳过后，两个相邻 user 消息触发
+consecutive-role guard，插入 `" "` 占位符。这是为了满足 Anthropic/OpenAI 的
+alternating-role 协议。但 `" "` 本身被代理拒绝，导致下一轮失败，再产生新的
+errored assistant，再次触发 guard 插入新的 `" "`，形成自我强化的失败循环。
 
-**必须遵守，否则测试无效：**
+**修复（源头，非后处理）：**
 
-1. **按顺序执行每个步骤**，不得跳过或重排。
-2. **每步检查 ABORT 条件**，触发则立即停止并报告 `ABORTED at H-N: <原因>`。
-3. **将每次 curl 响应保存在命名变量** (`RH1`, `RH2`, …)。
-4. **每次请求超时 120 秒** (`--max-time 120`)。curl 退出码 28 = ABORT。
-5. **使用 `$SESS_H` 贯穿所有 `/chat` 调用**，不得中途更换。
-6. 测试结束后打印结构化 **H 测试报告**（见本节末尾）。
+在 `ToModelMessages` 入口处做一次预过滤：
 
----
-
-## 服务器启动
-
-```bash
-# LLM 连接解析顺序：
-#   1. 环境变量（优先）：
-#        TIMI_PROVIDER  — "openai" 或 "anthropic"  (默认: anthropic)
-#        TIMI_BASE_URL  — provider base URL
-#        TIMI_API_KEY   — API key
-#        TIMI_MODEL     — 模型 ID                  (默认: claude-sonnet-4.6)
-#   2. cmd/knowledge-api/main.go 中 flag.StringVar 的硬编码默认值
-#   3. 以上均不可用时询问用户
-
-lsof -ti:7700 | xargs kill -9 2>/dev/null; sleep 1
-nohup go run ./cmd/knowledge-api/ \
-  -skills .opencode -addr 127.0.0.1:7700 \
-  > /tmp/kapi.log 2>&1 &
-sleep 6 && curl -s http://127.0.0.1:7700/health
+```go
+// Pre-filter: remove user+assistant pairs where assistant never produced content.
+filtered := make([]*store.Message, 0, len(msgs))
+for i := 0; i < len(msgs); i++ {
+    m := msgs[i]
+    if m.Role == store.RoleAssistant {
+        ps := parts[m.ID]
+        drop := m.Status == store.MessageStatusCancelled ||
+                (m.Error != nil && !hasRealContent(ps))
+        if drop {
+            if len(filtered) > 0 && filtered[len(filtered)-1].Role == store.RoleUser {
+                filtered = filtered[:len(filtered)-1]  // drop preceding user too
+            }
+            continue
+        }
+    }
+    filtered = append(filtered, m)
+}
 ```
 
-健康响应：`{"status":"ok","doc_count":N,"session_count":N}`
+这样 `cancelled`/`error` 的 user+assistant 对在进入 alternating-role 逻辑之前
+就已移除，guard 永远看不到相邻 user 消息，`" "` 不会被插入。
 
-**ABORT if:** 响应不含 `"status":"ok"`。
+**`" "` 保留的场景：** `interrupted` 且 `buildAssistantPartsInterrupted` 返回空
+（所有 tool 均不完整）时，guard 仍可能插入 `" "`。但这种情况代理是否拒绝未验证；
+若需要，可对此路径也做预过滤。
 
 ---
 
-## STEP H-0 — 服务器健康检查
+## Conversational Interrupt via /chat (对话式中断)
 
-```bash
-curl -s --max-time 10 http://127.0.0.1:7700/health
+### 机制
+
+`handleChat` 现在使用 `RunLoopAsync`，并在 `chatSession` 里存储当前的 `RunHandle`。
+每次新的 `/chat` 请求进来时，若同一 session 有正在运行的 handle，先调用 `prev.Cancel()`
+再启动新轮。这实现了**对话式中断**：用户发新消息即可中止上一轮正在进行的 LLM turn。
+
+```
+第一轮 /chat → RunLoopAsync → handle A → sess.activeHandle = A
+                              LLM 流式输出中...
+第二轮 /chat → Cancel(A) → RunLoopAsync → handle B → sess.activeHandle = B
+              ↑ [INTERRUPT] 日志
+              第一轮 → status='interrupted'（store）
 ```
 
-**ABORT if:** 响应不含 `"status":"ok"`。
+### 关键日志锚点
 
----
+服务器日志（`/tmp/kapi.log`）中观察：
 
-## STEP H-1 — 断开连接隔离：RunLoop 不受 HTTP disconnect 影响
+```
+[TURN-START] session=<id> handle=0x...      ← 第一轮开始
+[INTERRUPT]  session=<id> new message arrived — cancelling previous turn  ← Cancel 触发
+[TURN-START] session=<id> handle=0x...      ← 第二轮开始（新 handle）
+[TURN-DONE]  session=<id> handle=0x... result=stop err=llm error [transport]: context canceled  ← 第一轮结束
+[TURN-DONE]  session=<id> handle=0x... result=... err=<nil>  ← 第二轮结束
+```
 
-**验证核心不变式：** `context.WithoutCancel` 保证 HTTP 客户端断开后，
-服务端 RunLoop 仍正常完成，session store 中留下完整 assistant 消息（`status=""`）。
+### 可中断的场景
+
+| 场景 | 是否可对话式中断 | 说明 |
+|------|-----------------|------|
+| LLM 正在流式输出文字 | ✓ **可以** | Cancel 取消 LLM stream，`status=interrupted` |
+| LLM 正在等待 tool 执行 | ✓ **可以** | Cancel → `toolCancel()` → 工具被截断，`status=interrupted` |
+| Tool 执行耗时 < 250ms | ✓ 工具完成，LLM 下一步被取消 | |
+| Tool 执行耗时 > 250ms | ✓ 工具被 cleanup 250ms 超时截断，`Interrupted=true` | |
+
+### 无法通过 HTTP disconnect 中断
+
+`handleChat` 使用 `context.WithoutCancel(r.Context())`，HTTP 客户端断开连接**不会**
+取消 RunLoop。只有发送新的 `/chat` 消息（触发 `prev.Cancel()`）才能中断。
+
+### long_task 工具的行为说明
+
+`long_task`（30 秒阻塞）被 LLM 调用后，LLM stream 在发出 `tool_call` 事件后就结束
+（`FinishReason=tool_calls`），随即 `cleanup()` 调用 `toolCancel()`，工具在 250ms
+宽限期内被截断——**这发生在第二轮消息进来之前，不是对话式中断触发的**。
+
+对话式中断触发的是 **LLM 流式输出阶段**（在 tool_call 之前，或在收到 tool result 后
+LLM 开始第二步输出时）。
+
+### 验证脚本
 
 ```bash
-SESS_H="itest-$(date +%s)"
-echo "SESSION: $SESS_H"
+SESS="itest-interrupt-$(date +%s)"
 
-# 启动请求后 2 秒强制断开（用 timeout 模拟客户端离开）
-timeout 2 curl -sN --max-time 30 -X POST http://127.0.0.1:7700/chat \
+# 第一轮后台：LLM 写长文（不调工具）
+curl -sN --max-time 120 -X POST http://127.0.0.1:7700/chat \
   -H "Content-Type: application/json" \
-  -d "{\"message\":\"Please count from 1 to 20, one number per line, slowly.\",\"session_id\":\"$SESS_H\",\"context_limit\":20000,\"tools\":[],\"max_steps\":2}" \
-  || true   # timeout/kill 是预期的，不是错误
+  -d "{\"message\":\"Write a very long essay (500+ words) about computing history.\",
+       \"session_id\":\"$SESS\",\"tools\":[],\"max_steps\":1}" \
+  > /tmp/turn1_sse.txt 2>&1 &
+TURN1_PID=$!
 
-# 等待服务端完成（RunLoop 在后台继续运行）
-echo "等待服务端完成（约 15 秒）..."
-sleep 15
+# 等 LLM 开始输出（第一个 text delta 出现）
+for i in $(seq 1 10); do
+  sleep 1
+  grep -q '"type":"text"' /tmp/turn1_sse.txt && { echo "LLM started at T+${i}s"; break; }
+done
 
-# 检查 session 状态
-RH1_STATE=$(curl -s http://127.0.0.1:7700/sessions/$SESS_H/messages)
-echo "$RH1_STATE" | python3 -c "
-import json, sys
-d = json.load(sys.stdin)
-print('messages:', d['message_count'])
-for m in d['messages']:
-    role = m['role']
-    status = m.get('status', '')
-    ptypes = [p['type'] for p in m['parts']]
-    summaries = [p.get('summary','') for p in m['parts']]
-    print(f'  {role} status={status!r} parts={ptypes}')
-    for s in summaries:
-        if s: print(f'    {s[:100]}')
-"
-```
-
-**ABORT if:** curl timeout（exit 28）在 2 秒强制断开之前触发（说明服务未启动）。
-
-**CHECK H-1:**
-
-```bash
-echo "$RH1_STATE" | python3 -c "
-import json, sys
-d = json.load(sys.stdin)
-msgs = d['messages']
-assistant_msgs = [m for m in msgs if m['role'] == 'assistant']
-if not assistant_msgs:
-    print('INDETERMINATE: no assistant message yet (server still processing?)')
-    sys.exit(0)
-last = assistant_msgs[-1]
-status = last.get('status', '')
-if status == '':
-    print('PASS: assistant status=empty (normal completion despite disconnect)')
-elif status in ('cancelled', 'interrupted'):
-    print(f'FAIL: assistant status={status!r} — HTTP disconnect propagated to RunLoop!')
-    print('Check: context.WithoutCancel in handleChat')
-else:
-    print(f'UNKNOWN: assistant status={status!r}')
-"
-```
-
-| 结果 | 含义 |
-|------|------|
-| `status=""` | ✓ **PASS** — `context.WithoutCancel` 生效，RunLoop 正常完成 |
-| `status="cancelled"` 或 `"interrupted"` | ✗ **FAIL** — disconnect 传播到了 RunLoop |
-| 无 assistant 消息 | **INDETERMINATE** — 增加 sleep 时间后重试（最多 2 次） |
-
----
-
-## STEP H-2 — 慢工具存活：disconnect 期间工具继续执行直到完成
-
-**验证：** 客户端断开时 `slow_calc` 工具（睡 2 秒）能正常完成，
-结果写入 store，不被 cleanup 的 250ms 超时截断。
-
-> **原理：** `slow_calc` 用 `select { case <-time.After(2s): case <-ctx.Done(): }`
-> 实现。`context.WithoutCancel` 保证工具 ctx 不会因 HTTP disconnect 取消，
-> 所以工具能跑完整 2 秒。
-
-```bash
-SESS_H2="itest-slow-$(date +%s)"
-
-# 启动后 1 秒断开（工具还在睡眠中）
-timeout 1 curl -sN --max-time 30 -X POST http://127.0.0.1:7700/chat \
+# 第二轮：触发中断
+curl -sN --max-time 30 -X POST http://127.0.0.1:7700/chat \
   -H "Content-Type: application/json" \
-  -d "{\"message\":\"Use slow_calc to compute 13 * 17. Please wait for the result.\",\"session_id\":\"$SESS_H2\",\"context_limit\":20000,\"tools\":[\"slow_calc\"],\"max_steps\":3}" \
-  || true
+  -d "{\"message\":\"Stop. Just say OK.\",\"session_id\":\"$SESS\",\"tools\":[],\"max_steps\":1}"
 
-# 等待工具完成 + RunLoop 结束（工具需 2s，再加处理时间）
-echo "等待慢工具完成（约 10 秒）..."
-sleep 10
+wait $TURN1_PID 2>/dev/null
 
-RH2_STATE=$(curl -s http://127.0.0.1:7700/sessions/$SESS_H2/messages)
-echo "$RH2_STATE" | python3 -c "
-import json, sys
-d = json.load(sys.stdin)
-print('messages:', d['message_count'])
-for m in d['messages']:
-    role = m['role']
-    status = m.get('status', '')
-    for p in m['parts']:
-        s = p.get('summary', '')
-        if 'tool=' in s:
-            print(f'  {role} status={status!r} | {s}')
-        elif s:
-            print(f'  {role} status={status!r} | text: {s[:80]}')
-"
-```
+# 验证日志
+grep -E "INTERRUPT|TURN-DONE" /tmp/kapi.log | tail -4
 
-**CHECK H-2:**
-
-```bash
-echo "$RH2_STATE" | python3 -c "
-import json, sys
-d = json.load(sys.stdin)
-msgs = d['messages']
-
-# 找 slow_calc 工具 part
-tool_parts = []
-for m in msgs:
-    for p in m['parts']:
-        s = p.get('summary', '')
-        if 'tool=slow_calc' in s:
-            tool_parts.append((m['role'], m.get('status',''), s))
-
-if not tool_parts:
-    print('INDETERMINATE: no slow_calc tool part found (LLM may not have called it yet)')
-    sys.exit(0)
-
-for role, mstatus, summary in tool_parts:
-    print(f'slow_calc part: {summary}')
-    if 'status=completed' in summary:
-        print('PASS: slow_calc completed — tool survived disconnect (context.WithoutCancel working)')
-    elif 'status=error' in summary:
-        # 可能是工具执行出错（不是 interrupt）
-        print(f'CHECK: slow_calc status=error — verify Interrupted field')
-    else:
-        print(f'UNKNOWN: {summary}')
-
-# 检查 assistant 消息的 status
-assistant_msgs = [m for m in msgs if m['role'] == 'assistant']
-if assistant_msgs:
-    last_status = assistant_msgs[-1].get('status', '')
-    if last_status == '':
-        print('PASS: assistant message completed normally')
-    else:
-        print(f'FAIL: assistant status={last_status!r} — unexpected interrupt')
-"
-```
-
-| 结果 | 含义 |
-|------|------|
-| `slow_calc status=completed` + `assistant status=""` | ✓ **PASS** — 工具在 disconnect 后存活 |
-| `slow_calc status=error` (Interrupted=true) | ✗ **FAIL** — 工具被 cleanup 250ms 截断；检查 `context.WithoutCancel` |
-| 无 slow_calc part | **INDETERMINATE** — LLM 可能未调用工具；增加 sleep 重试 |
-
----
-
-## STEP H-3 — max_steps 正常停止：不产生 interrupt/cancelled 状态
-
-**验证：** `max_steps=1` 不是中断，是正常停止。
-assistant 消息 `status=""` 且 SSE 流有 `"type":"done"` 事件。
-
-```bash
-RH3=$(curl -sN --max-time 120 -X POST http://127.0.0.1:7700/chat \
-  -H "Content-Type: application/json" \
-  -d '{"message":"Use calc for 2+2, then calc for 3+3, then calc for 4+4. Do all three.","tools":["calc"],"max_steps":1}')
-
-echo "Terminal event:"
-echo "$RH3" | grep '"type":"done"\|"type":"error"' | head -1
-
-SESS_H3=$(echo "$RH3" | grep '"session_id"' | sed 's/.*"session_id":"\([^"]*\)".*/\1/' | head -1)
-echo "Session: $SESS_H3"
-```
-
-**ABORT if:** curl exit 28（超时）。
-
-**CHECK H-3:**
-
-```bash
-echo "$RH3" | python3 -c "
-import json, sys
-lines = sys.stdin.read()
-# 检查终止事件
-if '\"type\":\"done\"' in lines:
-    print('PASS: done event received (normal stop)')
-elif '\"type\":\"error\"' in lines:
-    print('CHECK: error event — may be doom-loop or LLM error; check content')
-else:
-    print('FAIL: no terminal event')
-    sys.exit(1)
-
-# 统计 tool_call 数量
-tc = lines.count('\"type\":\"tool_call\"')
-print(f'tool_call events: {tc} (max_steps=1 limits LLM turns, not individual calls)')
-"
-
-# 检查 session store：assistant 消息 status 必须为空（正常完成）
-RH3_STATE=$(curl -s "http://127.0.0.1:7700/sessions/$SESS_H3/messages")
-echo "$RH3_STATE" | python3 -c "
+# 验证 store 状态
+curl -s "http://127.0.0.1:7700/sessions/$SESS/messages" | python3 -c "
 import json, sys
 d = json.load(sys.stdin)
 for m in d['messages']:
     if m['role'] == 'assistant':
         status = m.get('status', '')
-        if status == '':
-            print(f'PASS: assistant status=empty — max_steps stop is NOT an interrupt')
-        else:
-            print(f'FAIL: assistant status={status!r} — max_steps incorrectly produced interrupt state')
+        print(f'assistant status={status!r}')
+        # 期望第一轮: interrupted, 第二轮: ''
 "
 ```
 
-| 结果 | 含义 |
-|------|------|
-| `done` 事件 + `assistant status=""` | ✓ **PASS** — max_steps 是正常停止，非中断 |
-| `assistant status="interrupted"` 或 `"cancelled"` | ✗ **FAIL** — max_steps 被误分类为中断 |
+**期望结果：**
+- 服务器日志出现 `[INTERRUPT]`
+- 第一轮 assistant `status='interrupted'`
+- 第二轮 assistant `status=''`（正常完成）或第二轮本身也因 LLM 问题失败
 
 ---
 
-## STEP H-4 — Disconnect 后续轮次连贯：第一轮断开不污染 history
+## Lessons Learned (from test run)
 
-**验证：** 第一轮被 disconnect（服务端完成后 status=""），
-第二轮能正常看到第一轮的结果并继续对话。
+### macOS: `timeout` 命令不可用
 
-```bash
-SESS_H4="itest-cont-$(date +%s)"
+macOS 上没有 GNU `timeout` 命令，用 `curl --max-time N` 代替。
 
-# 第一轮：植入锚点 9973，然后 disconnect
-timeout 2 curl -sN --max-time 30 -X POST http://127.0.0.1:7700/chat \
-  -H "Content-Type: application/json" \
-  -d "{\"message\":\"Remember the special code 9973. Use counter to set key anchor=9973. Confirm.\",\"session_id\":\"$SESS_H4\",\"context_limit\":20000,\"tools\":[\"counter\"],\"max_steps\":3}" \
-  || true
+### SSE `"type":"done"` 不等于 LLM 内容正确
 
-echo "等待第一轮完成（约 15 秒）..."
-sleep 15
+SSE 流以 `done` 结束只说明 RunLoop 正常退出，不代表 LLM 成功响应了内容。
+LLM 调用因 401/网络错误失败时，RunLoop 同样以 `done` 正常结束（错误通过 `"type":"error"` 事件上报）。
+验证 LLM 确实响应时，还需检查文本内容或 tool 调用是否出现。
 
-# 检查第一轮状态
-RH4_STATE1=$(curl -s "http://127.0.0.1:7700/sessions/$SESS_H4/messages")
-echo "第一轮后 session 状态:"
-echo "$RH4_STATE1" | python3 -c "
-import json, sys
-d = json.load(sys.stdin)
-print('messages:', d['message_count'])
-for m in d['messages']:
-    print(f'  {m[\"role\"]} status={m.get(\"status\",\"\")!r}')
-    for p in m['parts']:
-        s = p.get('summary','')
-        if s: print(f'    {s[:100]}')
-"
+### 代理服务器 X-Api-Key vs Authorization: Bearer
 
-# 第二轮：正常请求，验证 LLM 能回忆第一轮内容
-RH4=$(curl -sN --max-time 120 -X POST http://127.0.0.1:7700/chat \
-  -H "Content-Type: application/json" \
-  -d "{\"message\":\"What was the special code I gave you? And what is the current value of counter key anchor?\",\"session_id\":\"$SESS_H4\",\"context_limit\":20000,\"tools\":[\"counter\"],\"max_steps\":3}")
+`provider/anthropic` 使用 `option.WithAPIKey` → header 为 `X-Api-Key: <key>`。
+部分反向代理只识别 `Authorization: Bearer <key>`，会对 `X-Api-Key` 返回 401。
+若遇到此问题应修复代理配置，不要修改 SDK 的 header 策略。
 
-echo "第二轮终止事件:"
-echo "$RH4" | grep '"type":"done"\|"type":"error"' | head -1
-```
+### cleanup 250ms 超时与 interrupted+tool
 
-**ABORT if:** 第二轮 curl exit 28。
-
-**CHECK H-4:**
-
-```bash
-echo "$RH4" | python3 -c "
-import json, sys
-lines = sys.stdin.read()
-if '9973' in lines:
-    print('PASS: LLM recalled code 9973 — first turn (post-disconnect) preserved in history')
-else:
-    print('FAIL: LLM did not recall 9973 — disconnect may have broken history')
-    sys.exit(1)
-
-if '\"type\":\"done\"' in lines:
-    print('PASS: second turn completed cleanly')
-else:
-    print('WARN: no done event in second turn')
-"
-
-# 验证两轮均为 status="" (不是 cancelled/interrupted)
-RH4_STATE2=$(curl -s "http://127.0.0.1:7700/sessions/$SESS_H4/messages")
-echo "$RH4_STATE2" | python3 -c "
-import json, sys
-d = json.load(sys.stdin)
-print('final messages:', d['message_count'])
-bad = []
-for m in d['messages']:
-    if m['role'] == 'assistant':
-        s = m.get('status','')
-        if s in ('cancelled','interrupted'):
-            bad.append(f'{m[\"id\"][:8]} status={s!r}')
-if bad:
-    print('FAIL: interrupted assistant messages:', bad)
-else:
-    print('PASS: all assistant messages status=empty (clean history)')
-"
-```
-
-| 结果 | 含义 |
-|------|------|
-| 第二轮包含 `9973` + 所有 assistant `status=""` | ✓ **PASS** — disconnect 后 history 完整连贯 |
-| 第二轮未提到 `9973` | ✗ **FAIL** — 第一轮 history 未被正确保存 |
-| 有 assistant `status="cancelled"/"interrupted"` | ✗ **FAIL** — disconnect 触发了中断状态 |
-
----
-
-## STEP H-5 — Session 状态结构验证：正常完成后 store 内容正确
-
-**验证：** 一次含工具调用的正常对话结束后，`/sessions/{id}/messages`
-中 assistant 消息 `status=""`，工具 part `status=completed`，
-不存在 `status=running` 的工具 part（Done 保证）。
-
-```bash
-RH5=$(curl -sN --max-time 120 -X POST http://127.0.0.1:7700/chat \
-  -H "Content-Type: application/json" \
-  -d '{"message":"Use calc to compute 42 * 100. Tell me the result.","tools":["calc"],"max_steps":3}')
-
-echo "终止事件:"
-echo "$RH5" | grep '"type":"done"\|"type":"error"' | head -1
-
-SESS_H5=$(echo "$RH5" | grep '"session_id"' | sed 's/.*"session_id":"\([^"]*\)".*/\1/' | head -1)
-echo "Session: $SESS_H5"
-
-RH5_STATE=$(curl -s "http://127.0.0.1:7700/sessions/$SESS_H5/messages")
-echo "$RH5_STATE" | python3 -c "
-import json, sys
-d = json.load(sys.stdin)
-print('messages:', d['message_count'])
-
-issues = []
-for m in d['messages']:
-    role = m['role']
-    mstatus = m.get('status', '')
-    for p in m['parts']:
-        s = p.get('summary', '')
-        # 检查工具 part 状态
-        if 'tool=' in s:
-            if 'status=running' in s:
-                issues.append(f'{role} tool part still running: {s}')
-            elif 'status=completed' in s:
-                print(f'  PASS: {role} | {s}')
-            elif 'status=error' in s and 'Interrupted=true' not in s:
-                print(f'  CHECK: {role} | {s} (tool error, not interrupt)')
-    # 检查 assistant message status
-    if role == 'assistant':
-        if mstatus == '':
-            print(f'  PASS: assistant status=empty (normal completion)')
-        else:
-            issues.append(f'assistant status={mstatus!r}')
-
-if issues:
-    print()
-    for i in issues: print(f'FAIL: {i}')
-else:
-    print()
-    print('PASS: all parts in terminal state, no running tools after Done')
-"
-```
-
-**ABORT if:** curl exit 28。
-
-**CHECK H-5 判定：**
-
-| 检查项 | 期望 | 结果 |
-|--------|------|------|
-| `done` 事件 | 存在 | PASS / FAIL |
-| `assistant status=""` | 空字符串 | PASS / FAIL |
-| `calc` tool part `status=completed` | completed | PASS / FAIL |
-| 无 `status=running` 的 tool part | 不存在 | PASS / FAIL |
-
----
-
-## STEP H-6 — 最终 session 状态汇总
-
-```bash
-# 汇总所有测试 session 的最终状态
-for sess in "$SESS_H" "$SESS_H2" "$SESS_H4" "$SESS_H5"; do
-  echo "=== session: $sess ==="
-  curl -s "http://127.0.0.1:7700/sessions/$sess/messages" | python3 -c "
-import json, sys
-d = json.load(sys.stdin)
-print('  total messages:', d['message_count'])
-for m in d['messages']:
-    role = m['role']
-    status = m.get('status', '')
-    ptypes = [p['type'] for p in m['parts']]
-    print(f'  {role} status={status!r} parts={ptypes}')
-  " 2>/dev/null || echo "  (session not found)"
-done
-```
-
-此步骤仅供参考，无 ABORT 条件。
-
----
-
-## H 测试报告模板
-
-```
-=== INTERRUPT-TEST STEP H REPORT ===
-Date    : <date>
-Server  : http://127.0.0.1:7700
-Session : SESS_H=<id>  SESS_H2=<id>  SESS_H4=<id>  SESS_H5=<id>
-
-H-1  断开连接隔离 (context.WithoutCancel)
-     assistant status="" after disconnect  : PASS / FAIL / INDETERMINATE
-
-H-2  慢工具存活 (slow_calc 2s, disconnect after 1s)
-     slow_calc status=completed            : PASS / FAIL / INDETERMINATE
-     assistant status="" (normal finish)   : PASS / FAIL / INDETERMINATE
-
-H-3  max_steps 正常停止 (不产生 interrupt)
-     done event received                   : PASS / FAIL
-     assistant status="" (not interrupted) : PASS / FAIL
-
-H-4  Disconnect 后续轮次连贯
-     second turn recalled code 9973        : PASS / FAIL
-     all assistant messages status=""      : PASS / FAIL
-
-H-5  Session 状态结构验证
-     done event                            : PASS / FAIL
-     assistant status=""                   : PASS / FAIL
-     calc tool status=completed            : PASS / FAIL
-     no running tool parts after Done      : PASS / FAIL
-
-VERDICT: PASS / FAIL / ABORTED at H-N
+cleanup 在 250ms 宽限期后将仍在运行的工具标记为 `status=error, Interrupted=true`。
+这是正确行为（保护 RunLoop 不被慢工具拖死），与 HTTP disconnect 无关。
+区分方式：`message.status=''` 说明 RunLoop 正常完成，tool 被截断是 cleanup 行为而非中断。
 ```
 
 ---
-
-## H 测试中断条件汇总
-
-| 步骤 | ABORT 触发条件 |
-|------|----------------|
-| H-0 | 服务器不健康 |
-| H-1 | curl exit 28 在 2s 强制断开之前 |
-| H-2 | curl exit 28 在 1s 强制断开之前 |
-| H-3 | curl exit 28（120s 超时） |
-| H-4 | 第二轮 curl exit 28 |
-| H-5 | curl exit 28 |
-
----
-
-## H 测试关键代码位置
-
-| 概念 | 文件 | 位置 |
-|------|------|------|
-| `context.WithoutCancel` 屏蔽 disconnect | `cmd/knowledge-api/main.go` | `handleChat()` ctx 初始化 |
-| `slow_calc` 工具（ctx-aware 睡眠） | `cmd/knowledge-api/main.go` | `buildTestTools()` |
-| cleanup 250ms 工具超时 | `session/processor.go` | `cleanup()` |
-| `isAlreadyInterrupted()` 防竞争写 | `session/processor.go` | `executeTool()` |
-| `MessageStatus*` 常量 | `store/store.go` | `MessageStatus*` block |
-| `ToolStatus*` + `ToolPartData.Interrupted` | `store/store.go` | `ToolStatus*` block |
-| `/sessions/{id}/messages` 状态渲染 | `cmd/knowledge-api/main.go` | `handleSession()` |

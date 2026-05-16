@@ -72,7 +72,11 @@ func assistantMessages(t *testing.T, s store.Store, sessID string) []*store.Mess
 
 // ── Unit: ToModelMessages — cancelled / interrupted ───────────────────────────
 
-// Test 1: cancelled assistant message → skipped; consecutive user messages get " " placeholder.
+// Test 1: cancelled assistant message → user+cancelled pair removed entirely;
+// the next user message appears directly without any placeholder.
+// Rationale: a cancelled turn means the LLM never responded, so the user+cancelled
+// pair should be invisible. The old " " placeholder behaviour caused it to be
+// re-inserted on every subsequent turn, corrupting history after repeated cancels.
 func TestToModelMessages_cancelledAssistant_placeholder(t *testing.T) {
 	msgs := []*store.Message{
 		{ID: "u1", Role: store.RoleUser},
@@ -90,24 +94,15 @@ func TestToModelMessages_cancelledAssistant_placeholder(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Expected: user("first message") → assistant(" ") → user("correction")
-	if len(out) != 3 {
-		t.Fatalf("got %d messages, want 3 [user, assistant-placeholder, user]; roles: %v", len(out), roles(out))
+	// Expected: user("correction") only — the cancelled pair is completely invisible.
+	if len(out) != 1 {
+		t.Fatalf("got %d messages, want 1 [user(correction)]; roles: %v", len(out), roles(out))
 	}
 	if out[0].Role != llm.RoleUser {
 		t.Errorf("[0] role = %q, want user", out[0].Role)
 	}
-	if out[1].Role != llm.RoleAssistant {
-		t.Errorf("[1] role = %q, want assistant (placeholder)", out[1].Role)
-	}
-	if len(out[1].Content) != 1 || out[1].Content[0].Text != " " {
-		t.Errorf("[1] content = %+v, want single space placeholder", out[1].Content)
-	}
-	if out[2].Role != llm.RoleUser {
-		t.Errorf("[2] role = %q, want user", out[2].Role)
-	}
-	if out[2].Content[0].Text != "correction" {
-		t.Errorf("[2] text = %q, want 'correction'", out[2].Content[0].Text)
+	if out[0].Content[0].Text != "correction" {
+		t.Errorf("[0] text = %q, want 'correction'", out[0].Content[0].Text)
 	}
 }
 

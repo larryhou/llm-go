@@ -17,6 +17,7 @@ package session_test
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -423,6 +424,109 @@ func TestMarkAssistantCancelled_emptyTextPart(t *testing.T) {
 		t.Errorf("Status = %q, want %q (empty text part should not count as real content)",
 			asstMsgs[0].Status, store.MessageStatusCancelled)
 	}
+}
+
+// ── BC-9 ─────────────────────────────────────────────────────────────────────
+
+// BC-9: LLM transport error → Message.Error is set, not left as empty normal message.
+// Without this fix, a failed turn leaves status="" parts=[], which then causes
+// ToModelMessages to insert " " placeholders that accumulate and corrupt history.
+func TestRunLoop_llmTransportError_messageErrorSet(t *testing.T) {
+	s, sessID := newSession(t)
+
+	errProv := &mockProvider{
+		id: "err-prov",
+		events: []llm.Event{
+			{Type: llm.EventRequestStart},
+			{Type: llm.EventError, Err: fmt.Errorf("unexpected EOF")},
+		},
+	}
+
+	_, err := session.RunLoop(context.Background(), s, session.RunInput{
+		SessionID: sessID,
+		UserMsg:   "hello",
+		Model:     testModel(),
+		Provider:  errProv,
+		MaxSteps:  1,
+	})
+	if err == nil {
+		t.Fatal("expected error from RunLoop, got nil")
+	}
+
+	msgs, _ := s.ListMessages(context.Background(), sessID)
+	var assistantMsg *store.Message
+	for _, m := range msgs {
+		if m.Role == store.RoleAssistant {
+			assistantMsg = m
+		}
+	}
+	if assistantMsg == nil {
+		t.Fatal("no assistant message found")
+	}
+	if assistantMsg.Error == nil {
+		t.Errorf("BC-9 FAIL: Message.Error is nil after LLM transport error; "+
+			"status=%q — empty messages will accumulate and corrupt session history",
+			assistantMsg.Status)
+	} else {
+		t.Logf("BC-9 PASS: Message.Error set: name=%s", assistantMsg.Error.Name)
+	}
+}
+
+// ── BC-10 ────────────────────────────────────────────────────────────────────
+
+// BC-10: After a LLM error turn, the next turn's ToModelMessages must NOT
+// produce a " " placeholder for the failed assistant message.
+// Regression test for the " " accumulation bug.
+func TestRunLoop_llmTransportError_noPlaceholderInNextTurn(t *testing.T) {
+	s, sessID := newSession(t)
+
+	errProv := &mockProvider{
+		id: "err-prov",
+		events: []llm.Event{
+			{Type: llm.EventRequestStart},
+			{Type: llm.EventError, Err: fmt.Errorf("unexpected EOF")},
+		},
+	}
+
+	// Turn 1: LLM error
+	session.RunLoop(context.Background(), s, session.RunInput{ //nolint:errcheck
+		SessionID: sessID,
+		UserMsg:   "first message",
+		Model:     testModel(),
+		Provider:  errProv,
+		MaxSteps:  1,
+	})
+
+	// Turn 2: capture what history is sent to LLM
+	var capturedReqs []llm.Request
+	capProv := &capturingProvider{
+		inner:    simpleTextProvider("ok"),
+		captured: &capturedReqs,
+	}
+	session.RunLoop(context.Background(), s, session.RunInput{
+		SessionID: sessID,
+		UserMsg:   "second message",
+		Model:     testModel(),
+		Provider:  capProv,
+		MaxSteps:  1,
+	})
+
+	if len(capturedReqs) == 0 {
+		t.Fatal("no requests captured")
+	}
+	capturedReq := capturedReqs[0]
+	for _, msg := range capturedReq.Messages {
+		if msg.Role == llm.RoleAssistant {
+			for _, part := range msg.Content {
+				if part.Type == "text" && part.Text == " " {
+					t.Errorf("BC-10 FAIL: \" \" placeholder found in turn-2 messages — "+
+						"errored assistant message was not properly skipped")
+					return
+				}
+			}
+		}
+	}
+	t.Logf("BC-10 PASS: no \" \" placeholder in turn-2 (msg count=%d)", len(capturedReq.Messages))
 }
 
 // ── provider helpers ──────────────────────────────────────────────────────────

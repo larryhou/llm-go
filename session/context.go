@@ -26,9 +26,36 @@ import (
 //   - interrupted + has tool calls: keep completed tools, discard pending ones,
 //     append "[Assistant turn was interrupted by user]" so LLM does not retry.
 func ToModelMessages(msgs []*store.Message, parts map[string][]*store.Part) ([]llm.Message, error) {
+	// Pre-filter: remove user+assistant pairs where the assistant never produced
+	// content (cancelled before response, or LLM transport error with no content).
+	// These pairs are completely invisible to the LLM. Removing them here prevents
+	// the alternating-role guard below from inserting a " " placeholder, which
+	// proxies reject as invalid assistant content.
+	filtered := make([]*store.Message, 0, len(msgs))
+	for i := 0; i < len(msgs); i++ {
+		m := msgs[i]
+		if m.Role == store.RoleAssistant {
+			ps := parts[m.ID]
+			drop := false
+			if m.Status == store.MessageStatusCancelled {
+				drop = true
+			} else if m.Error != nil && !hasRealContent(ps) {
+				drop = true
+			}
+			if drop {
+				// Also drop the preceding user message if it is there.
+				if len(filtered) > 0 && filtered[len(filtered)-1].Role == store.RoleUser {
+					filtered = filtered[:len(filtered)-1]
+				}
+				continue
+			}
+		}
+		filtered = append(filtered, m)
+	}
+
 	var out []llm.Message
 
-	for _, m := range msgs {
+	for _, m := range filtered {
 		ps := parts[m.ID]
 
 		switch m.Role {
@@ -38,9 +65,10 @@ func ToModelMessages(msgs []*store.Message, parts map[string][]*store.Part) ([]l
 				continue
 			}
 			// Protocol fix: two consecutive user messages are invalid on both
-			// Anthropic and OpenAI. This can happen when a cancelled assistant
-			// message (Status=cancelled, no parts) is skipped. Insert a silent
-			// single-space assistant placeholder to satisfy the alternating rule.
+			// Anthropic and OpenAI. This can still happen if an interrupted
+			// assistant message had no usable content (buildAssistantPartsInterrupted
+			// returns empty). Insert a single-space placeholder — but only as a last
+			// resort; the pre-filter above eliminates the common cancelled/error cases.
 			if len(out) > 0 && out[len(out)-1].Role == llm.RoleUser {
 				out = append(out, llm.Message{
 					Role:    llm.RoleAssistant,
@@ -54,12 +82,6 @@ func ToModelMessages(msgs []*store.Message, parts map[string][]*store.Part) ([]l
 			})
 
 		case store.RoleAssistant:
-			// Cancelled: no content was ever emitted; skip entirely.
-			// The consecutive-user-message guard above handles the protocol gap.
-			if m.Status == store.MessageStatusCancelled {
-				continue
-			}
-
 			// Interrupted: partial content exists. Handle tool-call case specially.
 			if m.Status == store.MessageStatusInterrupted {
 				assistantParts, toolResultMsgs := buildAssistantPartsInterrupted(ps)
@@ -80,7 +102,7 @@ func ToModelMessages(msgs []*store.Message, parts map[string][]*store.Part) ([]l
 				continue
 			}
 
-			// Normal path: skip errored assistant messages (unless they have real content)
+			// Normal path: skip errored/empty assistant messages.
 			if m.Error != nil {
 				if !hasRealContent(ps) {
 					continue

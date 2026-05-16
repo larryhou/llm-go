@@ -248,6 +248,11 @@ type chatSession struct {
 	km         *knowledge.Manager // per-session manager: skills source + history source
 	hook       knowledge.CompactionHook // cached hook from historySrc
 	resetTool  tool.Tool                // cached session_reset tool
+
+	// activeHandle tracks the in-flight RunLoopAsync handle for this session.
+	// A new /chat request cancels the previous turn before starting its own.
+	// Guarded by server.mu.
+	activeHandle *session.RunHandle
 }
 
 // ── /health ───────────────────────────────────────────────────────────────────
@@ -551,7 +556,23 @@ func (s *server) handleChat(w http.ResponseWriter, r *http.Request) {
 		Limit:      llm.ModelLimit{Context: contextLimit, Output: 4096},
 	}
 
-	_, err := session.RunLoop(ctx, s.sessionStore, session.RunInput{
+	// Cancel any in-flight RunLoop for this session before starting a new one.
+	// This is the "conversational interrupt" path: a new /chat message from the
+	// user implicitly cancels the previous turn (e.g. if it was blocked waiting
+	// for a long tool call to finish).
+	//
+	// Wait for the previous handle's Done channel so store writes from the
+	// cancelled turn are fully committed before the new turn reads history.
+	s.mu.Lock()
+	prev := sess.activeHandle
+	s.mu.Unlock()
+	if prev != nil {
+		log.Printf("[INTERRUPT] session=%s new message arrived — cancelling previous turn", sessID)
+		prev.Cancel()
+		<-prev.Done
+	}
+
+	h := session.RunLoopAsync(ctx, s.sessionStore, session.RunInput{
 		SessionID: sessID,
 		UserMsg:   req.Message,
 		Model:     model,
@@ -570,8 +591,26 @@ func (s *server) handleChat(w http.ResponseWriter, r *http.Request) {
 		Config:                sessionCfg,
 		OnCompact:             sess.hook,
 	})
-	if err != nil {
-		sendEvent(map[string]any{"type": "error", "error": err.Error()})
+	log.Printf("[TURN-START] session=%s handle=%p", sessID, h)
+
+	// Register this handle so the next /chat request can cancel it.
+	s.mu.Lock()
+	sess.activeHandle = h
+	s.mu.Unlock()
+
+	// Wait for the RunLoop to finish (either normally or via Cancel).
+	<-h.Done
+	log.Printf("[TURN-DONE] session=%s handle=%p result=%v err=%v", sessID, h, h.Result, h.Err)
+
+	// Clear the handle now that this turn is finished.
+	s.mu.Lock()
+	if sess.activeHandle == h {
+		sess.activeHandle = nil
+	}
+	s.mu.Unlock()
+
+	if h.Err != nil {
+		sendEvent(map[string]any{"type": "error", "error": h.Err.Error()})
 		return
 	}
 
@@ -607,6 +646,8 @@ func (s *server) handleSession(w http.ResponseWriter, r *http.Request) {
 	type msgSummary struct {
 		ID      string        `json:"id"`
 		Role    string        `json:"role"`
+		Status  string        `json:"status"`
+		Error   *store.MessageError `json:"error,omitempty"`
 		Summary bool          `json:"summary,omitempty"`
 		Parts   []partSummary `json:"parts"`
 	}
@@ -625,7 +666,11 @@ func (s *server) handleSession(w http.ResponseWriter, r *http.Request) {
 					ps2.Summary = d.Text
 				}
 			case *store.ToolPartData:
-				ps2.Summary = fmt.Sprintf("tool=%s status=%s", d.Tool, d.Status)
+				if d.Interrupted {
+					ps2.Summary = fmt.Sprintf("tool=%s status=%s Interrupted=true", d.Tool, d.Status)
+				} else {
+					ps2.Summary = fmt.Sprintf("tool=%s status=%s", d.Tool, d.Status)
+				}
 			case *store.StepFinishData:
 				ps2.Summary = fmt.Sprintf("finish=%s input=%d output=%d", d.FinishReason, d.Usage.Input, d.Usage.Output)
 			case *store.CompactionPartData:
@@ -642,6 +687,8 @@ func (s *server) handleSession(w http.ResponseWriter, r *http.Request) {
 		out = append(out, msgSummary{
 			ID:      m.ID,
 			Role:    m.Role,
+			Status:  m.Status,
+			Error:   m.Error,
 			Summary: m.Summary,
 			Parts:   pss,
 		})
@@ -738,6 +785,7 @@ func (w *sseToolWrapper) Execute(ctx context.Context, input map[string]any) (too
 //
 //   - calc:          arithmetic (exercises normal tool execution + multi-turn)
 //   - slow_calc:     same but sleeps 2s (exercises async tool + concurrent dispatch)
+//   - long_task:     sleeps 30s (exercises user-interrupt-during-tool-call scenario)
 //   - counter:       stateful incrementing counter (multi-turn state accumulation)
 //   - tool_failure:  always returns a ToolFailure (exercises recoverable error path)
 //   - doom_bait:     echoes its input unchanged (LLM tends to call it repeatedly → doom-loop)
@@ -787,6 +835,45 @@ func buildTestTools() []tool.Tool {
 					return tool.Result{}, tool.Fail("invalid expression: " + err.Error())
 				}
 				return tool.Result{Output: fmt.Sprintf("%g (slow)", result), Title: "slow_calc"}, nil
+			},
+		},
+		&simpleTool{
+			name:        "long_task",
+			description: "Simulates a long-running background task that takes 30 seconds to complete. Use to test user-interrupt-during-tool-call scenarios. Input: {\"label\": \"<task name>\"}",
+			schema: map[string]any{
+				"type":     "object",
+				"required": []string{"label"},
+				"properties": map[string]any{
+					"label": map[string]any{"type": "string", "description": "task label for identification"},
+				},
+			},
+			fn: func(ctx context.Context, input map[string]any) (tool.Result, error) {
+				label, _ := input["label"].(string)
+				if label == "" {
+					label = "unnamed"
+				}
+				log.Printf("[LONG-TASK-START] label=%s — will block for 30s", label)
+				ticker := time.NewTicker(5 * time.Second)
+				defer ticker.Stop()
+				deadline := time.NewTimer(30 * time.Second)
+				defer deadline.Stop()
+				elapsed := 0
+				for {
+					select {
+					case <-deadline.C:
+						log.Printf("[LONG-TASK-DONE] label=%s completed normally after 30s", label)
+						return tool.Result{
+							Output: fmt.Sprintf("task[%s] completed after 30s", label),
+							Title:  "long_task",
+						}, nil
+					case <-ticker.C:
+						elapsed += 5
+						log.Printf("[LONG-TASK-TICK] label=%s elapsed=%ds (still running)", label, elapsed)
+					case <-ctx.Done():
+						log.Printf("[LONG-TASK-ABORTED] label=%s interrupted after ~%ds: %v", label, elapsed, ctx.Err())
+						return tool.Result{}, ctx.Err()
+					}
+				}
 			},
 		},
 		&simpleTool{

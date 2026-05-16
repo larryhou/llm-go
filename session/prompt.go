@@ -254,11 +254,21 @@ func runLoopInternal(ctx context.Context, s store.Store, input RunInput) (RunRes
 		if err != nil {
 			// Only mark the assistant message as cancelled/interrupted when the
 			// error is due to context cancellation (i.e. Cancel() was called).
-			// For LLM errors, network failures, etc. the message is left with
-			// no Status so the next RunLoop sees it as a normal (empty) assistant
-			// turn and ToModelMessages skips it via the len(assistantParts)==0 guard.
 			if ctx.Err() != nil {
 				markAssistantCancelled(s, assistantMsgID)
+			} else {
+				// For LLM/transport errors, mark the message with Error so that
+				// ToModelMessages skips it cleanly (via the m.Error+no-content guard)
+				// without leaving a bare empty assistant message in history.
+				// Without this, repeated LLM errors accumulate empty assistant
+				// messages that force " " placeholders and corrupt session history.
+				if m, merr := s.GetMessage(context.Background(), assistantMsgID); merr == nil {
+					m.Error = &store.MessageError{
+						Name:    "llm_error",
+						Message: err.Error(),
+					}
+					_ = s.UpdateMessage(context.Background(), m)
+				}
 			}
 			return RunResultStop, err
 		}
