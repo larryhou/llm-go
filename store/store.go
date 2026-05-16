@@ -98,8 +98,9 @@ const (
 	PartTypeTool       = "tool"
 	PartTypeStepStart  = "step-start"
 	PartTypeStepFinish = "step-finish"
-	PartTypeCompaction = "compaction"
-	PartTypeSnapshot   = "snapshot"
+	PartTypeCompaction    = "compaction"
+	PartTypeRecentContext = "recent-context"
+	PartTypeSnapshot      = "snapshot"
 	PartTypeRetry      = "retry"
 	PartTypeAgent      = "agent"
 	PartTypeSubtask    = "subtask"
@@ -156,6 +157,14 @@ type StepFinishData struct {
 // CompactionPartData marks a point where compaction occurred.
 type CompactionPartData struct {
 	SummaryMessageID string
+}
+
+// RecentContextPartData holds a verbatim excerpt of the turns immediately
+// preceding the tail at the time of compaction. Attached to the compaction
+// boundary message so the LLM has a fine-grained anchor without needing to
+// call knowledge_search.
+type RecentContextPartData struct {
+	Excerpt string // verbatim rendered excerpt of the last 2 turns of head
 }
 
 // RetryPartData records a retry attempt.

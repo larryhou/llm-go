@@ -3,7 +3,9 @@ package session
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/larryhou/llm-go/config"
 	"github.com/larryhou/llm-go/llm"
@@ -65,6 +67,11 @@ type SelectResult struct {
 	Head []*store.Message
 	// TailStartID is the ID of the first message in the tail to preserve verbatim.
 	TailStartID string
+	// RecentHead contains the messages belonging to the last 2 real user turns
+	// within Head (those immediately before the tail). These are the turns most
+	// likely to be mis-summarised. Nil when Head has ≤ 2 real turns (in which
+	// case there is nothing worth anchoring beyond what is already in the tail).
+	RecentHead []*store.Message
 }
 
 // Select splits a message list into head (to summarise) and tail (to keep verbatim).
@@ -142,9 +149,19 @@ func Select(msgs []*store.Message, allParts map[string][]*store.Part, model llm.
 		return SelectResult{Head: nil, TailStartID: ""}
 	}
 
+	// Compute RecentHead: the last 2 real turns within Head (those immediately
+	// before the tail). Only populated when head has more than 2 real turns;
+	// otherwise the content would duplicate the tail which is already verbatim.
+	var recentHead []*store.Message
+	if tailStartTurnIdx > 2 {
+		recentStartIdx := turns[tailStartTurnIdx-2].StartIdx
+		recentHead = msgs[recentStartIdx:tailMsgIdx]
+	}
+
 	return SelectResult{
 		Head:        msgs[:tailMsgIdx],
 		TailStartID: msgs[tailMsgIdx].ID,
+		RecentHead:  recentHead,
 	}
 }
 
@@ -318,8 +335,135 @@ func (c *Compactor) Compact(ctx context.Context, sessionID string, input Process
 		input.OnCompact(sel.Head, allParts)
 	}
 
+	// Step 6: Write a PartTypeRecentContext part onto the boundary message.
+	// This embeds a verbatim excerpt of the 2 turns immediately preceding the
+	// tail so the LLM has a fine-grained anchor after compaction without needing
+	// an extra tool call. Non-fatal: failure does not roll back the compaction.
+	if len(sel.RecentHead) > 0 {
+		excerpt := buildRecentContextExcerpt(sel.RecentHead, allParts)
+		if excerpt != "" {
+			_ = c.store.CreatePart(ctx, &store.Part{
+				ID:        newID(),
+				MessageID: compactionMsgID,
+				SessionID: sessionID,
+				Type:      store.PartTypeRecentContext,
+				CreatedAt: now,
+				UpdatedAt: now,
+				Data:      &store.RecentContextPartData{Excerpt: excerpt},
+			})
+			// Update boundary message Tokens so the next compaction's
+			// estimateTurnTokens does not under-count this message (which
+			// would otherwise fall back to the 100-token placeholder).
+			// Read-then-update to avoid clobbering other fields.
+			// Rough estimate: 1 token ≈ 4 chars.
+			if bm, readErr := c.store.GetMessage(ctx, compactionMsgID); readErr == nil {
+				bm.Tokens.Input = len(excerpt) / 4
+				_ = c.store.UpdateMessage(ctx, bm)
+			}
+		}
+	}
+
 	return summaryMsgID, nil
 }
+// buildRecentContextExcerpt renders a compact verbatim excerpt of msgs for
+// embedding into the compaction boundary message. Each message is rendered as
+// a labelled block with text truncated to keep the total size manageable.
+// Tool outputs are truncated to 120 runes; message text to 300 runes.
+func buildRecentContextExcerpt(msgs []*store.Message, allParts map[string][]*store.Part) string {
+	const (
+		maxTextRunes = 300
+		maxToolRunes = 120
+		ellipsis     = "..."
+	)
+
+	// truncateRunes returns s truncated to at most n runes, with ellipsis appended
+	// when truncation occurs. Operates on rune boundaries to avoid invalid UTF-8.
+	truncateRunes := func(s string, n int) string {
+		if utf8.RuneCountInString(s) <= n {
+			return s
+		}
+		runes := []rune(s)
+		return string(runes[:n]) + ellipsis
+	}
+
+	var sb strings.Builder
+	sb.WriteString("---\n以下是压缩前最近的对话原文：\n")
+
+	hasContent := false // true once any real text or tool call is written
+
+	for _, m := range msgs {
+		ps := allParts[m.ID]
+
+		switch m.Role {
+		case store.RoleUser:
+			// Skip compaction boundary messages — they carry "What did we do so far?"
+			// and would be noise in the excerpt.
+			if hasPartType(ps, store.PartTypeCompaction) {
+				continue
+			}
+			wroteLabel := false
+			for _, p := range ps {
+				if p.Type != store.PartTypeText {
+					continue
+				}
+				d, ok := store.DataAs[*store.TextPartData](p)
+				if !ok || d.Text == "" {
+					continue
+				}
+				if !wroteLabel {
+					sb.WriteString("\n**[用户]**\n")
+					wroteLabel = true
+				}
+				sb.WriteString(truncateRunes(d.Text, maxTextRunes))
+				sb.WriteByte('\n')
+				hasContent = true
+			}
+
+		case store.RoleAssistant:
+			wroteLabel := false
+			for _, p := range ps {
+				switch p.Type {
+				case store.PartTypeText:
+					d, ok := store.DataAs[*store.TextPartData](p)
+					if !ok || d.Text == "" {
+						continue
+					}
+					if !wroteLabel {
+						sb.WriteString("\n**[助手]**\n")
+						wroteLabel = true
+					}
+					sb.WriteString(truncateRunes(d.Text, maxTextRunes))
+					sb.WriteByte('\n')
+					hasContent = true
+
+				case store.PartTypeTool:
+					d, ok := store.DataAs[*store.ToolPartData](p)
+					if !ok {
+						continue
+					}
+					if !wroteLabel {
+						sb.WriteString("\n**[助手]**\n")
+						wroteLabel = true
+					}
+					output := d.Output
+					if d.Compacted > 0 {
+						output = "[已清除]"
+					} else {
+						output = truncateRunes(output, maxToolRunes)
+					}
+					fmt.Fprintf(&sb, "- 调用工具: %s → %s\n", d.Tool, output)
+					hasContent = true
+				}
+			}
+		}
+	}
+
+	if !hasContent {
+		return ""
+	}
+	return strings.TrimSpace(sb.String())
+}
+
 type ToModelOptions struct {
 	StripMedia         bool
 	ToolOutputMaxChars int
@@ -332,7 +476,7 @@ func ToModelMessagesWithOptions(msgs []*store.Message, parts map[string][]*store
 		ps := parts[m.ID]
 		switch m.Role {
 		case store.RoleUser:
-			userParts := buildUserParts(ps)
+			userParts := buildUserParts(ps, opts)
 			if len(userParts) > 0 {
 				out = append(out, llm.Message{Role: llm.RoleUser, Content: userParts})
 			}

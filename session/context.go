@@ -13,6 +13,7 @@ import (
 //
 // Key rules:
 //   - User messages: text parts → text content; compaction parts → "What did we do so far?"
+//   - recent-context parts → verbatim excerpt (stripped when StripMedia=true)
 //   - Assistant messages: skip if errored (unless AbortedError with content)
 //   - Tool parts: completed → output-available; error/interrupted → output-error
 //   - Compacted tool output → "[Old tool result content cleared]"
@@ -25,7 +26,7 @@ func ToModelMessages(msgs []*store.Message, parts map[string][]*store.Part) ([]l
 
 		switch m.Role {
 		case store.RoleUser:
-			userParts := buildUserParts(ps)
+			userParts := buildUserParts(ps, ToModelOptions{})
 			if len(userParts) == 0 {
 				continue
 			}
@@ -68,7 +69,9 @@ func ToModelMessages(msgs []*store.Message, parts map[string][]*store.Part) ([]l
 }
 
 // buildUserParts converts user message parts into LLM content parts.
-func buildUserParts(ps []*store.Part) []llm.ContentPart {
+// opts.StripMedia=true suppresses PartTypeRecentContext (used during summary
+// generation to avoid feeding previous excerpts to the summary LLM).
+func buildUserParts(ps []*store.Part, opts ToModelOptions) []llm.ContentPart {
 	var parts []llm.ContentPart
 	for _, p := range ps {
 		switch p.Type {
@@ -83,6 +86,14 @@ func buildUserParts(ps []*store.Part) []llm.ContentPart {
 		case store.PartTypeCompaction:
 			// Compaction boundary — represents summarised history
 			parts = append(parts, llm.NewTextPart("What did we do so far?"))
+		case store.PartTypeRecentContext:
+			if opts.StripMedia {
+				continue // omit excerpt when building input for the summary LLM
+			}
+			d, ok := store.DataAs[*store.RecentContextPartData](p)
+			if ok && d.Excerpt != "" {
+				parts = append(parts, llm.NewTextPart(d.Excerpt))
+			}
 		case store.PartTypeAgent:
 			parts = append(parts, llm.NewTextPart("The following tool was executed by the user"))
 		}
