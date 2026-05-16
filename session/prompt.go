@@ -67,6 +67,12 @@ type RunInput struct {
 	// for later retrieval via knowledge_search / knowledge_fetch.
 	// Nil is a no-op — existing callers are unaffected.
 	OnCompact knowledge.CompactionHook
+
+	// WaitFor, when non-nil, is waited on before loadMessages is called.
+	// Use the previous turn's StoreDone so the new turn starts immediately
+	// but only reads history after the previous turn's store writes are done.
+	// Nil means no waiting (default behaviour, fully backward-compatible).
+	WaitFor <-chan struct{}
 }
 
 // RunHandle is returned by RunLoopAsync. It allows the caller to cancel the
@@ -88,12 +94,27 @@ type RunHandle struct {
 	// receiving from Done.
 	Done <-chan struct{}
 
+	// StoreDone is closed once the current turn's store writes are complete —
+	// specifically after markAssistantCancelled (on cancel) or after the final
+	// ProcessStop return (on normal completion), and before Prune runs.
+	// A new RunLoop may pass this as WaitFor to start immediately without waiting
+	// for Prune, while still guaranteeing a consistent store view.
+	StoreDone <-chan struct{}
+
 	// Result and Err are set before Done is closed. Read them only after <-Done.
 	Result RunResult
 	Err    error
 
-	cancel context.CancelFunc
-	once   sync.Once
+	cancel    context.CancelFunc
+	once      sync.Once
+	storeDone chan struct{} // closed by runLoopInternal to signal store consistency
+	storeOnce sync.Once    // ensures storeDone is closed exactly once
+}
+
+// closeStoreDone signals that the store is in a consistent state.
+// Safe to call multiple times (idempotent via storeOnce).
+func (h *RunHandle) closeStoreDone() {
+	h.storeOnce.Do(func() { close(h.storeDone) })
 }
 
 // Cancel requests cancellation of the running loop. It is idempotent and
@@ -106,18 +127,23 @@ func (h *RunHandle) Cancel() {
 
 // RunLoopAsync starts the agentic loop in a background goroutine and returns
 // a RunHandle immediately. The caller can cancel the loop via h.Cancel() and
-// must wait on h.Done before starting a new RunLoop on the same session.
+// wait on h.Done for full completion (including Prune).
+//
+// Use h.StoreDone to start a new RunLoop as soon as the store is consistent,
+// without waiting for Prune to complete.
 //
 // The parent ctx controls the maximum lifetime of the loop independently of
 // Cancel — if ctx is cancelled, the loop is also cancelled.
 func RunLoopAsync(ctx context.Context, s store.Store, input RunInput) *RunHandle {
 	cancelCtx, cancel := context.WithCancel(ctx)
 	done := make(chan struct{})
-	h := &RunHandle{Done: done, cancel: cancel}
+	storeDone := make(chan struct{})
+	h := &RunHandle{Done: done, StoreDone: storeDone, storeDone: storeDone, cancel: cancel}
 	go func() {
 		defer close(done)
-		defer cancel() // release cancelCtx resources if loop exits naturally
-		h.Result, h.Err = runLoopInternal(cancelCtx, s, input)
+		defer cancel()
+		defer h.closeStoreDone() // ensure StoreDone is always closed before Done
+		h.Result, h.Err = runLoopInternal(cancelCtx, s, input, h)
 	}()
 	return h
 }
@@ -132,8 +158,23 @@ func RunLoop(ctx context.Context, s store.Store, input RunInput) (RunResult, err
 
 // runLoopInternal is the main agentic loop implementation.
 // Aligned with packages/opencode/src/session/prompt.ts runLoop().
-func runLoopInternal(ctx context.Context, s store.Store, input RunInput) (RunResult, error) {
-	// Create the user message
+func runLoopInternal(ctx context.Context, s store.Store, input RunInput, h *RunHandle) (RunResult, error) {
+	processor := NewProcessor(s)
+	compactor := NewCompactor(s, processor)
+
+	// If WaitFor is set, block until the previous turn's store writes are done
+	// before writing the user message or reading history. This prevents orphaned
+	// user messages: if ctx is cancelled during the wait, nothing has been written.
+	if input.WaitFor != nil {
+		select {
+		case <-input.WaitFor:
+		case <-ctx.Done():
+			return RunResultStop, ctx.Err()
+		}
+	}
+
+	// Create the user message (after WaitFor so history order is correct and
+	// no orphan is left if the turn is cancelled before the wait completes).
 	userMsgID := newID()
 	now := time.Now()
 	userMsg := &store.Message{
@@ -161,9 +202,6 @@ func runLoopInternal(ctx context.Context, s store.Store, input RunInput) (RunRes
 	}); err != nil {
 		return RunResultStop, fmt.Errorf("runloop: create user text part: %w", err)
 	}
-
-	processor := NewProcessor(s)
-	compactor := NewCompactor(s, processor)
 
 	// Load messages once and cache across steps.
 	// Only reloaded after compaction (which restructures history).
@@ -256,6 +294,7 @@ func runLoopInternal(ctx context.Context, s store.Store, input RunInput) (RunRes
 			// error is due to context cancellation (i.e. Cancel() was called).
 			if ctx.Err() != nil {
 				markAssistantCancelled(s, assistantMsgID)
+				h.closeStoreDone() // store is consistent; new turn may proceed
 			} else {
 				// For LLM/transport errors, mark the message with Error so that
 				// ToModelMessages skips it cleanly (via the m.Error+no-content guard)
@@ -269,6 +308,7 @@ func runLoopInternal(ctx context.Context, s store.Store, input RunInput) (RunRes
 					}
 					_ = s.UpdateMessage(context.Background(), m)
 				}
+				h.closeStoreDone()
 			}
 			return RunResultStop, err
 		}
@@ -278,6 +318,7 @@ func runLoopInternal(ctx context.Context, s store.Store, input RunInput) (RunRes
 		// cancellation as an interrupt so we don't start a new iteration.
 		if ctx.Err() != nil {
 			markAssistantCancelled(s, assistantMsgID)
+			h.closeStoreDone() // store is consistent; new turn may proceed
 			return RunResultStop, ctx.Err()
 		}
 
@@ -303,6 +344,11 @@ func runLoopInternal(ctx context.Context, s store.Store, input RunInput) (RunRes
 
 		switch result {
 		case ProcessStop:
+			// Signal store consistency before Prune so that a new turn waiting
+			// on StoreDone can start loadMessages while Prune runs concurrently.
+			// Prune only deletes old pruned parts; it does not affect the new
+			// turn's history view.
+			h.closeStoreDone()
 			// Run prune synchronously so that Done is only closed after Prune
 			// completes — prevents a concurrent new RunLoop from racing with
 			// Prune's UpdatePart writes on the same session.
@@ -346,12 +392,14 @@ func runLoopInternal(ctx context.Context, s store.Store, input RunInput) (RunRes
 		case ProcessContinue:
 			// Last step always terminates — the LLM has been asked to summarise.
 			if isLastStep {
+				h.closeStoreDone()
 				return RunResultStop, nil
 			}
 			// Check if the last assistant message finished with tool calls.
 			// If so, continue the loop to let the LLM process tool results.
 			// allParts[assistantMsgID] was refreshed above after the LLM call.
 			if !hasToolCalls(allParts[assistantMsgID]) {
+				h.closeStoreDone()
 				return RunResultContinue, nil
 			}
 			// Continue loop to let LLM see tool results

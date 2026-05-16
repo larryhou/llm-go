@@ -150,15 +150,19 @@ func (s *webServer) handleChat(w http.ResponseWriter, r *http.Request) {
 	// when the SSE client disconnects mid-stream.
 	ctx := context.WithoutCancel(r.Context())
 
-	// Cancel any in-flight turn for this session before starting a new one.
+	// Cancel the previous turn and register the new handle atomically under
+	// s.mu. Holding the lock across Cancel+RunLoopAsync+activeHandle assignment
+	// ensures a third concurrent request cannot observe a stale prev and race
+	// to also register itself against the same old StoreDone.
 	s.mu.Lock()
 	prev := s.activeHandle
-	s.mu.Unlock()
 	if prev != nil {
 		prev.Cancel()
-		<-prev.Done
 	}
-
+	var waitFor <-chan struct{}
+	if prev != nil {
+		waitFor = prev.StoreDone
+	}
 	h := session.RunLoopAsync(ctx, s.sessStore, session.RunInput{
 		SessionID:   s.sessID,
 		UserMsg:     req.Message,
@@ -168,9 +172,8 @@ func (s *webServer) handleChat(w http.ResponseWriter, r *http.Request) {
 		ExtraSystem: s.app.extraSystem,
 		MaxSteps:    20,
 		Config:      s.app.cfg,
+		WaitFor:     waitFor,
 	})
-
-	s.mu.Lock()
 	s.activeHandle = h
 	s.mu.Unlock()
 

@@ -564,22 +564,20 @@ func (s *server) handleChat(w http.ResponseWriter, r *http.Request) {
 		Limit:      llm.ModelLimit{Context: contextLimit, Output: 4096},
 	}
 
-	// Cancel any in-flight RunLoop for this session before starting a new one.
-	// This is the "conversational interrupt" path: a new /chat message from the
-	// user implicitly cancels the previous turn (e.g. if it was blocked waiting
-	// for a long tool call to finish).
-	//
-	// Wait for the previous handle's Done channel so store writes from the
-	// cancelled turn are fully committed before the new turn reads history.
+	// Cancel the previous turn and register the new handle atomically under
+	// s.mu. Holding the lock across Cancel+RunLoopAsync+activeHandle assignment
+	// ensures a third concurrent request cannot observe a stale prev and race
+	// to also register itself against the same old StoreDone.
 	s.mu.Lock()
 	prev := sess.activeHandle
-	s.mu.Unlock()
 	if prev != nil {
 		log.Printf("[INTERRUPT] session=%s new message arrived — cancelling previous turn", sessID)
 		prev.Cancel()
-		<-prev.Done
 	}
-
+	var waitFor <-chan struct{}
+	if prev != nil {
+		waitFor = prev.StoreDone
+	}
 	h := session.RunLoopAsync(ctx, s.sessionStore, session.RunInput{
 		SessionID: sessID,
 		UserMsg:   req.Message,
@@ -598,13 +596,11 @@ func (s *server) handleChat(w http.ResponseWriter, r *http.Request) {
 		MaxSteps:              maxSteps,
 		Config:                sessionCfg,
 		OnCompact:             sess.hook,
+		WaitFor:               waitFor,
 	})
-	log.Printf("[TURN-START] session=%s handle=%p", sessID, h)
-
-	// Register this handle so the next /chat request can cancel it.
-	s.mu.Lock()
 	sess.activeHandle = h
 	s.mu.Unlock()
+	log.Printf("[TURN-START] session=%s handle=%p", sessID, h)
 
 	// Wait for the RunLoop to finish (either normally or via Cancel).
 	<-h.Done

@@ -349,7 +349,7 @@ instead of the original output. The tool call itself (name + input) is preserved
 
 ## Interruptible RunLoop — `RunLoopAsync` / `RunHandle`
 
-`RunLoop` is a synchronous blocking call. `RunLoopAsync` wraps it in a goroutine and returns a `RunHandle` immediately, enabling callers to cancel an in-flight loop and start a new one safely.
+`RunLoop` is a synchronous blocking call. `RunLoopAsync` wraps it in a goroutine and returns a `RunHandle` immediately, enabling callers to cancel an in-flight loop and start a new one without blocking the HTTP handler.
 
 ### Cancellation lifecycle
 
@@ -363,9 +363,10 @@ sequenceDiagram
     participant Store
 
     Caller->>Handle: RunLoopAsync(ctx, store, input)
-    Handle-->>Caller: *RunHandle (Done channel)
+    Handle-->>Caller: *RunHandle (Done + StoreDone channels)
     Handle->>goroutine: go runLoopInternal(cancelCtx, ...)
 
+    Note over goroutine: if WaitFor set: <-WaitFor first
     goroutine->>Store: CreateMessage(userMsg)
     goroutine->>Store: CreateMessage(assistantMsg placeholder)
     goroutine->>Process: Process(cancelCtx, assistantMsgID, ...)
@@ -382,13 +383,31 @@ sequenceDiagram
 
     goroutine->>Store: markAssistantCancelled(assistantMsgID)
     Note over goroutine: Status = "cancelled" or "interrupted"\ndepends on whether parts exist
+    goroutine->>Handle: close(StoreDone)  ← new turn may now loadMessages safely
 
     goroutine->>Store: Prune() [synchronous, 10s timeout]
     goroutine->>Handle: close(Done)
 
-    Caller->>Handle: <-Done  [safe to start new RunLoop]
-    Caller->>Handle: RunLoopAsync(ctx, store, newInput)
+    Caller->>Handle: <-StoreDone  [new turn can start immediately]
+    Caller->>Handle: RunLoopAsync(ctx, store, newInput{WaitFor: h.StoreDone})
 ```
+
+### `StoreDone` — fast turn handoff
+
+`StoreDone` is closed as soon as the current turn's store writes are complete
+(after `markAssistantCancelled` on cancel, or before `Prune` on normal stop).
+A new turn can pass the previous handle's `StoreDone` as `WaitFor` in `RunInput`
+to start immediately without waiting for `Prune`:
+
+```go
+h2 := session.RunLoopAsync(ctx, store, session.RunInput{
+    WaitFor: h.StoreDone, // wait for store consistency, not full cleanup
+    ...
+})
+```
+
+`runLoopInternal` waits on `WaitFor` **before** writing the user message — so
+if the new turn's ctx is cancelled during the wait, no orphan records are left.
 
 ### Message.Status state machine
 
@@ -428,9 +447,10 @@ flowchart TD
 
 ```go
 type RunHandle struct {
-    Done   <-chan struct{} // closed after full cleanup (incl. Prune); safe to start new RunLoop after <-Done
-    Result RunResult       // available after <-Done
-    Err    error           // available after <-Done
+    Done      <-chan struct{} // closed after full cleanup (incl. Prune)
+    StoreDone <-chan struct{} // closed after store writes complete, before Prune
+    Result    RunResult       // available after <-Done
+    Err       error           // available after <-Done
 }
 
 func (h *RunHandle) Cancel()            // idempotent, race-safe via sync.Once
@@ -438,11 +458,16 @@ func RunLoopAsync(ctx context.Context, s store.Store, input RunInput) *RunHandle
 func RunLoop(ctx context.Context, s store.Store, input RunInput) (RunResult, error) // thin synchronous wrapper
 ```
 
+`RunInput.WaitFor <-chan struct{}` — optional; if set, `runLoopInternal` blocks
+on this channel before writing the user message or calling `loadMessages`. Pass
+`prev.StoreDone` to achieve immediate turn handoff without blocking the caller.
+
 ### Cancel() guarantees
 
 - `Cancel()` cancels the internal `cancelCtx`, which aborts the LLM stream and triggers `cleanup()` inside `Process()`.
 - `cleanup()` uses `context.Background()` for all store writes — not the cancelled ctx — so tool parts are correctly marked even after cancellation.
-- `Done` is closed only after `cleanup()` **and** `Prune()` complete. Callers must `<-h.Done` before starting a new `RunLoop` on the same session.
+- `StoreDone` is closed after `markAssistantCancelled` (cancel path) or before `Prune` (normal stop). A new turn with `WaitFor: prev.StoreDone` can start as soon as store consistency is guaranteed.
+- `Done` is closed only after `cleanup()` **and** `Prune()` complete.
 - `Cancel()` is idempotent (`sync.Once`); concurrent calls from multiple goroutines are safe.
 
 ### Message.Status — interrupted turn handling

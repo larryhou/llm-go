@@ -223,13 +223,15 @@ the terminal REPL. The port is printed on startup.
 
 ### `/chat` implementation
 
-`handleChat` in `web.go` uses `RunLoopAsync` + cancel-prev-turn, identical to
-`cmd/llm-api`:
+`handleChat` in `web.go` uses `RunLoopAsync` + immediate cancel + `WaitFor`:
 
 1. Build a per-request `hookProvider{inner: app.prov, onEvent: SSE forwarder}`
-2. Cancel any in-flight handle for this session (`prev.Cancel(); <-prev.Done`)
-3. Call `session.RunLoopAsync(ctx, store, RunInput{Provider: hookProv, ...})`
-4. Register handle; wait `<-h.Done`; send `cancelled` or `done` SSE event
+2. Under `s.mu`: call `prev.Cancel()`, capture `prev.StoreDone` as `waitFor`, call
+   `RunLoopAsync(..., WaitFor: waitFor)`, assign `s.activeHandle = h` — all atomic
+3. SSE stream is established immediately; new turn goroutine runs right away
+4. Inside `runLoopInternal`: wait on `WaitFor` before writing user message or
+   calling `loadMessages` — ensures store consistency without blocking the handler
+5. `<-h.Done`; send `cancelled` or `done` SSE event
 
 `appState.prov` is `llm.Provider` (plain interface, not `*hookProvider`). The
 SSE-forwarding hook is created fresh per request inside `handleChat`.
@@ -250,11 +252,15 @@ SSE-forwarding hook is created fresh per request inside `handleChat`.
 | Trigger | Mechanism |
 |---------|-----------|
 | ESC key | `document.addEventListener('keydown')` — fires `cancelTurn()` → POST `/cancel` |
-| New message while turn active | `handleChat` cancels the previous in-flight handle before starting a new one |
+| New message while turn active | `handleChat` calls `prev.Cancel()` then immediately starts new turn with `WaitFor: prev.StoreDone` |
 
 Send button is **always enabled** — sending a new message while a turn is active
-automatically cancels the previous turn (backend side, via `prev.Cancel(); <-prev.Done`).
-ESC provides a pure-cancel path when the user wants to stop without sending anything new.
+immediately cancels the previous turn and starts a new one. The new turn waits
+internally on `prev.StoreDone` before writing history, so the SSE stream is
+established without any HTTP-level blocking.
+
+ESC provides a pure-cancel path (POST `/cancel`) when the user wants to stop
+without sending anything new.
 
 `/cancel` calls `activeHandle.Cancel()` and returns `204`. The running
 `handleChat` goroutine receives `context.Canceled` from `<-h.Done`, sends
