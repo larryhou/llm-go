@@ -114,9 +114,26 @@ func Select(msgs []*store.Message, allParts map[string][]*store.Part, model llm.
 		}
 	}
 
-	// Need more turns than tailTurns to have anything to summarise
+	// Aligned with opencode compaction.ts select():
+	// When there are not enough turns to split (≤ tailTurns), or when the budget
+	// calculation places the tail start at index 0, summarise ALL messages as the
+	// head with no tail preserved verbatim (tail_start_id = "").
+	// This avoids "nothing to summarise" errors after repeated compaction rounds
+	// where the visible history has already been trimmed to a small number of turns.
 	if len(turns) <= tailTurns {
-		return SelectResult{Head: nil, TailStartID: ""}
+		// Still compute RecentHead (last ≤2 turns of the full head) so that Step 6
+		// of Compact() can write a PartTypeRecentContext excerpt onto the boundary
+		// message. This gives the LLM a verbatim anchor even when the entire history
+		// is summarised.
+		var recentHead []*store.Message
+		if len(turns) >= 1 {
+			startTurnIdx := len(turns) - 2
+			if startTurnIdx < 0 {
+				startTurnIdx = 0
+			}
+			recentHead = msgs[turns[startTurnIdx].StartIdx:]
+		}
+		return SelectResult{Head: msgs, TailStartID: "", RecentHead: recentHead}
 	}
 
 	// Determine how many of the most recent turns fit in the tail budget.
@@ -145,18 +162,32 @@ func Select(msgs []*store.Message, allParts map[string][]*store.Part, model llm.
 
 	tailMsgIdx := turns[tailStartTurnIdx].StartIdx
 	if tailMsgIdx == 0 {
-		// All messages are in the tail → nothing to summarise
-		return SelectResult{Head: nil, TailStartID: ""}
+		// Budget covers all turns — summarise everything with no verbatim tail.
+		// Aligned with opencode: keep.start == 0 → head = all messages, tail_start_id = undefined.
+		// Still compute RecentHead for the last ≤2 turns so Step 6 writes the RC excerpt.
+		var recentHead []*store.Message
+		if len(turns) >= 1 {
+			startTurnIdx := tailStartTurnIdx - 2
+			if startTurnIdx < 0 {
+				startTurnIdx = 0
+			}
+			recentHead = msgs[turns[startTurnIdx].StartIdx:]
+		}
+		return SelectResult{Head: msgs, TailStartID: "", RecentHead: recentHead}
 	}
 
 	// Compute RecentHead: the last 2 real turns within Head (those immediately
-	// before the tail). Populated when head has at least 2 real turns so the
-	// excerpt covers the most recently active discussion. When head has exactly
-	// 2 turns (tailStartTurnIdx == 2) we still capture them — they are the
-	// entire head and the most likely to be mis-summarised.
+	// before the tail). Populated whenever the head is non-empty (tailStartTurnIdx >= 1)
+	// so the excerpt is always written after any compaction. When head has only 1 turn
+	// (tailStartTurnIdx == 1), recentStartIdx clamps to turns[0].StartIdx, capturing
+	// the single head turn verbatim.
 	var recentHead []*store.Message
-	if tailStartTurnIdx >= 2 {
-		recentStartIdx := turns[tailStartTurnIdx-2].StartIdx
+	if tailStartTurnIdx >= 1 {
+		recentTurnIdx := tailStartTurnIdx - 2
+		if recentTurnIdx < 0 {
+			recentTurnIdx = 0
+		}
+		recentStartIdx := turns[recentTurnIdx].StartIdx
 		recentHead = msgs[recentStartIdx:tailMsgIdx]
 	}
 
@@ -216,6 +247,12 @@ func NewCompactor(s store.Store, processor *Processor) *Compactor {
 //
 // Returns the summary message ID on success.
 func (c *Compactor) Compact(ctx context.Context, sessionID string, input ProcessInput) (string, error) {
+	// Detach from the caller's cancellation so that compaction (especially the
+	// summary LLM call) completes even if the HTTP request context is cancelled
+	// (e.g. the SSE client disconnects mid-stream while we are summarising).
+	// context.WithoutCancel inherits values but ignores cancellation.
+	ctx = context.WithoutCancel(ctx)
+
 	// Load all messages for this session
 	msgs, err := c.store.ListMessages(ctx, sessionID)
 	if err != nil {

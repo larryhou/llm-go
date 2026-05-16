@@ -384,7 +384,12 @@ func (s *server) handleChat(w http.ResponseWriter, r *http.Request) {
 	if sessID == "" {
 		sessID = fmt.Sprintf("sess-%d", time.Now().UnixNano())
 	}
-	ctx := r.Context()
+	// Detach from the HTTP request context so that RunLoop (and compaction) are
+	// not cancelled when the SSE client disconnects mid-stream. This allows
+	// multi-step agentic turns and compaction to complete even when curl or a
+	// browser closes the connection after reading partial output.
+	// context.WithoutCancel inherits request-scoped values but ignores cancellation.
+	ctx := context.WithoutCancel(r.Context())
 
 	// Set SSE headers first so all error responses are delivered as SSE events.
 	w.Header().Set("Content-Type", "text/event-stream")
@@ -680,11 +685,7 @@ func (p *sseProvider) Stream(ctx context.Context, req llm.Request) (<-chan llm.E
 					"input": ev.Input,
 				})
 			}
-			select {
-			case out <- ev:
-			case <-ctx.Done():
-				return
-			}
+			out <- ev
 		}
 	}()
 	return out, nil
