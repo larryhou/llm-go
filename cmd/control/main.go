@@ -37,6 +37,7 @@ import (
 	"github.com/larryhou/llm-go/session"
 	"github.com/larryhou/llm-go/store"
 	"github.com/larryhou/llm-go/store/memory"
+	sqlitestore "github.com/larryhou/llm-go/store/sqlite"
 	"github.com/larryhou/llm-go/tool"
 	"github.com/larryhou/llm-go/tool/builtin"
 )
@@ -50,6 +51,7 @@ type appConfig struct {
 	maxSteps     int
 	contextLimit int
 	skillsDir    string
+	storeDSN     string
 	web          bool
 	debug        bool
 }
@@ -218,6 +220,7 @@ func main() {
 	flag.IntVar(&cfg.maxSteps, "max-steps", 20, "max agentic steps per turn")
 	flag.IntVar(&cfg.contextLimit, "context-limit", 128000, "context window token limit")
 	flag.StringVar(&cfg.skillsDir, "skills", ".opencode", "skills root directory to index")
+	flag.StringVar(&cfg.storeDSN, "store", "memory", "store DSN: \"memory\" or \"sqlite:<path>\"")
 	flag.BoolVar(&cfg.web, "web", false, "start web UI instead of REPL (port chosen automatically)")
 	flag.BoolVar(&cfg.debug, "debug", false, "record each turn to <session-id>/chat-<ts>.json")
 	flag.Parse()
@@ -327,6 +330,27 @@ func main() {
 		&builtin.ShellTool{WorkDir: cwd},
 	}
 
+	// ── session store ─────────────────────────────────────────────────────────
+
+	var sessionStore store.Store
+	switch {
+	case cfg.storeDSN == "" || cfg.storeDSN == "memory":
+		sessionStore = memory.New()
+	default:
+		path, ok := strings.CutPrefix(cfg.storeDSN, "sqlite:")
+		if !ok {
+			fmt.Fprintf(os.Stderr, "unknown store DSN %q — use \"memory\" or \"sqlite:<path>\"\n", cfg.storeDSN)
+			os.Exit(1)
+		}
+		st, err := sqlitestore.Open(path)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "open sqlite store: %v\n", err)
+			os.Exit(1)
+		}
+		defer st.Close()
+		sessionStore = st
+	}
+
 	// ── skills index + knowledge tools ───────────────────────────────────────
 
 	// sessionID declared here so it can be used by SessionHistorySource below.
@@ -351,10 +375,14 @@ func main() {
 		} else {
 			skillsCount = n
 
-			// SessionHistorySource: indexes compacted messages for recall.
-			// Priority 0 (highest) — queried before skills index (priority 1).
+			// If the store implements knowledge.PersistStore, wire it as the
+			// L2 backend so compacted history survives process restarts.
+			var ps knowledge.PersistStore
+			if p, ok := sessionStore.(knowledge.PersistStore); ok {
+				ps = p
+			}
 			var histErr error
-			historySrc, histErr = knowledge.NewSessionHistorySource(sessionID, knowledge.DefaultMaxCompactions)
+			historySrc, histErr = knowledge.NewSessionHistorySource(sessionID, knowledge.DefaultMaxCompactions, ps)
 			if histErr != nil {
 				fmt.Fprintf(os.Stderr, "[warn] failed to create session history source: %v\n", histErr)
 			} else {
@@ -368,6 +396,7 @@ func main() {
 				ContentMaxChars:     8000,
 				AllowPartialFailure: true,
 			})
+			// Skills index: priority 1 (lower priority than history).
 			km.Register(blevesource.New(idx, "skills", 1, &blevesource.Config{
 				TitleField:   "title",
 				ContentField: "content",
@@ -378,10 +407,6 @@ func main() {
 			tools = append(tools, km.Tools()...)
 		}
 	}
-
-	// ── session store ─────────────────────────────────────────────────────────
-
-	sessionStore := memory.New()
 	// ctx is cancelled on SIGTERM only. SIGINT (Ctrl-C) is handled per-turn
 	// by intSig below so that the user can cancel a running turn without
 	// exiting the whole process.

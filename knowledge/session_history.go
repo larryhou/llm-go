@@ -41,7 +41,7 @@ const (
 )
 
 // DefaultMaxCompactions is the default number of compaction rounds whose
-// documents are retained in the index. Each round is ~5-6 MB; 8 rounds ≈ 50 MB.
+// documents are retained in the Bleve index. Each round is ~5-6 MB; 8 rounds ≈ 50 MB.
 const DefaultMaxCompactions = 8
 
 // CompactionHook is called after a successful Compact(), receiving the head
@@ -66,29 +66,56 @@ type HistoryDoc struct {
 }
 
 // SessionHistorySource is a knowledge.Source backed by a per-session Bleve
-// in-memory index. It indexes compacted messages via a CompactionHook and
-// exposes them through knowledge_search / knowledge_fetch.
+// in-memory index (L1 hot cache) with an optional PersistStore backend (L2).
 //
-// Each instance owns a single private Bleve index — cross-session leakage is
-// impossible by construction. The index is released when the struct is GC'd.
+// # Two-layer cache semantics
 //
-// Memory is bounded by maxCompactions: when a new compaction round would exceed
-// the limit, the oldest round's documents are deleted first.
+//   - L1 (Bleve in-memory): fast gse-segmented full-text search; bounded to
+//     maxCompactions rounds (~50 MB). Rounds are evicted LRU-style when the
+//     cap is reached.
+//   - L2 (PersistStore, optional): durable SQLite storage; unlimited capacity;
+//     permanent until Reset(). On a cache miss (seq not in Bleve), the missing
+//     round is page-faulted in from L2, then the LRU policy re-applied.
+//
+// # Startup recovery
+//
+// If a PersistStore is provided, LoadHistoryDocs is called once at construction
+// to restore the known seq map (compactionDocs keys + doc IDs). The Bleve index
+// starts empty; rounds are loaded on first Peek() that touches them.
+//
+// # Memory bound
+//
+// The Bleve index never holds more than maxCompactions rounds simultaneously.
+// Evicted rounds remain in SQLite and are re-loaded on the next miss.
 type SessionHistorySource struct {
 	sessionID      string
 	index          bleve.Index
 	maxCompactions int
-	compactionDocs map[int][]string // compactionSeq → []docID
+	compactionDocs map[int][]string // seq → []docID  (all known seqs, incl. evicted)
 	currentSeq     int
-	mu             sync.Mutex
+
+	// L2 persistent backend; nil = pure-memory mode
+	persistStore PersistStore
+
+	// LRU tracking for the Bleve index (L1 only).
+	// loadedSeqs is the set of seqs currently in Bleve.
+	// lruOrder[0] = least recently used, lruOrder[len-1] = most recently used.
+	loadedSeqs map[int]struct{}
+	lruOrder   []int
+
+	mu sync.Mutex
 }
 
 // NewSessionHistorySource creates a SessionHistorySource with a private
 // in-memory Bleve index using gse for Chinese text segmentation.
 //
-// maxCompactions controls how many compaction rounds are retained (default 8).
-// Pass 0 to use DefaultMaxCompactions.
-func NewSessionHistorySource(sessionID string, maxCompactions int) (*SessionHistorySource, error) {
+// maxCompactions controls how many compaction rounds are held in Bleve (default
+// DefaultMaxCompactions). Pass 0 to use the default.
+//
+// ps is the optional persistent backend (knowledge.PersistStore, implemented by
+// sqlite.HistorySource). Pass nil for pure-memory mode — history is lost on
+// process restart but behaviour is otherwise identical.
+func NewSessionHistorySource(sessionID string, maxCompactions int, ps PersistStore) (*SessionHistorySource, error) {
 	if maxCompactions <= 0 {
 		maxCompactions = DefaultMaxCompactions
 	}
@@ -100,12 +127,34 @@ func NewSessionHistorySource(sessionID string, maxCompactions int) (*SessionHist
 	if err != nil {
 		return nil, fmt.Errorf("session history source: create index: %w", err)
 	}
-	return &SessionHistorySource{
+
+	src := &SessionHistorySource{
 		sessionID:      sessionID,
 		index:          idx,
 		maxCompactions: maxCompactions,
 		compactionDocs: make(map[int][]string),
-	}, nil
+		persistStore:   ps,
+		loadedSeqs:     make(map[int]struct{}),
+	}
+
+	// Restore known seq map from L2 without loading doc content into Bleve.
+	if ps != nil {
+		docs, err := ps.LoadRecords(context.Background(), sessionID)
+		if err == nil {
+			for seq, seqDocs := range docs {
+				ids := make([]string, len(seqDocs))
+				for i, d := range seqDocs {
+					ids[i] = d.ID
+				}
+				src.compactionDocs[seq] = ids
+				if seq > src.currentSeq {
+					src.currentSeq = seq
+				}
+			}
+		}
+	}
+
+	return src, nil
 }
 
 // ID implements knowledge.Source.
@@ -115,12 +164,18 @@ func (s *SessionHistorySource) ID() string { return sessionHistorySourceID }
 func (s *SessionHistorySource) Priority() int { return 0 }
 
 // Reset discards all indexed history and resets the source to its initial empty
-// state. Use this when the session is being fully reset (all messages cleared).
-// The SessionHistorySource remains usable after Reset — future compactions will
-// index into the fresh empty index.
+// state. If a PersistStore is configured, all history_docs for this session are
+// permanently deleted from SQLite — this is the "wipe memory" operation.
 func (s *SessionHistorySource) Reset() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	// Permanently delete from L2 before clearing L1.
+	if s.persistStore != nil {
+		for seq := range s.compactionDocs {
+			_ = s.persistStore.DeleteRecordsBySeq(context.Background(), s.sessionID, seq)
+		}
+	}
 
 	s.index.Close()
 	s.index = nil // guard against use-after-close if rebuild below fails
@@ -135,6 +190,8 @@ func (s *SessionHistorySource) Reset() error {
 	}
 	s.index = idx
 	s.compactionDocs = make(map[int][]string)
+	s.loadedSeqs = make(map[int]struct{})
+	s.lruOrder = nil
 	s.currentSeq = 0
 	return nil
 }
@@ -145,14 +202,24 @@ func (s *SessionHistorySource) Accepts(q Query) bool {
 }
 
 // Peek implements knowledge.Source for QueryTypeSearch.
-// It runs a Bleve highlight search and returns up to snippetMaxResults snippets,
-// each showing snippetFragmentSize characters around matched terms (max snippetMaxFragments fragments).
+// It runs a Bleve highlight search and returns up to snippetMaxResults snippets.
+// On a cache miss (a known seq is not yet in Bleve), the missing rounds are
+// page-faulted in from the PersistStore before the search is executed.
 func (s *SessionHistorySource) Peek(ctx context.Context, q Query) ([]Result, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	if s.index == nil {
 		return nil, fmt.Errorf("session history peek: index unavailable (reset in progress)")
+	}
+
+	// Page-in any known seqs that are not yet in Bleve (L2 → L1).
+	if s.persistStore != nil {
+		for seq := range s.compactionDocs {
+			if _, loaded := s.loadedSeqs[seq]; !loaded {
+				s.pageIn(ctx, seq)
+			}
+		}
 	}
 
 	input := strings.TrimSpace(q.Input)
@@ -186,7 +253,6 @@ func (s *SessionHistorySource) Peek(ctx context.Context, q Query) ([]Result, err
 
 		snippet := extractFragments(hit.Fragments, fieldText)
 		if snippet == "" {
-			// fallback: fetch stored text and truncate
 			snippet = s.storedText(hit.ID)
 			if len(snippet) > snippetFragmentSize {
 				snippet = snippet[:snippetFragmentSize] + "..."
@@ -213,6 +279,7 @@ func (s *SessionHistorySource) Peek(ctx context.Context, q Query) ([]Result, err
 
 // Fetch implements knowledge.Source for QueryTypeFetch.
 // It retrieves the full text of a previously indexed message by its ref_id.
+// If the doc's seq is not in Bleve, it is page-faulted in first.
 func (s *SessionHistorySource) Fetch(ctx context.Context, q Query) ([]Result, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -226,6 +293,16 @@ func (s *SessionHistorySource) Fetch(ctx context.Context, q Query) ([]Result, er
 		docID = strings.TrimPrefix(docID, pfx)
 	}
 
+	// If not in Bleve yet, page-in the seq that owns this doc.
+	if _, err := s.index.Document(docID); err != nil || func() bool {
+		d, _ := s.index.Document(docID)
+		return d == nil
+	}() {
+		if s.persistStore != nil {
+			s.pageInByDocID(ctx, docID)
+		}
+	}
+
 	doc, err := s.index.Document(docID)
 	if err != nil {
 		return nil, fmt.Errorf("session history fetch %q: %w", docID, err)
@@ -234,8 +311,6 @@ func (s *SessionHistorySource) Fetch(ctx context.Context, q Query) ([]Result, er
 		return nil, fmt.Errorf("session history fetch %q: not found", docID)
 	}
 
-	// VisitFields may visit the same logical field multiple times if Bleve stores
-	// it in multiple physical index columns. Accumulate all values per field.
 	fieldVals := make(map[string]*strings.Builder)
 	doc.VisitFields(func(f index.Field) {
 		b := fieldVals[f.Name()]
@@ -276,10 +351,11 @@ func (s *SessionHistorySource) Fetch(ctx context.Context, q Query) ([]Result, er
 }
 
 // Hook returns a CompactionHook that indexes the compacted head messages into
-// this source. Pass the result to RunInput.OnCompact.
+// this source. If a PersistStore is configured, each doc is also persisted to
+// SQLite synchronously before the function returns.
 //
-// When the number of retained compaction rounds reaches maxCompactions, the
-// oldest round's documents are deleted from the index before indexing the new round.
+// When the number of Bleve-held rounds reaches maxCompactions, the LRU-oldest
+// round is evicted from Bleve (but kept in SQLite).
 func (s *SessionHistorySource) Hook() CompactionHook {
 	return func(head []*store.Message, parts map[string][]*store.Part) {
 		s.mu.Lock()
@@ -291,24 +367,89 @@ func (s *SessionHistorySource) Hook() CompactionHook {
 
 		s.currentSeq++
 
-		// Prune oldest round if we've hit the limit.
-		if len(s.compactionDocs) >= s.maxCompactions {
-			oldest := s.oldestSeq()
-			for _, id := range s.compactionDocs[oldest] {
-				_ = s.index.Delete(id)
-			}
-			delete(s.compactionDocs, oldest)
-		}
-
-		// Index all messages in this compaction round.
+		// Index all messages in this compaction round into Bleve + SQLite.
 		var ids []string
 		for i, m := range head {
 			doc := buildDoc(m, parts[m.ID], s.currentSeq, i)
 			_ = s.index.Index(m.ID, doc)
 			ids = append(ids, m.ID)
+
+			// Persist to L2 synchronously.
+			if s.persistStore != nil {
+				_ = s.persistStore.SaveRecord(
+					context.Background(), s.sessionID, doc)
+			}
 		}
+
 		s.compactionDocs[s.currentSeq] = ids
+		s.loadedSeqs[s.currentSeq] = struct{}{}
+		s.lruOrder = append(s.lruOrder, s.currentSeq)
+
+		// LRU eviction from Bleve if we're over the cap.
+		s.evictIfNeeded()
 	}
+}
+
+// ── LRU / page-in helpers ─────────────────────────────────────────────────────
+
+// pageIn loads all docs for the given seq from L2 into Bleve and updates the
+// LRU order. Must be called with s.mu held.
+func (s *SessionHistorySource) pageIn(ctx context.Context, seq int) {
+	if _, loaded := s.loadedSeqs[seq]; loaded {
+		return
+	}
+	allDocs, err := s.persistStore.LoadRecords(ctx, s.sessionID)
+	if err != nil {
+		return
+	}
+	for _, doc := range allDocs[seq] {
+		_ = s.index.Index(doc.ID, doc)
+	}
+	s.loadedSeqs[seq] = struct{}{}
+	s.lruOrder = append(s.lruOrder, seq)
+	s.evictIfNeeded()
+}
+
+// pageInByDocID finds which seq owns docID and pages it in.
+// Must be called with s.mu held.
+func (s *SessionHistorySource) pageInByDocID(ctx context.Context, docID string) {
+	for seq, ids := range s.compactionDocs {
+		for _, id := range ids {
+			if id == docID {
+				s.pageIn(ctx, seq)
+				return
+			}
+		}
+	}
+}
+
+// evictIfNeeded removes the LRU-oldest seq from Bleve when loadedSeqs exceeds
+// maxCompactions. The SQLite copy is untouched.
+// Must be called with s.mu held.
+func (s *SessionHistorySource) evictIfNeeded() {
+	for len(s.loadedSeqs) > s.maxCompactions && len(s.lruOrder) > 0 {
+		oldest := s.lruOrder[0]
+		s.lruOrder = s.lruOrder[1:]
+		if _, ok := s.loadedSeqs[oldest]; !ok {
+			continue // already evicted
+		}
+		for _, id := range s.compactionDocs[oldest] {
+			_ = s.index.Delete(id)
+		}
+		delete(s.loadedSeqs, oldest)
+	}
+}
+
+// touchLRU marks seq as most-recently used in lruOrder.
+// Must be called with s.mu held.
+func (s *SessionHistorySource) touchLRU(seq int) {
+	for i, v := range s.lruOrder {
+		if v == seq {
+			s.lruOrder = append(s.lruOrder[:i], s.lruOrder[i+1:]...)
+			break
+		}
+	}
+	s.lruOrder = append(s.lruOrder, seq)
 }
 
 // ── helpers ───────────────────────────────────────────────────────────────────
@@ -380,9 +521,6 @@ func buildDoc(m *store.Message, parts []*store.Part, seq, turnIdx int) HistoryDo
 func buildIndexMapping() (mapping.IndexMapping, error) {
 	im := bleve.NewIndexMapping()
 
-	// Register gse_lowercase analyzer: gse tokenizer (registered by gsetokenizer
-	// init()) + lowercase filter. The "custom" type and "to_lower" filter name
-	// are Bleve built-ins; we use string literals to avoid importing the packages.
 	if err := im.AddCustomAnalyzer(historyAnalyzer, map[string]interface{}{
 		"type":          "custom",
 		"tokenizer":     "gse",
@@ -393,25 +531,21 @@ func buildIndexMapping() (mapping.IndexMapping, error) {
 
 	dm := bleve.NewDocumentMapping()
 
-	// text field: gse_lowercase for Chinese + ASCII search
 	textField := bleve.NewTextFieldMapping()
 	textField.Analyzer = historyAnalyzer
 	textField.Store = true
 	dm.AddFieldMappingsAt(fieldText, textField)
 
-	// role field: keyword (exact match)
 	roleField := bleve.NewTextFieldMapping()
 	roleField.Analyzer = "keyword"
 	roleField.Store = true
 	dm.AddFieldMappingsAt(fieldRole, roleField)
 
-	// tool_calls field: keyword (tool names must not be split)
 	toolField := bleve.NewTextFieldMapping()
 	toolField.Analyzer = "keyword"
 	toolField.Store = true
 	dm.AddFieldMappingsAt(fieldToolCalls, toolField)
 
-	// numeric fields: stored for retrieval
 	seqField := bleve.NewNumericFieldMapping()
 	seqField.Store = true
 	dm.AddFieldMappingsAt("compaction_seq", seqField)
@@ -431,8 +565,6 @@ func extractFragments(fragments map[string][]string, field string) string {
 	if !ok || len(frags) == 0 {
 		return ""
 	}
-	// Strip all HTML tags inserted by bleve's highlighter (e.g. <mark>, <em>,
-	// <strong>) regardless of which highlight style is configured.
 	var clean []string
 	for _, f := range frags {
 		clean = append(clean, htmlTagRe.ReplaceAllString(f, ""))

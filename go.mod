@@ -8,6 +8,7 @@ require (
 	github.com/blevesearch/bleve_index_api v1.3.11
 	github.com/go-ego/gse v1.0.2
 	github.com/openai/openai-go v1.12.0
+	modernc.org/sqlite v1.50.1
 )
 
 require (
@@ -32,11 +33,16 @@ require (
 	github.com/blevesearch/zapx/v16 v16.3.4 // indirect
 	github.com/blevesearch/zapx/v17 v17.1.2 // indirect
 	github.com/buger/jsonparser v1.1.2 // indirect
+	github.com/dustin/go-humanize v1.0.1 // indirect
 	github.com/golang/snappy v1.0.0 // indirect
+	github.com/google/uuid v1.6.0 // indirect
 	github.com/invopop/jsonschema v0.13.0 // indirect
 	github.com/json-iterator/go v0.0.0-20171115153421-f7279a603ede // indirect
 	github.com/mailru/easyjson v0.7.7 // indirect
+	github.com/mattn/go-isatty v0.0.20 // indirect
 	github.com/mschoch/smat v0.2.0 // indirect
+	github.com/ncruces/go-strftime v1.0.0 // indirect
+	github.com/remyoudompheng/bigfft v0.0.0-20230129092748-24d4a6f8daec // indirect
 	github.com/standard-webhooks/standard-webhooks/libraries v0.0.0-20260427160145-3afa6683f8b2 // indirect
 	github.com/tidwall/gjson v1.18.0 // indirect
 	github.com/tidwall/match v1.1.1 // indirect
@@ -45,9 +51,11 @@ require (
 	github.com/vcaesar/cedar v0.30.0 // indirect
 	github.com/wk8/go-ordered-map/v2 v2.1.8 // indirect
 	go.etcd.io/bbolt v1.4.0 // indirect
-	golang.org/x/sync v0.16.0 // indirect
+	golang.org/x/sync v0.20.0 // indirect
 	golang.org/x/sys v0.44.0 // indirect
-	golang.org/x/term v0.43.0 // indirect
 	google.golang.org/protobuf v1.36.6 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
+	modernc.org/libc v1.72.3 // indirect
+	modernc.org/mathutil v1.7.1 // indirect
+	modernc.org/memory v1.11.0 // indirect
 )

@@ -72,6 +72,7 @@ import (
 	"github.com/larryhou/llm-go/session"
 	"github.com/larryhou/llm-go/store"
 	"github.com/larryhou/llm-go/store/memory"
+	sqlitestore "github.com/larryhou/llm-go/store/sqlite"
 	"github.com/larryhou/llm-go/tool"
 )
 
@@ -83,6 +84,7 @@ type serverConfig struct {
 	sourceID   string
 	snippetMax int
 	contentMax int
+	storeDSN   string
 	// LLM
 	provider string
 	baseURL  string
@@ -98,6 +100,7 @@ func main() {
 	flag.StringVar(&cfg.sourceID, "source", "skills", "source ID prefix for RefIDs")
 	flag.IntVar(&cfg.snippetMax, "snippet-max", 400, "max chars per snippet")
 	flag.IntVar(&cfg.contentMax, "content-max", 8000, "max chars for fetched content")
+	flag.StringVar(&cfg.storeDSN, "store", "memory", "store DSN: \"memory\" or \"sqlite:<path>\"")
 	flag.StringVar(&cfg.provider, "provider", envOr("TIMI_PROVIDER", "anthropic"), "LLM provider: anthropic or openai")
 	flag.StringVar(&cfg.baseURL, "llm-url", envOr("TIMI_BASE_URL", ""), "LLM base URL (default depends on provider)")
 	flag.StringVar(&cfg.apiKey, "llm-key", envOr("TIMI_API_KEY", "sk-zzz6FtyLMyuobNNOukwgobP0l1F3TjMO"), "LLM API key")
@@ -186,8 +189,23 @@ func main() {
 		ContentField: "content",
 	}))
 
-	// Session store: one in-memory store shared across all /chat sessions.
-	sessionStore := memory.New()
+	// Session store: shared across all /chat sessions.
+	var sessionStore store.Store
+	switch {
+	case cfg.storeDSN == "" || cfg.storeDSN == "memory":
+		sessionStore = memory.New()
+	default:
+		path, ok := strings.CutPrefix(cfg.storeDSN, "sqlite:")
+		if !ok {
+			log.Fatalf("unknown store DSN %q — use \"memory\" or \"sqlite:<path>\"", cfg.storeDSN)
+		}
+		st, err := sqlitestore.Open(path)
+		if err != nil {
+			log.Fatalf("open sqlite store: %v", err)
+		}
+		defer st.Close()
+		sessionStore = st
+	}
 	var sessionCount atomic.Int64
 
 	srv := &server{
@@ -425,7 +443,14 @@ func (s *server) handleChat(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
 	sess, exists := s.sessions[sessID]
 	if !exists {
-		historySrc, histErr := knowledge.NewSessionHistorySource(sessID, knowledge.DefaultMaxCompactions)
+		// If the store implements knowledge.PersistStore, wire it as the
+		// L2 backend so compacted history survives process restarts.
+		var ps knowledge.PersistStore
+		if p, ok := s.sessionStore.(knowledge.PersistStore); ok {
+			ps = p
+		}
+
+		historySrc, histErr := knowledge.NewSessionHistorySource(sessID, knowledge.DefaultMaxCompactions, ps)
 		if histErr != nil {
 			s.mu.Unlock()
 			sendEvent(map[string]any{"type": "error", "error": "create history source: " + histErr.Error()})
