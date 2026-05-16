@@ -150,10 +150,12 @@ func Select(msgs []*store.Message, allParts map[string][]*store.Part, model llm.
 	}
 
 	// Compute RecentHead: the last 2 real turns within Head (those immediately
-	// before the tail). Only populated when head has more than 2 real turns;
-	// otherwise the content would duplicate the tail which is already verbatim.
+	// before the tail). Populated when head has at least 2 real turns so the
+	// excerpt covers the most recently active discussion. When head has exactly
+	// 2 turns (tailStartTurnIdx == 2) we still capture them — they are the
+	// entire head and the most likely to be mis-summarised.
 	var recentHead []*store.Message
-	if tailStartTurnIdx > 2 {
+	if tailStartTurnIdx >= 2 {
 		recentStartIdx := turns[tailStartTurnIdx-2].StartIdx
 		recentHead = msgs[recentStartIdx:tailMsgIdx]
 	}
@@ -365,6 +367,7 @@ func (c *Compactor) Compact(ctx context.Context, sessionID string, input Process
 
 	return summaryMsgID, nil
 }
+
 // buildRecentContextExcerpt renders a compact verbatim excerpt of msgs for
 // embedding into the compaction boundary message. Each message is rendered as
 // a labelled block with text truncated to keep the total size manageable.
@@ -470,6 +473,10 @@ type ToModelOptions struct {
 }
 
 // ToModelMessagesWithOptions is like ToModelMessages but with compaction options.
+// Used for building the head message list sent to the summary LLM during compaction.
+// Applies the same interrupted/cancelled message handling as ToModelMessages so that
+// a head containing partial assistant turns does not send malformed messages to the
+// summary LLM (e.g. an assistant tool-call with no matching tool-result).
 func ToModelMessagesWithOptions(msgs []*store.Message, parts map[string][]*store.Part, opts ToModelOptions) ([]llm.Message, error) {
 	var out []llm.Message
 	for _, m := range msgs {
@@ -477,10 +484,35 @@ func ToModelMessagesWithOptions(msgs []*store.Message, parts map[string][]*store
 		switch m.Role {
 		case store.RoleUser:
 			userParts := buildUserParts(ps, opts)
-			if len(userParts) > 0 {
-				out = append(out, llm.Message{Role: llm.RoleUser, Content: userParts})
+			if len(userParts) == 0 {
+				continue
 			}
+			// Same consecutive-user-message guard as ToModelMessages.
+			if len(out) > 0 && out[len(out)-1].Role == llm.RoleUser {
+				out = append(out, llm.Message{
+					Role:    llm.RoleAssistant,
+					Content: []llm.ContentPart{llm.NewTextPart(" ")},
+				})
+			}
+			out = append(out, llm.Message{Role: llm.RoleUser, Content: userParts})
+
 		case store.RoleAssistant:
+			// Cancelled: no content; skip entirely (consecutive-user guard above handles gap).
+			if m.Status == store.MessageStatusCancelled {
+				continue
+			}
+			// Interrupted: keep only completed tool calls to avoid dangling tool-call/result pairs.
+			if m.Status == store.MessageStatusInterrupted {
+				assistantParts, toolResults := buildAssistantPartsInterrupted(ps)
+				if len(assistantParts) == 0 {
+					continue
+				}
+				out = append(out, llm.Message{Role: llm.RoleAssistant, Content: assistantParts})
+				if len(toolResults) > 0 {
+					out = append(out, llm.Message{Role: llm.RoleTool, Content: toolResults})
+				}
+				continue
+			}
 			if m.Error != nil && !hasRealContent(ps) {
 				continue
 			}
@@ -568,7 +600,10 @@ func buildAssistantPartsWithOpts(m *store.Message, ps []*store.Part, opts ToMode
 // Aligned with packages/opencode/src/session/compaction.ts prune().
 //
 // Only runs when cfg.compaction.prune == true (default false).
-// Called as a fire-and-forget goroutine after each successful RunLoop.
+// Called synchronously at the end of each successful RunLoop (ProcessStop path),
+// with a 10-second timeout, so that RunLoopAsync.Done is only closed after
+// Prune completes — preventing a concurrent new RunLoop from racing with
+// Prune's UpdatePart writes on the same session.
 //
 // Algorithm:
 //  1. Walk messages backward

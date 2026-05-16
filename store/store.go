@@ -58,6 +58,23 @@ type TokenSummary struct {
 	CacheWrite int
 }
 
+// MessageStatus discriminators for Message.Status.
+const (
+	// MessageStatusNormal is the default state — no special handling needed.
+	MessageStatusNormal = ""
+	// MessageStatusInterrupted marks an assistant message that was cut short
+	// by Cancel() after the LLM had already emitted some content (text or tool
+	// calls). Completed tool calls are preserved in context; pending/running
+	// ones are surfaced as errors. An explicit interruption notice is appended
+	// when the message contained tool calls, so the LLM does not retry them.
+	MessageStatusInterrupted = "interrupted"
+	// MessageStatusCancelled marks an assistant message whose LLM turn was
+	// cancelled before any content was emitted. The message has no parts and
+	// is invisible to the LLM; a silent " " placeholder is injected between
+	// any two consecutive user messages to satisfy protocol requirements.
+	MessageStatusCancelled = "cancelled"
+)
+
 // Message is a single turn in a conversation.
 type Message struct {
 	ID        string
@@ -69,6 +86,11 @@ type Message struct {
 	Error     *MessageError // set if assistant turn errored
 	Summary   bool          // true if this is a compaction summary message
 	Tokens    TokenSummary
+	// Status captures the lifecycle state of an assistant message.
+	// Empty string (MessageStatusNormal) is the default and requires no special
+	// handling. Set to MessageStatusInterrupted or MessageStatusCancelled by
+	// RunLoopAsync when Cancel() fires before the turn completes.
+	Status string
 }
 
 // MessageError represents an error on an assistant message.

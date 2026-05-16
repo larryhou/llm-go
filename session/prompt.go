@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/larryhou/llm-go/config"
@@ -68,11 +69,70 @@ type RunInput struct {
 	OnCompact knowledge.CompactionHook
 }
 
-// RunLoop is the main agentic loop for a session.
-// It handles the complete lifecycle: user message → LLM call → tool execution
-// → context compaction → next turn, until the LLM stops or an error occurs.
-// Aligned with packages/opencode/src/session/prompt.ts runLoop().
+// RunHandle is returned by RunLoopAsync. It allows the caller to cancel the
+// in-flight loop and observe when it has fully exited.
+//
+// Usage:
+//
+//	h := session.RunLoopAsync(ctx, store, input)
+//	// ... later ...
+//	h.Cancel()   // request cancellation (idempotent)
+//	<-h.Done     // wait for full cleanup; safe to start a new RunLoop after this
+//	result, err := h.Result, h.Err
+//
+// Memory model: all writes to Result and Err happen-before close(Done), which
+// happens-before any receive on Done. No additional synchronisation is needed.
+type RunHandle struct {
+	// Done is closed after the loop has fully exited and all cleanup is complete
+	// (including Prune). Safe to start a new RunLoop on the same session after
+	// receiving from Done.
+	Done <-chan struct{}
+
+	// Result and Err are set before Done is closed. Read them only after <-Done.
+	Result RunResult
+	Err    error
+
+	cancel context.CancelFunc
+	once   sync.Once
+}
+
+// Cancel requests cancellation of the running loop. It is idempotent and
+// safe to call from any goroutine, including concurrently with itself.
+// The loop may not stop immediately — tool goroutines are given up to 250ms
+// to exit cleanly. Wait on Done for full completion.
+func (h *RunHandle) Cancel() {
+	h.once.Do(h.cancel)
+}
+
+// RunLoopAsync starts the agentic loop in a background goroutine and returns
+// a RunHandle immediately. The caller can cancel the loop via h.Cancel() and
+// must wait on h.Done before starting a new RunLoop on the same session.
+//
+// The parent ctx controls the maximum lifetime of the loop independently of
+// Cancel — if ctx is cancelled, the loop is also cancelled.
+func RunLoopAsync(ctx context.Context, s store.Store, input RunInput) *RunHandle {
+	cancelCtx, cancel := context.WithCancel(ctx)
+	done := make(chan struct{})
+	h := &RunHandle{Done: done, cancel: cancel}
+	go func() {
+		defer close(done)
+		defer cancel() // release cancelCtx resources if loop exits naturally
+		h.Result, h.Err = runLoopInternal(cancelCtx, s, input)
+	}()
+	return h
+}
+
+// RunLoop is the synchronous wrapper around RunLoopAsync. It blocks until the
+// loop completes and returns the result. Existing callers are unaffected.
 func RunLoop(ctx context.Context, s store.Store, input RunInput) (RunResult, error) {
+	h := RunLoopAsync(ctx, s, input)
+	<-h.Done
+	return h.Result, h.Err
+}
+
+// runLoopInternal is the main agentic loop implementation.
+// Aligned with packages/opencode/src/session/prompt.ts runLoop().
+func runLoopInternal(ctx context.Context, s store.Store, input RunInput) (RunResult, error) {
 	// Create the user message
 	userMsgID := newID()
 	now := time.Now()
@@ -192,6 +252,14 @@ func RunLoop(ctx context.Context, s store.Store, input RunInput) (RunResult, err
 			Config:    input.Config,
 		})
 		if err != nil {
+			// Only mark the assistant message as cancelled/interrupted when the
+			// error is due to context cancellation (i.e. Cancel() was called).
+			// For LLM errors, network failures, etc. the message is left with
+			// no Status so the next RunLoop sees it as a normal (empty) assistant
+			// turn and ToModelMessages skips it via the len(assistantParts)==0 guard.
+			if ctx.Err() != nil {
+				markAssistantCancelled(s, assistantMsgID)
+			}
 			return RunResultStop, err
 		}
 
@@ -217,16 +285,20 @@ func RunLoop(ctx context.Context, s store.Store, input RunInput) (RunResult, err
 
 		switch result {
 		case ProcessStop:
-			// Aligned with opencode prompt.ts:1625 — run prune as a background
-			// fire-and-forget after the loop ends, only when cfg.compaction.prune=true.
-			go func() {
-				log.Printf("[session] prune triggered: input=%d", lastInputTokens)
-				if err := Prune(context.Background(), input.SessionID, s, input.Config); err != nil {
-					log.Printf("[session] prune skipped: %v", err)
-				} else {
-					log.Printf("[session] prune done")
-				}
-			}()
+			// Run prune synchronously so that Done is only closed after Prune
+			// completes — prevents a concurrent new RunLoop from racing with
+			// Prune's UpdatePart writes on the same session.
+			// Prune is a pure store operation (no LLM call); in practice it
+			// completes in milliseconds. A 10s timeout is a safety net for
+			// slow database backends.
+			pruneCtx, pruneCancel := context.WithTimeout(context.Background(), 10*time.Second)
+			log.Printf("[session] prune triggered: input=%d", lastInputTokens)
+			if err := Prune(pruneCtx, input.SessionID, s, input.Config); err != nil {
+				log.Printf("[session] prune skipped: %v", err)
+			} else {
+				log.Printf("[session] prune done")
+			}
+			pruneCancel() // explicit call — defer inside loop delays release until function return
 			return RunResultStop, nil
 
 		case ProcessCompact:
@@ -341,5 +413,35 @@ func loadMessages(ctx context.Context, s store.Store, sessionID string) ([]*stor
 		return nil, nil, err
 	}
 	return msgs, allParts, nil
+}
+
+// markAssistantCancelled sets the Status on an assistant message after an
+// incomplete Process() call due to ctx cancellation. It always uses
+// context.Background() because the caller's ctx is already cancelled.
+//
+// Status logic:
+//   - Has tool calls or real text content → MessageStatusInterrupted
+//     (partial content exists; ToModelMessages preserves completed tools)
+//   - No content at all → MessageStatusCancelled
+//     (invisible to LLM; consecutive-user-message guard inserts a placeholder)
+//
+// Known race: cleanup() inside Process() waits up to 250ms for tool goroutines.
+// After that timeout, goroutines may still be running and could write
+// ToolStatusCompleted after ListParts reads here. In that case a completed
+// tool result may be misclassified as Cancelled rather than Interrupted.
+// This window is small and the consequence is limited to the next turn seeing
+// a slightly degraded history. Eliminating it would require an unconditional
+// wait for all tool goroutines, which is a larger change left for future work.
+func markAssistantCancelled(s store.Store, assistantMsgID string) {
+	ctx := context.Background()
+	parts, _ := s.ListParts(ctx, assistantMsgID)
+	status := store.MessageStatusCancelled
+	if hasToolCalls(parts) || hasRealContent(parts) {
+		status = store.MessageStatusInterrupted
+	}
+	if m, err := s.GetMessage(ctx, assistantMsgID); err == nil {
+		m.Status = status
+		_ = s.UpdateMessage(ctx, m)
+	}
 }
 

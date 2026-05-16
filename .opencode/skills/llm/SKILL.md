@@ -267,7 +267,7 @@ if isLastStep {
 
 Prune is a lighter alternative to full compaction: instead of replacing history with a summary, it **clears old tool output content** in-place, freeing context without changing the message structure.
 
-`Prune()` is called as a **fire-and-forget goroutine** after every `ProcessStop` in `RunLoop`. It is guarded internally by `cfg.compaction.prune` (default `false`), so it is a no-op unless explicitly opt-in. Set `cfg.compaction.prune = true` to enable background pruning.
+`Prune()` is called **synchronously** (with a 10-second timeout) at the end of every `ProcessStop` path in `RunLoopAsync`'s inner goroutine. This ensures `RunHandle.Done` is only closed after Prune completes, preventing a concurrent new `RunLoop` from racing with Prune's `UpdatePart` writes on the same session. It is guarded internally by `cfg.compaction.prune` (default `false`), so it is a no-op unless explicitly opted in.
 
 ```mermaid
 flowchart TD
@@ -310,12 +310,73 @@ instead of the original output. The tool call itself (name + input) is preserved
 | | Prune | Compact |
 |---|---|---|
 | Trigger | manual / future strategy | `IsOverflow()` or provider overflow error |
-| Currently called | no (dead code) | yes, via `RunLoop` → `Compactor.Compact()` |
+| Currently called | yes, synchronous in `RunLoopAsync` goroutine (10s timeout) | yes, via `RunLoop` → `Compactor.Compact()` |
 | Message count | unchanged | large reduction (head → 1 summary message) |
 | History structure | intact | head replaced by summary + compaction boundary |
 | input token drop | small (tool outputs only) | large |
 | LLM call required | no | yes (summary generation) |
 | Crosses summary boundary | no (stops at summary) | creates new summary |
+
+---
+
+## Interruptible RunLoop — `RunLoopAsync` / `RunHandle`
+
+`RunLoop` is a synchronous blocking call. `RunLoopAsync` wraps it in a goroutine and returns a `RunHandle` immediately, enabling callers to cancel an in-flight loop and start a new one safely.
+
+### API
+
+```go
+type RunHandle struct {
+    Done   <-chan struct{} // closed after full cleanup (incl. Prune); safe to start new RunLoop after <-Done
+    Result RunResult       // available after <-Done
+    Err    error           // available after <-Done
+}
+
+func (h *RunHandle) Cancel()            // idempotent, race-safe via sync.Once
+func RunLoopAsync(ctx context.Context, s store.Store, input RunInput) *RunHandle
+func RunLoop(ctx context.Context, s store.Store, input RunInput) (RunResult, error) // thin synchronous wrapper
+```
+
+### Cancel() guarantees
+
+- `Cancel()` cancels the internal `cancelCtx`, which aborts the LLM stream and triggers `cleanup()` inside `Process()`.
+- `cleanup()` uses `context.Background()` for all store writes — not the cancelled ctx — so tool parts are correctly marked even after cancellation.
+- `Done` is closed only after `cleanup()` **and** `Prune()` complete. Callers must `<-h.Done` before starting a new `RunLoop` on the same session.
+- `Cancel()` is idempotent (`sync.Once`); concurrent calls from multiple goroutines are safe.
+
+### Message.Status — interrupted turn handling
+
+When `Cancel()` fires mid-turn, the assistant message placeholder is marked with a `Status` field:
+
+| Status | Condition | LLM treatment |
+|--------|-----------|---------------|
+| `""` (normal) | Turn completed normally | Standard path |
+| `"cancelled"` | No content emitted before cancel | Skipped; silent `" "` placeholder inserted between consecutive user messages to satisfy Anthropic/OpenAI alternating-role protocol |
+| `"interrupted"` | Partial content emitted (text or tools) | Kept with special handling (see below) |
+
+**Interrupted turn handling in `ToModelMessages`:**
+
+- **Text only, no tool calls** (`hadAnyTool=false`): partial text kept as-is; LLM infers from context naturally.
+- **Has tool calls, some completed** (`hadAnyTool=true`, `len(toolCallParts) > 0`): only completed tool calls kept; ordering is `[text/reasoning] → "[Assistant turn was interrupted by user]" → [completed tool calls]`; text before tool use satisfies Anthropic validation.
+- **Has tool calls, none completed** (`hadAnyTool=true`, `len(toolCallParts) == 0`): entire turn dropped (`nil, nil` returned); text parts discarded to avoid a dangling turn with no tool-result.
+
+**Known race:** `cleanup()` waits up to 250ms for tool goroutines. After that timeout, a goroutine may still write `ToolStatusCompleted` after `markAssistantCancelled` reads `ListParts`. In that case the message may be classified `cancelled` instead of `interrupted`, losing the completed tool result from the next turn's context. This window is small; eliminating it requires unconditional goroutine drain (future work).
+
+### Usage pattern
+
+```go
+h := session.RunLoopAsync(ctx, store, input)
+
+// ... user sends a correction while LLM is running ...
+h.Cancel()
+<-h.Done  // wait for full cleanup before starting new turn
+
+h2 := session.RunLoopAsync(ctx, store, RunInput{
+    UserMsg: "actually, just look at session/ package",
+    // ... same session ID ...
+})
+<-h2.Done
+```
 
 ---
 
@@ -409,6 +470,7 @@ Always use `DataAs` instead of bare `p.Data.(T)` assertions. The JSON fallback e
 - `sessionOrder []string` (added) mirrors the same design for sessions → `ListSessions` is now O(n), no sort needed.
 - `hasPartType(ps []*store.Part, partType string) bool` — internal helper in `session/compaction.go`, used by both `FilterCompacted` (via `context.go`) and `Select()` to identify compaction boundary messages by `PartTypeCompaction`.
 - `DeleteSession(ctx, id)` — removes all parts, messages, and session record in a single write-lock pass. Idempotent (returns nil if session does not exist). Used by `session_reset` tool.
+- `Message.Status string` — lifecycle state for assistant messages set by `RunLoopAsync` on cancellation. Zero value (`""` = `MessageStatusNormal`) requires no special handling; `"interrupted"` and `"cancelled"` are handled by `ToModelMessages` and `ToModelMessagesWithOptions`. The `memory.Store` copies structs by value so the new field is automatically persisted with zero-value compatibility.
 
 ---
 

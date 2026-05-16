@@ -18,6 +18,13 @@ import (
 //   - Tool parts: completed → output-available; error/interrupted → output-error
 //   - Compacted tool output → "[Old tool result content cleared]"
 //   - Pending/running tool parts (interrupted) → "[Tool execution was interrupted]"
+//
+// Interrupted assistant messages (Status=interrupted/cancelled):
+//   - cancelled (no content): completely invisible to LLM; a silent " " placeholder
+//     is injected between any two consecutive user messages to satisfy protocol.
+//   - interrupted + no tool calls: keep partial text as-is; LLM infers naturally.
+//   - interrupted + has tool calls: keep completed tools, discard pending ones,
+//     append "[Assistant turn was interrupted by user]" so LLM does not retry.
 func ToModelMessages(msgs []*store.Message, parts map[string][]*store.Part) ([]llm.Message, error) {
 	var out []llm.Message
 
@@ -30,6 +37,16 @@ func ToModelMessages(msgs []*store.Message, parts map[string][]*store.Part) ([]l
 			if len(userParts) == 0 {
 				continue
 			}
+			// Protocol fix: two consecutive user messages are invalid on both
+			// Anthropic and OpenAI. This can happen when a cancelled assistant
+			// message (Status=cancelled, no parts) is skipped. Insert a silent
+			// single-space assistant placeholder to satisfy the alternating rule.
+			if len(out) > 0 && out[len(out)-1].Role == llm.RoleUser {
+				out = append(out, llm.Message{
+					Role:    llm.RoleAssistant,
+					Content: []llm.ContentPart{llm.NewTextPart(" ")},
+				})
+			}
 			out = append(out, llm.Message{
 				ID:      m.ID,
 				Role:    llm.RoleUser,
@@ -37,7 +54,33 @@ func ToModelMessages(msgs []*store.Message, parts map[string][]*store.Part) ([]l
 			})
 
 		case store.RoleAssistant:
-			// Skip errored assistant messages (unless they have real content)
+			// Cancelled: no content was ever emitted; skip entirely.
+			// The consecutive-user-message guard above handles the protocol gap.
+			if m.Status == store.MessageStatusCancelled {
+				continue
+			}
+
+			// Interrupted: partial content exists. Handle tool-call case specially.
+			if m.Status == store.MessageStatusInterrupted {
+				assistantParts, toolResultMsgs := buildAssistantPartsInterrupted(ps)
+				if len(assistantParts) == 0 {
+					continue
+				}
+				out = append(out, llm.Message{
+					ID:      m.ID,
+					Role:    llm.RoleAssistant,
+					Content: assistantParts,
+				})
+				if len(toolResultMsgs) > 0 {
+					out = append(out, llm.Message{
+						Role:    llm.RoleTool,
+						Content: toolResultMsgs,
+					})
+				}
+				continue
+			}
+
+			// Normal path: skip errored assistant messages (unless they have real content)
 			if m.Error != nil {
 				if !hasRealContent(ps) {
 					continue
@@ -66,6 +109,95 @@ func ToModelMessages(msgs []*store.Message, parts map[string][]*store.Part) ([]l
 	}
 
 	return out, nil
+}
+
+// buildAssistantPartsInterrupted handles an assistant message whose turn was
+// cut short by Cancel() after some content had been emitted.
+//
+// Rules (per design):
+//   - Text/reasoning parts: always kept as-is (LLM infers naturally from partial text).
+//   - Tool parts with Status=completed: kept with their output.
+//   - Tool parts with Status=pending/running/error(interrupted): discarded from
+//     the assistant side AND from the tool-result side (no dangling tool calls).
+//   - If any tool call was present (completed or not), a single
+//     "[Assistant turn was interrupted by user]" notice is inserted BEFORE the
+//     tool call parts so the LLM does not attempt to retry incomplete tool calls.
+//     Text before tool use is the safe ordering for Anthropic.
+func buildAssistantPartsInterrupted(ps []*store.Part) ([]llm.ContentPart, []llm.ContentPart) {
+	// Collect text/reasoning and tool parts separately so we can order them:
+	// [text/reasoning] → [interruption notice] → [tool calls]
+	var textParts []llm.ContentPart
+	var toolCallParts []llm.ContentPart
+	var toolResults []llm.ContentPart
+	hadAnyTool := false
+
+	for _, p := range ps {
+		switch p.Type {
+		case store.PartTypeText:
+			d, ok := store.DataAs[*store.TextPartData](p)
+			if !ok {
+				continue
+			}
+			text := d.Text
+			if text == "" {
+				text = " "
+			}
+			textParts = append(textParts, llm.NewTextPart(text))
+
+		case store.PartTypeReasoning:
+			d, ok := store.DataAs[*store.ReasoningPartData](p)
+			if !ok {
+				continue
+			}
+			if d.Text != "" {
+				textParts = append(textParts, llm.NewReasoningPart(d.Text, d.Signature))
+			}
+
+		case store.PartTypeTool:
+			hadAnyTool = true
+			d, ok := store.DataAs[*store.ToolPartData](p)
+			if !ok {
+				continue
+			}
+			// Only include tool calls that completed — drop pending/running/interrupted.
+			if d.Status != store.ToolStatusCompleted {
+				continue
+			}
+			inputMap := d.Input
+			if inputMap == nil {
+				inputMap = map[string]any{}
+			}
+			toolCallParts = append(toolCallParts, llm.NewToolCallPart(d.CallID, d.Tool, inputMap))
+			toolResults = append(toolResults, llm.NewToolResultPart(d.CallID, d.Tool, buildToolResult(d)))
+		}
+	}
+
+	// Assemble: text/reasoning first, then interruption notice (if tools were
+	// involved), then tool call parts. Text before tool use is the safe
+	// content ordering for Anthropic's validation rules.
+	//
+	// Special case: the LLM emitted tool calls (hadAnyTool=true) but none
+	// completed before cancellation (toolCallParts is empty). We cannot keep
+	// the text parts alone because the assistant message would then reference
+	// tool calls that have no corresponding tool-result, creating a broken
+	// history fragment. Drop the entire turn; the consecutive-user-message
+	// guard in ToModelMessages inserts a " " placeholder so the protocol
+	// alternating-role requirement is still satisfied.
+	//
+	// Note: this is distinct from the "interrupted + no tool calls" case
+	// (hadAnyTool=false), where partial text is kept as-is because the LLM
+	// never issued a tool call and there is no tool-result gap to worry about.
+	if hadAnyTool && len(toolCallParts) == 0 {
+		return nil, nil
+	}
+
+	assistantParts := textParts
+	if hadAnyTool {
+		assistantParts = append(assistantParts, llm.NewTextPart("[Assistant turn was interrupted by user]"))
+		assistantParts = append(assistantParts, toolCallParts...)
+	}
+
+	return assistantParts, toolResults
 }
 
 // buildUserParts converts user message parts into LLM content parts.

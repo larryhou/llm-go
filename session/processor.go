@@ -124,7 +124,7 @@ func (p *Processor) Process(ctx context.Context, assistantMsgID string, input Pr
 	for ev := range events {
 		r, err := state.handleEvent(ctx, ev)
 		if err != nil {
-			state.cleanup(ctx)
+			state.cleanup()
 			return ProcessStop, err
 		}
 		if r != ProcessContinue {
@@ -136,7 +136,7 @@ func (p *Processor) Process(ctx context.Context, assistantMsgID string, input Pr
 		}
 	}
 
-	state.cleanup(ctx)
+	state.cleanup()
 	return result, nil
 }
 
@@ -379,7 +379,14 @@ func (s *processorState) checkDoomLoop(toolName, inputKey string) bool {
 
 // cleanup finalises any open parts when the stream ends (normally or abnormally).
 // Aligned with processor.ts cleanup().
-func (s *processorState) cleanup(ctx context.Context) {
+//
+// IMPORTANT: cleanup always uses context.Background() for store writes, never
+// the caller's ctx. When triggered by cancellation the caller's ctx is already
+// done; using it for store operations would cause every write to fail silently
+// in a real database backend, leaving tool parts permanently in pending state.
+func (s *processorState) cleanup() {
+	ctx := context.Background()
+
 	// Finalise open text part
 	if s.currentTextPartID != "" {
 		_ = s.updateTextPart(ctx, s.currentTextPartID, s.currentTextBuf, s.currentTextStart, nowMS())
@@ -412,7 +419,6 @@ func (s *processorState) cleanup(ctx context.Context) {
 	}
 
 	// Mark any parts that are still pending/running as interrupted.
-	// Use the original context (not toolCtx which is already cancelled).
 	s.toolMu.Lock()
 	activeSnapshot := make(map[string]string, len(s.activeToolParts))
 	for k, v := range s.activeToolParts {

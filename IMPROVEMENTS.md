@@ -450,6 +450,8 @@ the full `Input`.
 | F | `session` | Doom-loop detection resets per `Process` call — does not span agentic steps | Low | Clarify / Fix |
 | G | `config` | `Load()` does shallow JSON unmarshal merge — project config cannot unset global fields | Low | Document / Fix |
 | H | `session` | `system.go` model-ID matching uses short substrings (`o1`, `o3`) — false positives on custom IDs | Low | Fix |
+| I | `session` | `RunLoop` is a blocking call with no preemption — user cannot interrupt an in-flight agentic loop | **High** | Design |
+| J | `session` | Compaction swallows recent context — LLM loses track of the active topic after compact | **High** | Design |
 
 ---
 
@@ -647,4 +649,294 @@ or third-party model IDs.
 case id == "o1" || id == "o3" || strings.HasPrefix(id, "o1-") || strings.HasPrefix(id, "o3-") ||
      strings.Contains(id, "gpt-4"):
 ```
+
+---
+
+### I. `RunLoop` is a blocking call with no preemption — user cannot interrupt an in-flight agentic loop — `session/prompt.go`
+
+**Location:** `prompt.go:75–271`, `processor.go:81–141`
+
+**Scenario:**
+
+A user sends a message that triggers a long-running agentic loop (e.g. LLM calls a
+slow tool — file indexing, a network fetch, a shell command). Mid-execution the user
+realises the LLM is doing the wrong thing and sends a correction message. There is no
+way to deliver that message to the running session without first terminating the entire
+loop and losing its in-progress state.
+
+**Root cause — `RunLoop` is fully synchronous and blocking:**
+
+```go
+// Caller blocks here until stop / error / compaction:
+result, err := RunLoop(ctx, store, input)
+// ← only here can a second message be accepted
+```
+
+The only external control surface is `ctx.cancel()`, which is a **hard global cancel**:
+it kills the LLM stream, all tool goroutines, and leaves no channel for a new message
+to be injected into the same session.
+
+**What happens if a caller forces concurrent `RunLoop` calls on the same session:**
+
+1. **Store data race** — two goroutines simultaneously read and write messages/parts for
+   the same `sessionID`. The memory store has per-collection locks, but the ordering of
+   `CreateMessage` calls across two loops is non-deterministic, corrupting `ListMessages`
+   results.
+
+2. **Incomplete assistant message visible to the second loop** — the first `RunLoop`
+   calls `CreateMessage` for an assistant placeholder before the LLM stream finishes.
+   The second loop loads history via `loadMessages` and sees this empty assistant message.
+   Sending an assistant message with no content (and no tool-result follow-up) to the LLM
+   is a protocol error on both Anthropic and OpenAI.
+
+3. **Tool goroutine leak** — the first loop's in-flight tool goroutines hold `toolCtx`
+   (derived from the first loop's `ctx`). The second loop has no visibility into these
+   goroutines and cannot cancel or wait for them.
+
+**What is needed:**
+
+Three changes across three layers are required to support this pattern cleanly:
+
+**Layer 1 — `session/prompt.go`: async handle with clean preemption**
+
+`RunLoop` must be splittable into a non-blocking start and a cancellable handle:
+
+```go
+type RunHandle struct {
+    Interrupt func()        // signal: stop after current tool completes
+    Cancel    func()        // signal: stop immediately (hard cancel)
+    Done      <-chan struct{} // closed when RunLoop has fully exited
+    Result    RunResult     // available after Done is closed
+    Err       error
+}
+
+func RunLoopAsync(ctx context.Context, s store.Store, input RunInput) *RunHandle
+```
+
+`Interrupt()` sets a flag checked between agentic steps (after each `Process` call
+returns), allowing the current tool to finish naturally before the loop exits cleanly.
+`Cancel()` cancels the context immediately, triggering `cleanup()`.
+Both must wait for `cleanup()` to complete (tool goroutines drained, parts marked)
+before the caller is allowed to start a new `RunLoop` on the same session.
+
+**Layer 2 — `store/store.go`: interrupted message state**
+
+`Message` needs an `Interrupted bool` field (or equivalent `Status` field) so that
+a loop that was preempted can mark its in-progress assistant message:
+
+```go
+type Message struct {
+    ...
+    Interrupted bool  // true if this assistant turn was cut short by user preemption
+}
+```
+
+This allows the next `RunLoop` (carrying the user's correction) to load a clean history.
+
+**Layer 3 — `session/context.go`: filter interrupted messages from history**
+
+`ToModelMessages` (and `FilterCompacted`) must skip interrupted assistant messages when
+building the message list sent to the LLM. An assistant message that has no complete
+tool-result pair is a protocol error; it must not appear in the next request.
+
+Optionally, a brief `[Assistant response interrupted by user]` text part can be
+injected in place of the interrupted message so the LLM understands the context gap.
+
+**Impact:** Without this capability, any UI that allows users to send a correction while
+the agent is running must either (a) queue the message and wait for the current loop to
+finish — potentially minutes later — or (b) hard-cancel the session and lose all
+in-progress tool results. Neither is acceptable for interactive use.
+
+---
+
+### J. Compaction swallows recent context — LLM loses track of the active topic after compact — `session/compaction.go`, `session/context.go`
+
+**Location:** `compaction.go:199–322`, `context.go:71–99`, `prompt.go:232–254`
+
+**Scenario:**
+
+A user is mid-conversation on a specific technical topic — e.g. debugging a particular
+function, negotiating the details of an API contract, or tracking a sequence of code
+changes. The context window fills up and compaction fires. After compaction the LLM
+receives a high-level summary of the entire conversation, but the fine-grained details
+of the *most recent* discussion are frequently lost: the summary LLM generalises and
+omits specifics (exact function signatures, intermediate debugging findings, the last
+decision that was just made). The LLM then continues the conversation as if those
+details were still available, producing answers that contradict or ignore what was
+just agreed upon.
+
+**Root cause — compaction is fully transparent to the LLM:**
+
+After `Compact()` succeeds, `RunLoop` immediately continues into the next agentic step:
+
+```go
+case ProcessCompact:
+    compactor.Compact(ctx, ...)
+    msgs, allParts, err = loadMessages(ctx, s, input.SessionID)
+    continue   // ← LLM gets the new context with no awareness of what just happened
+```
+
+The LLM sees:
+
+```
+[boundary user msg: "What did we do so far?"]
+[summary assistant msg: high-level summary of entire conversation]
+[tail: last 2 turns verbatim]
+```
+
+The head — which includes the turns immediately preceding the tail — is completely
+gone. The LLM has no way to know which specific details were dropped, so it cannot
+know to call `knowledge_search` to recover them. The existing `knowledge-recall.txt`
+system prompt hint ("use knowledge_search if you need to recall earlier content") only
+works when the LLM *suspects* it is missing something; it cannot help when the LLM
+believes the summary is complete.
+
+**Why the summary is insufficient for fine-grained recall:**
+
+The `SummaryTemplate` produces a structured Markdown summary with sections for Goal,
+Progress, Decisions, Next Steps, and Relevant Files. This is adequate for re-orienting
+the LLM at a high level. It is not adequate for preserving the verbatim details that
+matter most in a technical conversation — the exact content of the last tool result,
+the specific line of code that was just identified as problematic, the precise wording
+of the last user requirement. Summary LLMs routinely generalise these away.
+
+**Proposed fix — inject a recent-context excerpt into the compaction boundary message:**
+
+The `Select()` function already splits messages into `head` (to summarise) and `tail`
+(to keep verbatim). The last 2 turns of `head` — the turns immediately before the tail
+— are the most information-dense and most likely to be mis-summarised. Their verbatim
+content (truncated to a manageable size) should be written directly into the compaction
+boundary message as a new `PartTypeRecentContext` part.
+
+The boundary message the LLM sees after compaction would then become:
+
+```
+[boundary user msg]
+  Content 1: "What did we do so far?"
+  Content 2: ## 压缩前最近讨论的内容
+
+             **[用户]**
+             具体的用户消息原文（最多 300 字符）...
+
+             **[助手]**
+               - 调用工具: read_file → 文件内容前 120 字符...
+             助手回复原文（最多 300 字符）...
+
+[summary assistant msg: 整体摘要]
+[tail: 最近 2 轮对话原文]
+```
+
+This gives the LLM an immediate, verbatim anchor for the active topic without
+requiring any tool call, and without relying on the summary to preserve detail.
+
+**Required changes across four locations:**
+
+**`store/store.go`** — new part type and data struct:
+
+```go
+PartTypeRecentContext = "recent-context"
+
+type RecentContextPartData struct {
+    Excerpt string  // verbatim excerpt of last N turns before compaction
+}
+```
+
+**`session/compaction.go`** — two additions:
+
+1. `SelectResult` gains a `RecentHead []*store.Message` field, populated by `Select()`
+   as the messages belonging to the last 2 user turns within `Head` (i.e.,
+   `msgs[turns[len(turns)-tailTurns-2].StartIdx : tailMsgIdx]`, guarded by
+   `len(turns) > tailTurns+2` — if head has ≤ 2 turns there is nothing extra to anchor,
+   and `RecentHead` is nil, skipping Step 5 entirely):
+
+```go
+type SelectResult struct {
+    Head        []*store.Message
+    TailStartID string
+    RecentHead  []*store.Message  // last 2 turns of Head closest to tail; nil if head is too short
+}
+```
+
+2. `Compact()` gains a new Step 5 (after the existing `PartTypeCompaction` write) that
+   calls `buildRecentContextExcerpt(sel.RecentHead, allParts)` and writes the result as
+   a `PartTypeRecentContext` part on the boundary message. This step is **non-fatal**:
+   failure does not roll back the compaction.
+
+   `buildRecentContextExcerpt` renders each message as one block:
+   ```
+   ---
+   以下是压缩前最近的对话原文：
+
+   **[用户]**
+   <user text, max 300 chars>...
+
+   **[助手]**
+   - 调用工具: <tool_name> → <output前120字符>...
+   <assistant text, max 300 chars>...
+   ```
+   Text is explicitly truncated with `...` so the LLM knows content was cut.
+
+**`session/context.go`** — two changes:
+
+1. `buildUserParts()` gains one new case:
+
+```go
+case store.PartTypeRecentContext:
+    d, ok := store.DataAs[*store.RecentContextPartData](p)
+    if ok && d.Excerpt != "" {
+        parts = append(parts, llm.NewTextPart(d.Excerpt))
+    }
+```
+
+2. `buildUserParts()` must accept a `opts ToModelOptions` parameter (same as
+   `buildAssistantPartsWithOpts`) and skip `PartTypeRecentContext` when
+   `opts.StripMedia` is true. This is required because on the **second compaction**,
+   the previous boundary message enters `sel.Head` and is passed to
+   `ToModelMessagesWithOptions(StripMedia=true)` for summary generation — without this
+   guard, the verbatim excerpt from the previous compaction round would be fed to the
+   summary LLM, adding token cost and semantic noise.
+
+   The updated signature:
+   ```go
+   func buildUserParts(ps []*store.Part, opts ToModelOptions) []llm.ContentPart
+   ```
+   All three call sites must be updated:
+   - `ToModelMessages` (normal path) → pass `ToModelOptions{}`
+   - `ToModelMessagesWithOptions` (compaction summary path) → pass the same `opts`
+     that already carries `StripMedia: true`
+
+**`session/compaction.go` — `ToModelMessagesWithOptions` call site** (third location):
+
+No code change needed here beyond updating the `buildUserParts` call signature above.
+The summary path already passes `StripMedia: true`; once `buildUserParts` respects it,
+the excerpt is automatically stripped from the summary LLM input.
+
+**Design decisions:**
+
+| Decision | Rationale |
+|----------|-----------|
+| Written into the boundary message, not a new separate message | The boundary is the compaction anchor; no change to `FilterCompacted` or message-counting logic |
+| Step 5 non-fatal | Compaction committed at Step 4; excerpt is enhancement, not correctness |
+| Only last 2 turns of head, guarded by `len(turns) > tailTurns+2` | Head can be arbitrarily long; guard avoids duplicating the tail (which is already verbatim); short-head case produces nil RecentHead and skips Step 5 |
+| Verbatim truncated text, not another LLM summarisation | No extra LLM call, no extra latency; preserves exact details a summary would abstract away |
+| `buildUserParts` opts + `StripMedia` guard | On second compaction the boundary message enters `sel.Head`; stripping `PartTypeRecentContext` prevents the previous excerpt from entering the summary LLM and growing token cost across repeated compactions |
+| excerpt token budget | excerpt is written after `Select()` completes and is attached to the boundary message, which is always in `sel.Head` (never in tail). `estimateTurnTokens` uses `m.Tokens` for budget calculation; boundary message has `Tokens=zero` → fallback 100 tokens (compaction.go:160). This fallback under-counts the excerpt on the **next** compaction's head token estimate. Mitigation: after writing the `PartTypeRecentContext` part, call `store.UpdateMessage` to set `boundary.Tokens.Input = len(excerpt)/4` (rough char-to-token estimate). This prevents the excerpt from being invisible to the next round's token budget. |
+
+**Boundary cases confirmed safe by code review:**
+
+| Case | Status |
+|------|--------|
+| `len(turns) <= tailTurns` (history too short to compact) | Already handled: `Select()` returns `Head:nil`, `Compact()` exits early at line 222 — Step 5 never reached |
+| `len(turns) == tailTurns+1` (head has exactly 1 real turn) | `RecentHead` guard (`len(turns) > tailTurns+2`) is false → `RecentHead=nil` → Step 5 skipped |
+| Second (and subsequent) compactions — boundary enters `sel.Head` | `buildUserParts` `StripMedia` guard strips `PartTypeRecentContext`; boundary renders as `"What did we do so far?"` only — semantically correct for the summary LLM |
+| `PartTypeRecentContext` token budget on next compaction | Mitigated by updating `boundary.Tokens.Input` after Step 5 write |
+| tail verbatim preservation | Confirmed: `ToModelMessages` (normal path) does not truncate tool output; Prune protects the last 2 turns |
+
+**Impact:** With these four changes, every compaction round leaves a verbatim anchor of
+the 2 turns immediately preceding the tail embedded in the boundary message. The LLM
+receives the anchor without any tool call, without relying on the summary's fidelity,
+and without token cost growing unboundedly across repeated compactions (excerpt stripped
+from summary input on subsequent rounds). This directly enables the long uninterrupted
+conversation experience: topic continuity is preserved across an unlimited number of
+compaction rounds.
 
