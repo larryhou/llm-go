@@ -404,12 +404,20 @@ func (s *server) handleChat(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 	flusher, canFlush := w.(http.Flusher)
 
+	// sseMu serialises all writes to w. http.ResponseWriter (and its underlying
+	// bufio.Writer) is not goroutine-safe; concurrent tool-execution goroutines
+	// can call sendEvent simultaneously, which corrupts the chunked-encoding
+	// framing and causes clients to receive a malformed stream (curl exit 56,
+	// "chunk hex-length char not a hex digit").
+	var sseMu sync.Mutex
 	sendEvent := func(v any) {
 		b, _ := json.Marshal(v)
+		sseMu.Lock()
 		fmt.Fprintf(w, "data: %s\n\n", b)
 		if canFlush {
 			flusher.Flush()
 		}
+		sseMu.Unlock()
 	}
 
 	// Get or create per-session state (history source + knowledge manager).

@@ -525,3 +525,4 @@ Note: FAIL or ABORTED at [B] means the test did not run — rerun with lower con
 | Compaction fails with `context canceled` | `Compact()` used HTTP request context for LLM call | `ctx = context.WithoutCancel(ctx)` at top of `Compact()` |
 | RunLoop aborted mid-step on SSE disconnect | `handleChat` passed `r.Context()` to RunLoop | `ctx := context.WithoutCancel(r.Context())` |
 | RC part missing in AllHead path | AllHead returned `RecentHead: nil` | Compute last ≤2 turns as RecentHead in AllHead path |
+| SSE chunked-encoding corruption / curl exit 56 when LLM calls ≥2 tools | `sendEvent` closure in `handleChat` called concurrently by multiple `executeTool` goroutines without locking; `http.ResponseWriter`/`bufio.Writer` is not goroutine-safe; concurrent writes interleave chunk-size and chunk-body bytes | Added `sync.Mutex` (`sseMu`) around `fmt.Fprintf` + `flusher.Flush()` in `sendEvent` (`cmd/knowledge-api/main.go`) |
