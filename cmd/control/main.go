@@ -64,20 +64,16 @@ func envOr(key, fallback string) string {
 	return fallback
 }
 
-// ── provider wrapper — tees events to a local channel ────────────────────────
+// ── provider wrapper — calls onEvent for every streamed event ────────────────
 
-type replProvider struct {
-	inner     llm.Provider
-	out       chan llm.Event
-	onRequest func(req llm.Request) // called once per Stream() invocation with the input request
+type hookProvider struct {
+	inner   llm.Provider
+	onEvent func(llm.Event)
 }
 
-func (p *replProvider) ID() string { return p.inner.ID() }
+func (p *hookProvider) ID() string { return p.inner.ID() }
 
-func (p *replProvider) Stream(ctx context.Context, req llm.Request) (<-chan llm.Event, error) {
-	if p.onRequest != nil {
-		p.onRequest(req)
-	}
+func (p *hookProvider) Stream(ctx context.Context, req llm.Request) (<-chan llm.Event, error) {
 	inner, err := p.inner.Stream(ctx, req)
 	if err != nil {
 		return nil, err
@@ -86,17 +82,8 @@ func (p *replProvider) Stream(ctx context.Context, req llm.Request) (<-chan llm.
 	go func() {
 		defer close(ch)
 		for ev := range inner {
-			// Forward to REPL output handler.
-			select {
-			case p.out <- ev:
-			case <-ctx.Done():
-			}
-			// Pass through to session processor.
-			select {
-			case ch <- ev:
-			case <-ctx.Done():
-				return
-			}
+			p.onEvent(ev)
+			ch <- ev
 		}
 	}()
 	return ch, nil
@@ -300,9 +287,28 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Event channel consumed by the REPL printer goroutine.
+	// In -debug mode, wrap with RecordProvider before anything else.
+	// One ndjson file captures all Stream() calls for the entire session.
+	if cfg.debug {
+		path := fmt.Sprintf("debug-%d.ndjson", time.Now().UnixMilli())
+		rec, err := llm.NewRecordProvider(innerProv, path)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "debug: %v\n", err)
+			os.Exit(1)
+		}
+		defer rec.Close()
+		innerProv = rec
+		fmt.Printf("Debug recording: %s\n", path)
+	}
+
+	// REPL event channel — printer goroutine reads from it while RunLoop runs.
 	evCh := make(chan llm.Event, 128)
-	prov := &replProvider{inner: innerProv, out: evCh}
+	prov := &hookProvider{
+		inner: innerProv,
+		onEvent: func(ev llm.Event) {
+			evCh <- ev
+		},
+	}
 
 	// ── builtin tools ─────────────────────────────────────────────────────────
 
@@ -456,9 +462,8 @@ func main() {
 			tools:       tools,
 			extraSystem: extraSystem,
 			model:       model,
-			prov:        prov,
+			prov:        innerProv,
 			cfg:         sessionCfg,
-			debug:       cfg.debug,
 		}
 		if err := runWebServer(app); err != nil {
 			fmt.Fprintf(os.Stderr, "web server: %v\n", err)
@@ -525,9 +530,8 @@ func main() {
 		// Signal printer to drain and exit.
 		close(evCh)
 		<-done
-		// Reset channel for next turn.
+		// Reset channel for next turn (closure captures evCh variable, not value).
 		evCh = make(chan llm.Event, 128)
-		prov.out = evCh
 
 		if runErr != nil {
 			fmt.Fprintf(os.Stderr, "[error] %v\n", runErr)

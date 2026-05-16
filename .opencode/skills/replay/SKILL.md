@@ -1,0 +1,330 @@
+---
+name: replay
+description: Record and replay llm-go sessions — RecordProvider captures real LLM events to ndjson, ReplayProvider drives RunLoop from the recording, cmd/replay diagnoses compaction behaviour without real LLM calls
+---
+
+# Skill: replay
+
+Provides deterministic session replay for `llm-go`. A real session is recorded
+once with `RecordProvider`; subsequent replays use `ReplayProvider` to drive
+`session.RunLoop` with identical token counts, tool calls, and text — no LLM
+required. Primary use: diagnosing compaction bugs by reproducing exact `Select()`
+decisions from production recordings.
+
+---
+
+## Architecture
+
+```mermaid
+flowchart TD
+    subgraph Record["Record phase (real session)"]
+        RP["real_provider\n(Anthropic/OpenAI)"]
+        REC["RecordProvider\nllm/record_provider.go"]
+        HOOK["hookProvider / sseProvider\n(REPL tee / SSE forwarder)"]
+        RL1["session.RunLoop"]
+        NDJSON["debug-&lt;ts&gt;.ndjson\none JSON line per Stream() call"]
+
+        RP --> REC
+        REC --> HOOK
+        HOOK --> RL1
+        REC -->|"append Record after stream closes"| NDJSON
+    end
+
+    subgraph Replay["Replay phase (no LLM)"]
+        NDJSON2["debug-&lt;ts&gt;.ndjson"]
+        LOAD["llm.NewReplayProvider\nload all Records"]
+        GROUP["groupTurns()\ndetect turn boundaries\nby last user message"]
+        TURN["per-turn ReplayProvider\nNewReplayProviderFromRecords"]
+        RL2["session.RunLoop\nsame model + config\nreal token usage replayed"]
+        OUT["compaction diagnosis\nboundaries / RC parts / Select() decisions"]
+
+        NDJSON2 --> LOAD
+        LOAD --> GROUP
+        GROUP --> TURN
+        TURN --> RL2
+        RL2 --> OUT
+    end
+```
+
+### Key design principles
+
+- **Zero invasion**: `RecordProvider` is a pure `llm.Provider` wrapper. No lifecycle
+  methods (`StartTurn`/`FinishTurn`) are needed. The session framework, compaction,
+  and tool execution are completely unaware of recording.
+- **Data-driven replay**: `ReplayProvider` ignores the `Request` argument passed to
+  `Stream()` and replays the recorded events. Turn grouping is done externally in
+  `cmd/replay` by inspecting `Record.Request.Messages`.
+- **Real token usage**: `EventStepFinish.Usage` is stored verbatim. Replaying with
+  real token counts means `estimateTurnTokens` in `Select()` fires compaction at
+  exactly the same turn boundary as the original session.
+
+---
+
+## File Format
+
+**`debug-<unix_ms>.ndjson`** — one JSON object per line, each line is one `Record`:
+
+```jsonl
+{"request":{"Model":{...},"Messages":[...],"Tools":[...],...},"events":[{"type":"request-start"},{"type":"step-start"},{"type":"text-delta","text":"Hello"},{"type":"tool-call","tool_name":"read","tool_call_id":"id1","input":{...}},{"type":"step-finish","finish_reason":"tool-calls","usage":{"input":12450,"output":87}},{"type":"request-finish","finish_reason":"tool-calls"}]}
+{"request":{...},"events":[...]}
+```
+
+One file = one session. One line = one `Stream()` call (one agentic step).
+
+### Stored event types
+
+Only semantically significant events are stored. Low-level events
+(`EventTextStart/End`, `EventToolInputStart/Delta`) are synthesised on replay.
+
+| Event stored | Why |
+|---|---|
+| `EventRequestStart` | lifecycle marker |
+| `EventStepStart` | step boundary |
+| `EventTextDelta` | accumulated full text (not per-chunk) |
+| `EventReasoningDelta` + `EventReasoningEnd` | reasoning blocks with signature |
+| `EventToolCall` | name, id, parsed input for tool dispatch |
+| `EventStepFinish` | **finish_reason + real usage** ← critical for compaction |
+| `EventRequestFinish` | end marker |
+| `EventError` | LLM errors |
+
+---
+
+## Types (`llm/record_provider.go`, `llm/replay_provider.go`)
+
+```go
+// RecordEvent — JSON snapshot of one event
+type RecordEvent struct {
+    Type         EventType    `json:"type"`
+    Text         string       `json:"text,omitempty"`
+    Signature    string       `json:"signature,omitempty"`
+    ToolCallID   string       `json:"tool_call_id,omitempty"`
+    ToolName     string       `json:"tool_name,omitempty"`
+    Input        any          `json:"input,omitempty"`
+    FinishReason FinishReason `json:"finish_reason,omitempty"`
+    Usage        *TokenUsage  `json:"usage,omitempty"`  // EventStepFinish only
+    Error        string       `json:"error,omitempty"`
+}
+
+// Record — one line in the ndjson file
+type Record struct {
+    Request Request       `json:"request"`
+    Events  []RecordEvent `json:"events"`
+}
+```
+
+---
+
+## RecordProvider (`llm/record_provider.go`)
+
+Wraps any `llm.Provider`. Each `Stream()` call proxies to `inner`, tees all
+events to the caller, and appends one `Record` to the ndjson file after the
+stream closes. Thread-safe: concurrent `Stream()` calls (parallel tool execution)
+are serialised only at the final `json.Encoder.Encode` step.
+
+```mermaid
+sequenceDiagram
+    participant Caller as session.Processor
+    participant RP as RecordProvider
+    participant Inner as inner Provider
+    participant File as ndjson file
+
+    Caller->>RP: Stream(ctx, req)
+    RP->>Inner: Stream(ctx, req)
+    Inner-->>RP: inner channel
+
+    loop for each event
+        Inner-->>RP: ev
+        RP-->>Caller: out ← ev  (transparent pass-through)
+        RP->>RP: recordEvent(&step, ev)\naccumulate text deltas\nstore usage verbatim
+    end
+
+    Note over Inner,RP: inner channel closed
+    RP->>File: mu.Lock(); enc.Encode(step)\none JSON line appended
+    RP-->>Caller: out channel closed
+```
+
+```go
+rec, err := llm.NewRecordProvider(innerProv, "debug-1234.ndjson")
+if err != nil { ... }
+defer rec.Close()
+// Use rec anywhere llm.Provider is accepted — RunLoop, compaction, etc.
+```
+
+### Wiring in `cmd/control` (`cmd/control/main.go`)
+
+```go
+if cfg.debug {
+    path := fmt.Sprintf("debug-%d.ndjson", time.Now().UnixMilli())
+    rec, err := llm.NewRecordProvider(innerProv, path)
+    if err != nil { ... }
+    defer rec.Close()
+    innerProv = rec          // ← transparent override, nothing else changes
+    fmt.Printf("Debug recording: %s\n", path)
+}
+```
+
+`innerProv` is then wrapped by `hookProvider` (REPL event tee) or `sseProvider`
+(web SSE forwarder) — neither is aware of the recording layer beneath.
+
+---
+
+## ReplayProvider (`llm/replay_provider.go`)
+
+Reads the ndjson file and replays one `Record` per `Stream()` call. Synthesises
+low-level lifecycle events from the stored higher-level ones.
+
+```go
+// From file:
+prov, err := llm.NewReplayProvider("debug-1234.ndjson")
+
+// From in-memory slice (used by cmd/replay per-turn):
+prov := llm.NewReplayProviderFromRecords(records)
+
+prov.ID()       // "replay"
+prov.Len()      // total number of records
+prov.Records()  // []Record slice
+```
+
+### Event expansion (`expand` function)
+
+```mermaid
+flowchart LR
+    RS[request-start] --> E_RS[EventRequestStart]
+    SS[step-start] --> E_SS[EventStepStart]
+    TD[text-delta\naccumulated text] --> E_TS[EventTextStart] & E_TD[EventTextDelta] & E_TE[EventTextEnd]
+    RD[reasoning-delta\n+ signature] --> E_RD[EventReasoningDelta] & E_RE[EventReasoningEnd]
+    TC[tool-call\nname, id, input] --> E_TIS[EventToolInputStart] & E_TC[EventToolCall]
+    SF[step-finish\nfinish_reason + usage ★] --> E_SF[EventStepFinish\nreal token counts]
+    RF[request-finish] --> E_RF[EventRequestFinish]
+    ERR[error] --> E_ERR[EventError]
+```
+
+★ `EventStepFinish.Usage` carries the real token counts from the original LLM
+response — this is what makes `estimateTurnTokens` fire compaction at the
+correct turn boundary during replay.
+
+---
+
+## cmd/replay
+
+Full data-driven replay of a recorded session. No real LLM calls.
+
+```bash
+go run ./cmd/replay -recording debug-<ts>.ndjson
+go run ./cmd/replay -recording debug-<ts>.ndjson -verbose
+```
+
+```mermaid
+flowchart TD
+    FILE["debug-&lt;ts&gt;.ndjson"]
+    LOAD["llm.NewReplayProvider(path)\nload all Records into memory"]
+    GROUP["groupTurns(records)\ndetect turn boundaries:\nnew turn when last user message changes\nsteps with no user msg → current turn"]
+    INIT["reconstruct session config\nmodel from steps[0].Request.Model\nextraSystem from System[1:]\nprune=true, MaxSteps=20"]
+    STORE["memory.Store\nsingle session ID 'replay'"]
+
+    FILE --> LOAD --> GROUP --> INIT
+
+    INIT --> LOOP
+
+    subgraph LOOP["for each turn"]
+        RPROV["NewReplayProviderFromRecords(turn.steps)"]
+        RL["session.RunLoop\nProvider=ReplayProvider\nreplays recorded events + real usage"]
+        COMPACT{"compaction\ntriggered?"}
+        HOOK["OnCompact hook\nprint head turns\nprint RC excerpt"]
+        STATUS["print store state\ntotal / filtered / boundaries / rc_parts"]
+
+        RPROV --> RL
+        RL --> COMPACT
+        COMPACT -- yes --> HOOK --> RL
+        COMPACT -- no --> STATUS
+        RL --> STATUS
+    end
+
+    STATUS --> FINAL["print final context window\nprint all RC excerpts"]
+```
+
+### Turn grouping logic
+
+```go
+func groupTurns(steps []llm.Record) []turnGroup {
+    // A new turn begins when the last user message in Request.Messages changes.
+    // Steps with no user message (e.g. compaction summary calls) are appended
+    // to the current turn.
+}
+```
+
+### Config alignment with `cmd/control`
+
+`cmd/replay` reconstructs session config from the first record's `Request`:
+
+| Config | Source |
+|---|---|
+| `model` | `steps[0].Request.Model` |
+| `extraSystem` | `steps[0].Request.System[1:]` (System[0] is provider prompt) |
+| `sessionCfg.Compaction.Prune` | `true` (matches cmd/control default) |
+| `MaxSteps` | `20` (matches cmd/control web mode) |
+
+### Example output
+
+```
+[recording] debug-1778934906.ndjson  total_steps=27
+
+[turns] detected 6 turns
+  turn 1: "你对llm-go了解么"  (4 steps)
+  turn 2: "详细分析下llm"  (3 steps)
+  ...
+  turn 6: "所以必须用户主动说终止才会停止是么"  (7 steps)
+
+┌─ Turn 6: "所以必须用户主动说终止才会停止是么"
+
+╔══ COMPACTION #1 ════════════════════════════════════
+║  head: 38 messages
+║  real user turns in head: 5
+║    user: 你对llm-go了解么
+║    user: 详细分析下llm
+║    user: 能看下错误处理么
+║    user: 听说已经支持中断处理了
+║    user: 那么如果前一个会话还在tool call...
+╚════════════════════════════════════════════════════
+
+│  store: total=42 filtered=6 boundaries=1 rc_parts=1
+└─ turn 6 done  (consumed 7/7 steps)
+```
+
+---
+
+## Key Code Locations
+
+| Component | File | Key location |
+|---|---|---|
+| `RecordEvent` / `Record` types | `llm/record_provider.go` | lines 31–48 |
+| `RecordProvider.Stream()` | `llm/record_provider.go` | `Stream()` + `recordEvent()` |
+| `RecordProvider.Close()` | `llm/record_provider.go` | `Close()` |
+| `ReplayProvider.Stream()` | `llm/replay_provider.go` | `Stream()` + `expand()` |
+| `NewReplayProviderFromRecords` | `llm/replay_provider.go` | constructor |
+| Wiring in cmd/control | `cmd/control/main.go` | `-debug` block |
+| Turn grouping | `cmd/replay/main.go` | `groupTurns()` |
+| Config reconstruction | `cmd/replay/main.go` | model/extraSystem/sessionCfg setup |
+
+---
+
+## Known Limitations
+
+- **Tool execution in replay**: `cmd/replay` does not register real tools. Tool
+  calls from the recording are replayed as events to `session.Processor`, which
+  will attempt to execute them. If the tools are not registered, the processor
+  gets a "tool not found" error — which is stored as a tool error part but does
+  not abort the loop. This means compaction still fires at the correct point even
+  without real tools.
+
+- **Compaction summary provider**: During replay, the compaction summary LLM call
+  also goes through `ReplayProvider`. If the compaction step's `Record` is present
+  in the recording (it is — `RecordProvider` captures all `Stream()` calls including
+  summary calls), the summary is replayed correctly.
+
+- **Non-deterministic tool outputs**: If a tool output in the original session was
+  large enough to affect token counts, but the tool isn't registered in replay,
+  the `ToolPartData.Output` will be empty. This can cause `estimateTurnTokens` to
+  undercount slightly. The recorded `EventStepFinish.Usage` compensates: it carries
+  the real token count from the original LLM response (which already saw the full
+  tool output), so compaction budget arithmetic is still accurate.

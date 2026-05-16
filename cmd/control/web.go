@@ -6,9 +6,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
-	"os"
 	"sync"
-	"time"
 
 	"github.com/larryhou/llm-go/config"
 	"github.com/larryhou/llm-go/llm"
@@ -26,7 +24,6 @@ type webServer struct {
 	activeHandle *session.RunHandle
 	sessStore    store.Store
 	sessID       string
-	debugDir     string // non-empty when -debug is set
 }
 
 // appState holds shared state initialised once in main.
@@ -35,9 +32,8 @@ type appState struct {
 	tools       []tool.Tool
 	extraSystem []string
 	model       llm.Model
-	prov        *replProvider
+	prov        llm.Provider // RecordProvider(real) in -debug, real otherwise
 	cfg         *config.Info
-	debug       bool
 }
 
 // ── web server ────────────────────────────────────────────────────────────────
@@ -50,7 +46,6 @@ func runWebServer(app *appState) error {
 	addr := ln.Addr().(*net.TCPAddr)
 	url := fmt.Sprintf("http://127.0.0.1:%d", addr.Port)
 
-	// Port is unique per process — use it as the session seed.
 	sessID := fmt.Sprintf("web-%d", addr.Port)
 	sessStore := memory.New()
 	if err := sessStore.CreateSession(context.Background(), &store.Session{
@@ -60,17 +55,7 @@ func runWebServer(app *appState) error {
 		return fmt.Errorf("create session: %w", err)
 	}
 
-	// Create debug directory if -debug is set.
-	var debugDir string
-	if app.debug {
-		debugDir = sessID
-		if err := os.MkdirAll(debugDir, 0755); err != nil {
-			return fmt.Errorf("create debug dir: %w", err)
-		}
-		fmt.Printf("Debug recording: %s/\n", debugDir)
-	}
-
-	srv := &webServer{app: app, sessStore: sessStore, sessID: sessID, debugDir: debugDir}
+	srv := &webServer{app: app, sessStore: sessStore, sessID: sessID}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", srv.handleUI)
 	mux.HandleFunc("/chat", srv.handleChat)
@@ -131,37 +116,10 @@ func (s *webServer) handleChat(w http.ResponseWriter, r *http.Request) {
 		sseMu.Unlock()
 	}
 
-	// Debug recording: collect each LLM input request for this turn.
-	type turnRecord struct {
-		SessionID string        `json:"session_id"`
-		TS        string        `json:"ts"`
-		UserMsg   string        `json:"user_message"`
-		Requests  []llm.Request `json:"requests"`
-		RunError  string        `json:"run_error,omitempty"`
-	}
-	rec := &turnRecord{
-		SessionID: s.sessID,
-		TS:        time.Now().Format(time.RFC3339),
-		UserMsg:   req.Message,
-	}
-
-	// Per-request event channel.
-	evCh := make(chan llm.Event, 128)
-	prov := &replProvider{
-		inner: s.app.prov.inner,
-		out:   evCh,
-	}
-	if s.debugDir != "" {
-		prov.onRequest = func(r llm.Request) {
-			rec.Requests = append(rec.Requests, r)
-		}
-	}
-
-	// Drain events → SSE in a goroutine while RunLoopAsync runs in background.
-	evDone := make(chan struct{})
-	go func() {
-		defer close(evDone)
-		for ev := range evCh {
+	// Wrap provider to forward events to SSE.
+	turnProv := &hookProvider{
+		inner: s.app.prov,
+		onEvent: func(ev llm.Event) {
 			switch ev.Type {
 			case llm.EventTextDelta:
 				if ev.Text != "" {
@@ -184,15 +142,14 @@ func (s *webServer) handleChat(w http.ResponseWriter, r *http.Request) {
 			case llm.EventError:
 				sendEvent(map[string]any{"type": "error", "error": fmt.Sprintf("%v", ev.Err)})
 			}
-		}
-	}()
+		},
+	}
 
 	// Detach from the HTTP request context so that RunLoop is not cancelled
 	// when the SSE client disconnects mid-stream.
 	ctx := context.WithoutCancel(r.Context())
 
 	// Cancel any in-flight turn for this session before starting a new one.
-	// New user message implicitly interrupts the previous turn.
 	s.mu.Lock()
 	prev := s.activeHandle
 	s.mu.Unlock()
@@ -205,7 +162,7 @@ func (s *webServer) handleChat(w http.ResponseWriter, r *http.Request) {
 		SessionID:   s.sessID,
 		UserMsg:     req.Message,
 		Model:       s.app.model,
-		Provider:    prov,
+		Provider:    turnProv,
 		Tools:       s.app.tools,
 		ExtraSystem: s.app.extraSystem,
 		MaxSteps:    20,
@@ -225,22 +182,12 @@ func (s *webServer) handleChat(w http.ResponseWriter, r *http.Request) {
 	}
 	s.mu.Unlock()
 
-	close(evCh)
-	<-evDone
-
+	runErrStr := ""
 	if h.Err != nil {
-		rec.RunError = h.Err.Error()
-		sendEvent(map[string]any{"type": "error", "error": h.Err.Error()})
+		runErrStr = h.Err.Error()
+		sendEvent(map[string]any{"type": "error", "error": runErrStr})
 	}
 	sendEvent(map[string]any{"type": "done"})
-
-	// Write debug file after the turn is fully done.
-	if s.debugDir != "" {
-		fname := fmt.Sprintf("%s/chat-%d.json", s.debugDir, time.Now().UnixMilli())
-		if b, err := json.MarshalIndent(rec, "", "  "); err == nil {
-			_ = os.WriteFile(fname, b, 0644)
-		}
-	}
 }
 
 // ── /context — inspect current session context window ────────────────────────
