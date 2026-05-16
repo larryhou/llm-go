@@ -242,7 +242,7 @@ When `opts.StripMedia = true` (used in the summary generation path), `PartTypeRe
 
 ### Context lifetime — `context.WithoutCancel` in Compact() and handleChat
 
-Both `Compact()` and the `knowledge-api` HTTP handler use `context.WithoutCancel` to decouple their work from the caller's cancellation signal:
+Both `Compact()` and the `llm-api` HTTP handler use `context.WithoutCancel` to decouple their work from the caller's cancellation signal:
 
 **`session/compaction.go:Compact()`**
 ```go
@@ -254,7 +254,7 @@ func (c *Compactor) Compact(ctx context.Context, ...) (string, error) {
 }
 ```
 
-**`cmd/knowledge-api/main.go:handleChat()`**
+**`cmd/llm-api/main.go:handleChat()`**
 ```go
 // Detach: RunLoop must not be cancelled when the SSE client disconnects.
 ctx := context.WithoutCancel(r.Context())

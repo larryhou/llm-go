@@ -298,7 +298,7 @@ Add to the tools guidance section:
 
 ---
 
-## Caller wiring (`cmd/knowledge-api/main.go`)
+## Caller wiring (`cmd/llm-api/main.go`)
 
 ```go
 src, err := knowledge.NewSessionHistorySource(sessID, 8)

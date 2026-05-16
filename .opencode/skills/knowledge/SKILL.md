@@ -254,7 +254,7 @@ sequenceDiagram
     searchTool-->>LLM: full original message text
 ```
 
-### Wiring in `cmd/knowledge-api/main.go`
+### Wiring in `cmd/llm-api/main.go`
 
 Each session creates its state once and caches it on `chatSession`:
 

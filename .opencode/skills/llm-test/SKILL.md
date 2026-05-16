@@ -1,11 +1,11 @@
 ---
 name: llm-test
-description: Automated integration testing of the llm-go knowledge-api /chat HTTP interface — covers all major design features including multi-turn sessions, tool execution, tool failure, doom-loop detection, max_steps, context compaction, async tools, SSE event types, and knowledge retrieval
+description: Automated integration testing of the llm-go llm-api /chat HTTP interface — covers all major design features including multi-turn sessions, tool execution, tool failure, doom-loop detection, max_steps, context compaction, async tools, SSE event types, and knowledge retrieval
 ---
 
 # LLM Integration Test Skill
 
-End-to-end tests for the `knowledge-api` HTTP server. The system is treated as
+End-to-end tests for the `llm-api` HTTP server. The system is treated as
 a black box — tests POST to `/chat` and assert on the SSE event stream and
 `/sessions` state.
 
@@ -15,8 +15,8 @@ a black box — tests POST to `/chat` and assert on the SSE event stream and
 
 | Item | Path |
 |------|------|
-| knowledge-api source | `cmd/knowledge-api/main.go` |
-| Test script | `cmd/knowledge-api/test_features.sh` |
+| llm-api source | `cmd/llm-api/main.go` |
+| Test script | `cmd/llm-api/test_features.sh` |
 | Skills dir | `.opencode/skills` |
 
 ---
@@ -27,7 +27,7 @@ a black box — tests POST to `/chat` and assert on the SSE event stream and
 test script / test_features.sh
     │  POST /chat  {message, session_id, context_limit, max_steps, tools}
     ▼
-knowledge-api  (127.0.0.1:7700)
+llm-api  (127.0.0.1:7700)
     │  session.RunLoop  (context.WithoutCancel — disconnect-safe)
     ▼
 ┌─────────────────────────────────────────────────────┐
@@ -63,11 +63,11 @@ The server listens on `http://127.0.0.1:7700` by default. Start if not running:
 #        TIMI_BASE_URL  — provider base URL
 #        TIMI_API_KEY   — API key
 #        TIMI_MODEL     — model ID                  (default: claude-sonnet-4.6)
-#   2. Hardcoded defaults in cmd/knowledge-api/main.go (flag.StringVar lines)
+#   2. Hardcoded defaults in cmd/llm-api/main.go (flag.StringVar lines)
 #   3. If still unresolved (e.g. main.go defaults unavailable), ask the user.
 
 lsof -ti:7700 | xargs kill -9 2>/dev/null; sleep 1
-nohup go run ./cmd/knowledge-api/ \
+nohup go run ./cmd/llm-api/ \
   -skills .opencode -addr 127.0.0.1:7700 \
   > /tmp/kapi.log 2>&1 &
 sleep 6 && curl -s http://127.0.0.1:7700/health
@@ -81,7 +81,7 @@ Healthy response: `{"status":"ok","doc_count":N,"session_count":0}`
 
 ## Test Tools
 
-Defined in `cmd/knowledge-api/main.go:buildTestTools()`:
+Defined in `cmd/llm-api/main.go:buildTestTools()`:
 
 | Tool | Description | Tests |
 |------|-------------|-------|
@@ -97,13 +97,13 @@ Defined in `cmd/knowledge-api/main.go:buildTestTools()`:
 
 ```bash
 # Run all tests (requires server running on :7700)
-bash cmd/knowledge-api/test_features.sh
+bash cmd/llm-api/test_features.sh
 
 # With custom server address
-BASE=http://127.0.0.1:7700 bash cmd/knowledge-api/test_features.sh
+BASE=http://127.0.0.1:7700 bash cmd/llm-api/test_features.sh
 
 # Capture output for analysis
-bash cmd/knowledge-api/test_features.sh > /tmp/test_out.txt 2>&1
+bash cmd/llm-api/test_features.sh > /tmp/test_out.txt 2>&1
 grep -E "✓|✗|===" /tmp/test_out.txt
 ```
 
@@ -423,7 +423,7 @@ fi
 
 ### Adding a new test tool
 
-In `cmd/knowledge-api/main.go:buildTestTools()`:
+In `cmd/llm-api/main.go:buildTestTools()`:
 
 ```go
 &simpleTool{

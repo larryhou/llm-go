@@ -37,7 +37,7 @@ type config struct {
 
 ### 1. Flag 解析 + 环境变量 fallback
 
-与 knowledge-api 完全相同的模式：
+与 llm-api 完全相同的模式：
 - flag.Parse() 先行
 - 环境变量作为 fallback（TIMI_PROVIDER / TIMI_BASE_URL / TIMI_API_KEY / TIMI_MODEL）
 
@@ -77,7 +77,7 @@ tools := []tool.Tool{
 
 函数：`buildSkillsIndex(skillsDir string) (bleve.Index, int, error)`
 
-逻辑（复用 knowledge-api 的 buildMemoryIndex）：
+逻辑（复用 llm-api 的 buildMemoryIndex）：
 - `bleve.NewMemOnly(buildMapping())` 创建内存索引
 - `filepath.WalkDir(skillsDir, ...)` 递归扫描所有 `*.md` 文件
 - 每个文件：
@@ -211,7 +211,7 @@ import (
 
 ---
 
-## 复用自 knowledge-api 的函数（直接拷贝，不改逻辑）
+## 复用自 llm-api 的函数（直接拷贝，不改逻辑）
 
 | 函数 | 说明 |
 |------|------|
@@ -230,7 +230,7 @@ go build ./cmd/control/...
 ## 注意事项
 
 1. `session.RunLoop` 返回的是 `(RunResult, error)`，不是 channel——
-   需确认实际签名（knowledge-api 中是直接调用并在 wrappedProv 里拦截事件）。
+   需确认实际签名（llm-api 中是直接调用并在 wrappedProv 里拦截事件）。
    → 若 RunLoop 是同步的，则流式输出需在 Provider wrapper 层或事件 hook 处理。
    → 若存在 `RunLoopStream` 或 channel 变体，优先使用。
    → 否则用 `sseProvider` 同款 wrapper 模式，将事件写入本地 channel。

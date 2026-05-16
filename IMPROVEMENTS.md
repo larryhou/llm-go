@@ -129,7 +129,7 @@ Each item has been verified against the current codebase. Items marked **[FIXED]
 
 ## provider / Registry
 
-### 10. `NewFromConfig` has no callers — `llm.json` provider config is inert — `cmd/control/main.go`, `cmd/knowledge-api/main.go`
+### 10. `NewFromConfig` has no callers — `llm.json` provider config is inert — `cmd/control/main.go`, `cmd/llm-api/main.go`
 
 **Location:** `cmd/control/main.go:238–247`
 **Status:** **FIXED** — both cmd entrypoints now load `config.Load()` + `auth.Load()`, build a `provider.Registry`, register anthropic/openai/timi factories, and call `registry.BuildProvider()`. CLI flags override file config via a merged `ProviderInfo`.
@@ -190,7 +190,7 @@ Each item has been verified against the current codebase. Items marked **[FIXED]
 | 13 | `DataAs` breaks on JSON round-trip | `store/store.go` — JSON marshal/unmarshal fallback |
 | 14 | Bare `p.Data.(T)` assertions across session | `session/` — all replaced with `store.DataAs[T](p)` |
 | 15 | Cross-group knowledge score sort | `knowledge/manager.go` — global `sort.Slice` after accumulation |
-| 16 | `NewFromConfig` never called in cmd | `cmd/control/main.go`, `cmd/knowledge-api/main.go` — registry wired |
+| 16 | `NewFromConfig` never called in cmd | `cmd/control/main.go`, `cmd/llm-api/main.go` — registry wired |
 | 17 | `provider.Registry` dead code | `provider/provider.go` — `RegisterFactory` + `BuildProvider` added |
 | 2 (orig) | `classifyStatus` case 529 unreachable | `error.go` — `case 529` now precedes `>= 500` |
 | 3 (orig) | `MaxOutputTokens` returns 0 for unset output | `overflow.go` — `fallback = 4096` added |
@@ -523,7 +523,7 @@ In test binaries every `go test` run leaks this goroutine. In long-running proce
 it is benign but uncontrollable.
 
 **Fix:** Replace `init()` with an explicit `StartCleanup(ctx context.Context)` function
-that respects context cancellation. Callers (e.g. `cmd/knowledge-api`) call it once at
+that respects context cancellation. Callers (e.g. `cmd/llm-api`) call it once at
 startup and pass the root context.
 
 ---

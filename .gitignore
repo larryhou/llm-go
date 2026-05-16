@@ -3,7 +3,7 @@ vendor/
 *.out
 
 # compiled binaries (root level only)
-/knowledge-api
+/llm-api
 /control
 
 # local test scripts and runtime artifacts

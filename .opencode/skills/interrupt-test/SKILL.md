@@ -9,7 +9,7 @@ Tests the `RunLoopAsync` / `Cancel()` interruption mechanism and all edge cases
 around what the store contains after a cancelled or interrupted turn.
 
 > **Why unit tests, not HTTP tests?**
-> `cmd/knowledge-api` uses `context.WithoutCancel(r.Context())` — a deliberate
+> `cmd/llm-api` uses `context.WithoutCancel(r.Context())` — a deliberate
 > design decision that makes HTTP client disconnect unable to cancel a running
 > `RunLoop`. There is also **no `/cancel` HTTP endpoint**. All interrupt paths
 > go through `session.RunLoopAsync(…).Cancel()`, which is only exercisable at
@@ -239,13 +239,13 @@ Base URL : http://127.0.0.1:7700
 
 ```bash
 lsof -ti:7700 | xargs kill -9 2>/dev/null; sleep 1
-nohup go run ./cmd/knowledge-api/ -skills .opencode -addr 127.0.0.1:7700 \
+nohup go run ./cmd/llm-api/ -skills .opencode -addr 127.0.0.1:7700 \
   > /tmp/kapi.log 2>&1 &
 sleep 6 && curl -s http://127.0.0.1:7700/health
 ```
 
 LLM 连接通过环境变量 `TIMI_PROVIDER` / `TIMI_BASE_URL` / `TIMI_API_KEY` / `TIMI_MODEL` 配置，
-或读取 `cmd/knowledge-api/main.go` 中的默认值。
+或读取 `cmd/llm-api/main.go` 中的默认值。
 
 **ABORT if:** `/health` 响应不含 `"status":"ok"`。
 
@@ -483,7 +483,7 @@ VERDICT: PASS / FAIL / ABORTED at step N
 | `hasToolCalls` | `session/prompt.go` | `:394–401` |
 | `cleanup()` — 250ms tool goroutine timeout | `session/processor.go` | `:387–439` |
 | `buildAssistantPartsInterrupted` | `session/context.go` | `:126–201` |
-| `context.WithoutCancel` in handleChat | `cmd/knowledge-api/main.go` | `handleChat()` ctx setup |
+| `context.WithoutCancel` in handleChat | `cmd/llm-api/main.go` | `handleChat()` ctx setup |
 | `DoomLoopThreshold` | `session/processor.go` | `:22–24` |
 | Consecutive-user-message guard | `session/context.go` | `ToModelMessages` loop |
 | `MessageStatusCancelled` / `MessageStatusInterrupted` | `store/store.go` | `MessageStatus*` consts |
@@ -512,7 +512,7 @@ VERDICT: PASS / FAIL / ABORTED at step N
 | `executeTool` could overwrite `Interrupted=true` set by cleanup's 250ms timeout | Added `isAlreadyInterrupted()` guard in `session/processor.go` before writing tool result | `da15367` |
 | RunLoop continued iterating after Cancel() when cleanup ran its 250ms wait (Process returned nil error) | Added `ctx.Err()` check after `Process()` returns in `runLoopInternal` | `da15367` |
 | DATA RACE in `countingTool.Execute` (test helper) — `calls` field written by concurrent goroutines | Added `sync.Mutex` to `countingTool` | `da15367` |
-| `handleSession` response missing `status` field | Added `Status string` to `msgSummary` in `cmd/knowledge-api/main.go` | — |
+| `handleSession` response missing `status` field | Added `Status string` to `msgSummary` in `cmd/llm-api/main.go` | — |
 | `handleSession` response missing `Interrupted=true` flag on tool parts | Added `Interrupted=true` suffix to tool part summary | — |
 | `handleChat` used synchronous `session.RunLoop` — impossible to cancel in-flight turn via second `/chat` | Replaced with `RunLoopAsync`; added `activeHandle *session.RunHandle` to `chatSession` | — |
 | **`" "` space placeholder injected as assistant content after cancelled/error turns — proxies reject whitespace-only assistant content (400/EOF)** | **Root fix: pre-filter cancelled/error user+assistant pairs before building model messages in `ToModelMessages`. `cancelled` and `error` (no content) pairs are dropped entirely, never entering the alternating-role logic that inserts `" "`.** | — |

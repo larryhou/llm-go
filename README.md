@@ -38,7 +38,7 @@ github.com/larryhou/llm-go
 - **Bleve full-text source** — ready-made `knowledge/source/bleve` backed by
   an in-memory or on-disk Bleve index.
 
-- **HTTP knowledge API** (`cmd/knowledge-api`) — self-contained HTTP server
+- **HTTP knowledge API** (`cmd/llm-api`) — self-contained HTTP server
   that indexes a skills directory, exposes REST search/fetch endpoints, and
   streams LLM chat responses as Server-Sent Events.
 
@@ -70,7 +70,7 @@ github.com/larryhou/llm-go/
 ├── config/               Config schema, Load(), per-field accessors
 ├── auth/                 auth.json reader/writer (oauth / api / wellknown)
 └── cmd/
-    ├── knowledge-api/    HTTP server — Bleve index + /chat SSE endpoint
+    ├── llm-api/    HTTP server — Bleve index + /chat SSE endpoint
     └── index-skills/     CLI — build an on-disk Bleve index from a skills directory
 ```
 
@@ -335,11 +335,11 @@ func main() {
 - The `resetFn` must cover `DeleteSession` + `CreateSession` + `historySrc.Reset()` atomically.
 - `OnCompact: nil` disables history indexing silently — no hook call, no error.
 
-### 5. Run the knowledge-api HTTP server
+### 5. Run the llm-api HTTP server
 
 ```bash
 # Start — indexes .opencode/skills and listens on :7700
-go run ./cmd/knowledge-api/ \
+go run ./cmd/llm-api/ \
     -skills /path/to/.opencode/skills \
     -addr   127.0.0.1:7700 \
     -llm-url https://api.openai.com/v1 \
@@ -447,12 +447,12 @@ go test ./integration/overflow/... -v -count=1 -timeout=300s
 go test ./integration/knowledge/... -v -count=1 -timeout=120s
 ```
 
-### knowledge-api feature test (requires running server)
+### llm-api feature test (requires running server)
 
 ```bash
-go run ./cmd/knowledge-api/ -skills .opencode/skills -addr 127.0.0.1:7700 &
+go run ./cmd/llm-api/ -skills .opencode/skills -addr 127.0.0.1:7700 &
 
-bash cmd/knowledge-api/test_features.sh
+bash cmd/llm-api/test_features.sh
 # → Passed: 32 / 32 — ALL TESTS PASSED
 ```
 
@@ -488,7 +488,7 @@ source in O(1), avoiding a linear scan across all sources.
 
 **SummaryProvider separation** — the compaction summary LLM call uses a separate
 `SummaryProvider` (when provided). This prevents middleware (e.g., the SSE event
-forwarder in `knowledge-api`) from leaking internal summary events to external
+forwarder in `llm-api`) from leaking internal summary events to external
 clients.
 
 ---
@@ -498,7 +498,7 @@ clients.
 - Go 1.25+
 - An OpenAI-compatible or Anthropic LLM endpoint
 - No CGO required for the core library; Bleve's FAISS backend requires CGO if
-  used (the in-memory Bleve index used by `knowledge-api` does not)
+  used (the in-memory Bleve index used by `llm-api` does not)
 
 ---
 

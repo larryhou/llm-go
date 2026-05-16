@@ -1,6 +1,6 @@
 ---
 name: compact-test
-description: Test double-compaction topic continuity for llm-go — verifies PartTypeRecentContext preserves the active topic across two successive compaction rounds via the knowledge-api /chat HTTP interface
+description: Test double-compaction topic continuity for llm-go — verifies PartTypeRecentContext preserves the active topic across two successive compaction rounds via the llm-api /chat HTTP interface
 ---
 
 # Compact-Test Skill
@@ -47,11 +47,11 @@ Start if not running:
 #        TIMI_BASE_URL  — provider base URL
 #        TIMI_API_KEY   — API key
 #        TIMI_MODEL     — model ID                  (default: claude-sonnet-4.6)
-#   2. Hardcoded defaults in cmd/knowledge-api/main.go (flag.StringVar lines)
+#   2. Hardcoded defaults in cmd/llm-api/main.go (flag.StringVar lines)
 #   3. If still unresolved (e.g. main.go defaults unavailable), ask the user.
 
 lsof -ti:7700 | xargs kill -9 2>/dev/null; sleep 1
-nohup go run ./cmd/knowledge-api/ \
+nohup go run ./cmd/llm-api/ \
   -skills .opencode -addr 127.0.0.1:7700 \
   > /tmp/kapi.log 2>&1 &
 sleep 6 && curl -s http://127.0.0.1:7700/health
@@ -510,10 +510,10 @@ Note: FAIL or ABORTED at [B] means the test did not run — rerun with lower con
 | RecentHead in AllHead path | `session/compaction.go` | `Select()` `len(turns) <= tailTurns` branch |
 | Step 6 excerpt write + token update | `session/compaction.go` | `Compact()` Step 6 |
 | `context.WithoutCancel` in Compact | `session/compaction.go` | top of `Compact()` |
-| `context.WithoutCancel` in handleChat | `cmd/knowledge-api/main.go` | `handleChat()` ctx setup |
+| `context.WithoutCancel` in handleChat | `cmd/llm-api/main.go` | `handleChat()` ctx setup |
 | `buildRecentContextExcerpt` | `session/compaction.go` | after `Compact()` |
 | `buildUserParts` opts + StripMedia | `session/context.go` | `buildUserParts()` |
-| `/sessions/{id}/messages` RC rendering | `cmd/knowledge-api/main.go` | `handleSession()` |
+| `/sessions/{id}/messages` RC rendering | `cmd/llm-api/main.go` | `handleSession()` |
 
 ## Known Fixed Bugs
 
@@ -525,4 +525,4 @@ Note: FAIL or ABORTED at [B] means the test did not run — rerun with lower con
 | Compaction fails with `context canceled` | `Compact()` used HTTP request context for LLM call | `ctx = context.WithoutCancel(ctx)` at top of `Compact()` |
 | RunLoop aborted mid-step on SSE disconnect | `handleChat` passed `r.Context()` to RunLoop | `ctx := context.WithoutCancel(r.Context())` |
 | RC part missing in AllHead path | AllHead returned `RecentHead: nil` | Compute last ≤2 turns as RecentHead in AllHead path |
-| SSE chunked-encoding corruption / curl exit 56 when LLM calls ≥2 tools | `sendEvent` closure in `handleChat` called concurrently by multiple `executeTool` goroutines without locking; `http.ResponseWriter`/`bufio.Writer` is not goroutine-safe; concurrent writes interleave chunk-size and chunk-body bytes | Added `sync.Mutex` (`sseMu`) around `fmt.Fprintf` + `flusher.Flush()` in `sendEvent` (`cmd/knowledge-api/main.go`) |
+| SSE chunked-encoding corruption / curl exit 56 when LLM calls ≥2 tools | `sendEvent` closure in `handleChat` called concurrently by multiple `executeTool` goroutines without locking; `http.ResponseWriter`/`bufio.Writer` is not goroutine-safe; concurrent writes interleave chunk-size and chunk-body bytes | Added `sync.Mutex` (`sseMu`) around `fmt.Fprintf` + `flusher.Flush()` in `sendEvent` (`cmd/llm-api/main.go`) |

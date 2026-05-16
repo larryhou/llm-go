@@ -102,7 +102,7 @@ func (p *replProvider) Stream(ctx context.Context, req llm.Request) (<-chan llm.
 	return ch, nil
 }
 
-// ── index helpers (ported from knowledge-api) ─────────────────────────────────
+// ── index helpers (ported from llm-api) ─────────────────────────────────
 
 // toolPath extracts a display path suffix from tool input arguments.
 // Returns a string like " path/to/file" for file tools, or "" for others.
