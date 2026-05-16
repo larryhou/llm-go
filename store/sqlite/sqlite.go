@@ -537,7 +537,7 @@ func scanParts(rows *sql.Rows) ([]*store.Part, error) {
 // LoadHistoryDocs returns all history documents for a session, grouped by
 // compaction_seq. Called once at SessionHistorySource startup to restore the
 // known seq map without loading doc content into Bleve (lazy-load).
-func (s *Store) LoadHistoryDocs(ctx context.Context, sessionID string) (map[int][]knowledge.HistoryDoc, error) {
+func (s *Store) LoadHistoryDocs(ctx context.Context, sessionID string) (map[int][]knowledge.Record, error) {
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT id, role, text, tool_calls, turn_index, compaction_seq, created_at
 		FROM history_docs WHERE session_id = ?
@@ -547,9 +547,9 @@ func (s *Store) LoadHistoryDocs(ctx context.Context, sessionID string) (map[int]
 	}
 	defer rows.Close()
 
-	result := make(map[int][]knowledge.HistoryDoc)
+	result := make(map[int][]knowledge.Record)
 	for rows.Next() {
-		var doc knowledge.HistoryDoc
+		var doc knowledge.Record
 		var toolCallsJSON string
 		if err := rows.Scan(
 			&doc.ID, &doc.Role, &doc.Text, &toolCallsJSON,
@@ -563,9 +563,9 @@ func (s *Store) LoadHistoryDocs(ctx context.Context, sessionID string) (map[int]
 	return result, rows.Err()
 }
 
-// SaveHistoryDoc persists a single HistoryDoc for future recall.
+// SaveHistoryDoc persists a single Record for future recall.
 // Called synchronously inside the CompactionHook.
-func (s *Store) SaveHistoryDoc(ctx context.Context, sessionID string, doc knowledge.HistoryDoc) error {
+func (s *Store) SaveHistoryDoc(ctx context.Context, sessionID string, doc knowledge.Record) error {
 	toolCallsJSON, _ := json.Marshal(doc.ToolCalls)
 	_, err := s.db.ExecContext(ctx, `
 		INSERT OR REPLACE INTO history_docs
@@ -726,13 +726,13 @@ func (h *HistorySource) Fetch(ctx context.Context, q knowledge.Query) ([]knowled
 }
 
 // LoadRecords implements knowledge.PersistStore.
-func (s *Store) LoadRecords(ctx context.Context, sessionID string) (map[int][]knowledge.HistoryDoc, error) {
+func (s *Store) LoadRecords(ctx context.Context, sessionID string) (map[int][]knowledge.Record, error) {
 	return s.LoadHistoryDocs(ctx, sessionID)
 }
 
 // SaveRecord implements knowledge.PersistStore.
-func (s *Store) SaveRecord(ctx context.Context, sessionID string, doc knowledge.HistoryDoc) error {
-	return s.SaveHistoryDoc(ctx, sessionID, doc)
+func (s *Store) SaveRecord(ctx context.Context, sessionID string, rec knowledge.Record) error {
+	return s.SaveHistoryDoc(ctx, sessionID, rec)
 }
 
 // DeleteRecordsBySeq implements knowledge.PersistStore.

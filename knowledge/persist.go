@@ -5,7 +5,7 @@ package knowledge
 import "context"
 
 // PersistStore is the persistent storage backend for session-scoped records.
-// It stores and retrieves HistoryDoc records keyed by (sessionID, seq, doc.ID)
+// It stores and retrieves Record values keyed by (sessionID, seq, record.ID)
 // without being tied to any particular storage technology.
 //
 // PersistStore is intentionally separate from Source: a store (e.g. sqlite.Store)
@@ -17,7 +17,7 @@ import "context"
 //
 // Dependency graph is cycle-free:
 //
-//	knowledge    →  store            (HistoryDoc uses store.Message/Part types)
+//	knowledge    →  store            (Record uses store.Message/Part types)
 //	store/sqlite →  knowledge        (sqlite.Store implements PersistStore;
 //	                                  sqlite.HistorySource implements Source)
 //	cmd/*        →  store/sqlite     (injection point — no cycle)
@@ -25,11 +25,11 @@ type PersistStore interface {
 	// LoadRecords returns all persisted records for the session, grouped by
 	// compaction_seq. Called once at SessionHistorySource startup to restore
 	// the known seq map without loading content into Bleve (lazy page-in).
-	LoadRecords(ctx context.Context, sessionID string) (map[int][]HistoryDoc, error)
+	LoadRecords(ctx context.Context, sessionID string) (map[int][]Record, error)
 
 	// SaveRecord persists one record. Called synchronously inside the
 	// CompactionHook so a clean process exit never loses a round.
-	SaveRecord(ctx context.Context, sessionID string, doc HistoryDoc) error
+	SaveRecord(ctx context.Context, sessionID string, rec Record) error
 
 	// DeleteRecordsBySeq permanently removes all records for the given
 	// compaction round from storage. Called during Reset() to honour the

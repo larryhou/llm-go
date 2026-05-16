@@ -327,7 +327,7 @@ func TestPersistStore_saveAndLoad(t *testing.T) {
 	s := newStore(t)
 	ctx := context.Background()
 
-	docs := []knowledge.HistoryDoc{
+	docs := []knowledge.Record{
 		{ID: "d1", Role: "user", Text: "hello world", TurnIndex: 0, CompactionSeq: 1, CreatedAt: time.Now().UnixMilli()},
 		{ID: "d2", Role: "assistant", Text: "hi there", TurnIndex: 1, CompactionSeq: 1, CreatedAt: time.Now().UnixMilli()},
 	}
@@ -351,7 +351,7 @@ func TestPersistStore_deleteBySeq(t *testing.T) {
 	ctx := context.Background()
 
 	for seq := 1; seq <= 3; seq++ {
-		_ = s.SaveRecord(ctx, "sess1", knowledge.HistoryDoc{
+		_ = s.SaveRecord(ctx, "sess1", knowledge.Record{
 			ID: fmt.Sprintf("d%d", seq), Role: "user",
 			Text: "msg", CompactionSeq: seq, CreatedAt: time.Now().UnixMilli(),
 		})
@@ -374,7 +374,7 @@ func TestPersistStore_toolCalls(t *testing.T) {
 	s := newStore(t)
 	ctx := context.Background()
 
-	doc := knowledge.HistoryDoc{
+	doc := knowledge.Record{
 		ID: "d1", Role: "assistant",
 		Text:          "using tools",
 		ToolCalls:     []string{"shell", "read", "write"},
@@ -394,8 +394,8 @@ func TestPersistStore_sessionIsolation(t *testing.T) {
 	s := newStore(t)
 	ctx := context.Background()
 
-	_ = s.SaveRecord(ctx, "sess1", knowledge.HistoryDoc{ID: "d1", CompactionSeq: 1, CreatedAt: time.Now().UnixMilli()})
-	_ = s.SaveRecord(ctx, "sess2", knowledge.HistoryDoc{ID: "d1", CompactionSeq: 1, CreatedAt: time.Now().UnixMilli()})
+	_ = s.SaveRecord(ctx, "sess1", knowledge.Record{ID: "d1", CompactionSeq: 1, CreatedAt: time.Now().UnixMilli()})
+	_ = s.SaveRecord(ctx, "sess2", knowledge.Record{ID: "d1", CompactionSeq: 1, CreatedAt: time.Now().UnixMilli()})
 
 	r1, _ := s.LoadRecords(ctx, "sess1")
 	r2, _ := s.LoadRecords(ctx, "sess2")
@@ -412,7 +412,7 @@ func TestHistorySource_peek(t *testing.T) {
 	ctx := context.Background()
 	hs := newHistorySource(t, s, "sess1")
 
-	docs := []knowledge.HistoryDoc{
+	docs := []knowledge.Record{
 		{ID: "d1", Role: "user", Text: "golang concurrency patterns", CompactionSeq: 1, TurnIndex: 0, CreatedAt: time.Now().UnixMilli()},
 		{ID: "d2", Role: "assistant", Text: "use goroutines and channels", CompactionSeq: 1, TurnIndex: 1, CreatedAt: time.Now().UnixMilli()},
 		{ID: "d3", Role: "user", Text: "python decorators explained", CompactionSeq: 2, TurnIndex: 0, CreatedAt: time.Now().UnixMilli()},
@@ -444,7 +444,7 @@ func TestHistorySource_peek_empty_query(t *testing.T) {
 	hs := newHistorySource(t, s, "sess1")
 
 	for i := 0; i < 3; i++ {
-		_ = s.SaveRecord(ctx, "sess1", knowledge.HistoryDoc{
+		_ = s.SaveRecord(ctx, "sess1", knowledge.Record{
 			ID: fmt.Sprintf("d%d", i), Role: "user",
 			Text: fmt.Sprintf("message %d", i), CompactionSeq: 1,
 			TurnIndex: i, CreatedAt: time.Now().UnixMilli(),
@@ -466,7 +466,7 @@ func TestHistorySource_fetch(t *testing.T) {
 	ctx := context.Background()
 	hs := newHistorySource(t, s, "sess1")
 
-	_ = s.SaveRecord(ctx, "sess1", knowledge.HistoryDoc{
+	_ = s.SaveRecord(ctx, "sess1", knowledge.Record{
 		ID: "doc42", Role: "assistant",
 		Text:          "the full answer is here",
 		CompactionSeq: 1, TurnIndex: 0,
@@ -543,7 +543,7 @@ func TestPersistStore_survivesReopen(t *testing.T) {
 
 	// Write records in first open.
 	st1, _ := sqlite.Open(path)
-	_ = st1.SaveRecord(ctx, "sess1", knowledge.HistoryDoc{
+	_ = st1.SaveRecord(ctx, "sess1", knowledge.Record{
 		ID: "d1", Role: "user", Text: "remember this",
 		CompactionSeq: 1, CreatedAt: time.Now().UnixMilli(),
 	})

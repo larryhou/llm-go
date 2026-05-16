@@ -34,7 +34,7 @@ const (
 	snippetMaxFragments = 3
 	snippetMaxResults   = 5
 
-	// field names in HistoryDoc
+	// field names in Record
 	fieldText      = "text"
 	fieldRole      = "role"
 	fieldToolCalls = "tool_calls"
@@ -54,8 +54,8 @@ const DefaultMaxCompactions = 8
 // in head. Implementations should only access parts[m.ID] for m in head.
 type CompactionHook func(head []*store.Message, parts map[string][]*store.Part)
 
-// HistoryDoc is the document indexed per message at compaction time.
-type HistoryDoc struct {
+// Record is the document indexed per message at compaction time.
+type Record struct {
 	ID            string   `json:"id"`
 	Role          string   `json:"role"`
 	Text          string   `json:"text"`
@@ -79,7 +79,7 @@ type HistoryDoc struct {
 //
 // # Startup recovery
 //
-// If a PersistStore is provided, LoadHistoryDocs is called once at construction
+// If a PersistStore is provided, LoadRecords is called once at construction
 // to restore the known seq map (compactionDocs keys + doc IDs). The Bleve index
 // starts empty; rounds are loaded on first Peek() that touches them.
 //
@@ -483,9 +483,9 @@ func (s *SessionHistorySource) storedText(docID string) string {
 	return sb.String()
 }
 
-// buildDoc constructs a HistoryDoc from a store.Message and its parts.
+// buildDoc constructs a Record from a store.Message and its parts.
 // Text is assembled from all text parts; tool call names are collected separately.
-func buildDoc(m *store.Message, parts []*store.Part, seq, turnIdx int) HistoryDoc {
+func buildDoc(m *store.Message, parts []*store.Part, seq, turnIdx int) Record {
 	var textParts []string
 	var toolCalls []string
 
@@ -504,7 +504,7 @@ func buildDoc(m *store.Message, parts []*store.Part, seq, turnIdx int) HistoryDo
 		}
 	}
 
-	return HistoryDoc{
+	return Record{
 		ID:            m.ID,
 		Role:          m.Role,
 		Text:          strings.Join(textParts, "\n"),
