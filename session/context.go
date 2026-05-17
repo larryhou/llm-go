@@ -366,6 +366,13 @@ func hasRealContent(ps []*store.Part) bool {
 // Rule: find the most recent *complete* compaction pair (boundary user message
 // + summary assistant message). Walking backward avoids mis-pairing a boundary
 // from one round with a summary from another on partial failures.
+//
+// When the compaction boundary carries a non-empty TailStartID in its
+// CompactionPartData, the tail messages (those between TailStartID and the
+// boundary, which were excluded from summarisation) are spliced back into the
+// visible window immediately after the summary:
+//
+//	[boundary, summary, tail..., messages after boundary...]
 func FilterCompacted(msgs []*store.Message, parts map[string][]*store.Part) []*store.Message {
 	for i := len(msgs) - 1; i >= 1; i-- {
 		if msgs[i].Role != store.RoleAssistant || !msgs[i].Summary {
@@ -378,12 +385,37 @@ func FilterCompacted(msgs []*store.Message, parts map[string][]*store.Part) []*s
 			}
 			ps := parts[msgs[j].ID]
 			for _, p := range ps {
-				if p.Type == store.PartTypeCompaction {
-					out := make([]*store.Message, 0, len(msgs)-j)
-					out = append(out, msgs[j])    // compaction boundary user msg
-					out = append(out, msgs[i:]...) // summary + tail
-					return out
+				if p.Type != store.PartTypeCompaction {
+					continue
 				}
+				// Extract TailStartID from the compaction part (may be empty for
+				// old records written before this field existed).
+				var tailStartID string
+				if d, ok := store.DataAs[*store.CompactionPartData](p); ok {
+					tailStartID = d.TailStartID
+				}
+
+				// Locate the tail slice within msgs. The tail is the contiguous
+				// block of messages starting at TailStartID and ending just before
+				// the boundary message (msgs[j]).
+				var tail []*store.Message
+				if tailStartID != "" {
+					for k := 0; k < j; k++ {
+						if msgs[k].ID == tailStartID {
+							tail = msgs[k:j]
+							break
+						}
+					}
+				}
+
+				// Build the visible context: boundary + summary + tail + post-boundary.
+				postBoundary := msgs[i+1:] // messages after the summary
+				out := make([]*store.Message, 0, 1+1+len(tail)+len(postBoundary))
+				out = append(out, msgs[j])      // compaction boundary user msg
+				out = append(out, msgs[i])      // summary assistant msg
+				out = append(out, tail...)       // verbatim tail (may be empty)
+				out = append(out, postBoundary...) // new messages after compaction
+				return out
 			}
 			// A real user message between summary and boundary — no match, stop.
 			break

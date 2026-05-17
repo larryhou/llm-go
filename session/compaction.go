@@ -365,7 +365,7 @@ func (c *Compactor) Compact(ctx context.Context, sessionID string, input Process
 		MessageID: compactionMsgID,
 		SessionID: sessionID,
 		Type:      store.PartTypeCompaction,
-		Data:      &store.CompactionPartData{},
+		Data:      &store.CompactionPartData{TailStartID: sel.TailStartID},
 	}); err != nil {
 		return "", fmt.Errorf("compaction: create boundary part: %w", err)
 	}

@@ -179,9 +179,12 @@ type StepFinishData struct {
 }
 
 // CompactionPartData marks a point where compaction occurred.
-// Note: TypeScript uses parentID on the summary assistant message to link back
-// to the compaction boundary; no additional fields are needed here.
+// TailStartID is the ID of the first message in the verbatim tail preserved
+// after compaction. FilterCompacted uses this to splice the tail back into
+// the visible context window (boundary + summary + tail + new messages).
+// Empty string means the entire history was summarised (no tail).
 type CompactionPartData struct {
+	TailStartID string
 }
 
 // RecentContextPartData holds a verbatim excerpt of the turns immediately

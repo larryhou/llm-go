@@ -328,7 +328,52 @@ func TestFilterCompacted_noCompaction(t *testing.T) {
 }
 
 func TestFilterCompacted_withCompaction(t *testing.T) {
-	// History: m1(user) m2(assistant) m3(user/compaction) m4(assistant/summary) m5(user) m6(assistant)
+	// Real storage order: head msgs come first, then tail, then boundary+summary+new.
+	// m1(user/head) m2(asst/head)
+	// m3(user/tail) m4(asst/tail)   ← tail: preserved verbatim, sits BEFORE boundary
+	// m5(user/boundary) m6(asst/summary)
+	// m7(user/new) m8(asst/new)
+	msgs := []*store.Message{
+		{ID: "m1", Role: store.RoleUser},
+		{ID: "m2", Role: store.RoleAssistant},
+		{ID: "m3", Role: store.RoleUser},
+		{ID: "m4", Role: store.RoleAssistant},
+		{ID: "m5", Role: store.RoleUser},
+		{ID: "m6", Role: store.RoleAssistant, Summary: true},
+		{ID: "m7", Role: store.RoleUser},
+		{ID: "m8", Role: store.RoleAssistant},
+	}
+	parts := map[string][]*store.Part{
+		"m1": {},
+		"m2": {},
+		"m3": {},
+		"m4": {},
+		"m5": {{Type: store.PartTypeCompaction, Data: &store.CompactionPartData{TailStartID: "m3"}}},
+		"m6": {},
+		"m7": {},
+		"m8": {},
+	}
+	out := session.FilterCompacted(msgs, parts)
+	// Expected: m5(boundary) + m6(summary) + m3+m4(tail spliced back) + m7+m8(new)
+	wantIDs := []string{"m5", "m6", "m3", "m4", "m7", "m8"}
+	gotIDs := make([]string, len(out))
+	for i, m := range out {
+		gotIDs[i] = m.ID
+	}
+	if len(out) != len(wantIDs) {
+		t.Fatalf("FilterCompacted returned %d messages %v, want %d %v", len(out), gotIDs, len(wantIDs), wantIDs)
+	}
+	for i, id := range wantIDs {
+		if gotIDs[i] != id {
+			t.Errorf("message[%d]: got %s, want %s (full: %v)", i, gotIDs[i], id, gotIDs)
+			break
+		}
+	}
+}
+
+func TestFilterCompacted_withCompaction_noTail(t *testing.T) {
+	// All-head compaction: TailStartID is empty — entire history summarised.
+	// m1(user) m2(asst) m3(user/boundary) m4(asst/summary) m5(user/new) m6(asst/new)
 	msgs := []*store.Message{
 		{ID: "m1", Role: store.RoleUser},
 		{ID: "m2", Role: store.RoleAssistant},
@@ -340,22 +385,26 @@ func TestFilterCompacted_withCompaction(t *testing.T) {
 	parts := map[string][]*store.Part{
 		"m1": {},
 		"m2": {},
-		"m3": {{Type: store.PartTypeCompaction, Data: &store.CompactionPartData{}}},
+		"m3": {{Type: store.PartTypeCompaction, Data: &store.CompactionPartData{}}}, // no TailStartID
 		"m4": {},
 		"m5": {},
 		"m6": {},
 	}
 	out := session.FilterCompacted(msgs, parts)
-	// Should return: m3 (compaction user) + m4 (summary) + m5 + m6 (tail)
-	if len(out) != 4 {
-		ids := make([]string, len(out))
-		for i, m := range out {
-			ids[i] = m.ID
-		}
-		t.Errorf("FilterCompacted returned %d messages %v, want 4 [m3,m4,m5,m6]", len(out), ids)
+	// Expected: m3(boundary) + m4(summary) + m5+m6(new), no tail
+	wantIDs := []string{"m3", "m4", "m5", "m6"}
+	gotIDs := make([]string, len(out))
+	for i, m := range out {
+		gotIDs[i] = m.ID
 	}
-	if out[0].ID != "m3" || out[1].ID != "m4" {
-		t.Errorf("first two messages should be m3,m4; got %s,%s", out[0].ID, out[1].ID)
+	if len(out) != len(wantIDs) {
+		t.Fatalf("FilterCompacted (no-tail) returned %d messages %v, want %d %v", len(out), gotIDs, len(wantIDs), wantIDs)
+	}
+	for i, id := range wantIDs {
+		if gotIDs[i] != id {
+			t.Errorf("message[%d]: got %s, want %s", i, gotIDs[i], id)
+			break
+		}
 	}
 }
 

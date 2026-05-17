@@ -113,7 +113,7 @@ flowchart TD
 
     Select --> Tail["Tail messages (TailStartID != '')\n~25% of Usable\nmin 2000 / max 8000 tokens\n≥ 1 user turn always kept\nOR empty tail when all msgs summarised"]
 
-    SummaryMsg --> NextTurn["Next RunLoop iteration\nFilterCompacted skips head\nonly summary + tail sent to LLM"]
+    SummaryMsg --> NextTurn["Next RunLoop iteration\nFilterCompacted: boundary+summary+tail(spliced)+new\nTail spliced back via TailStartID in CompactionPartData"]
     Tail --> NextTurn
 ```
 
@@ -219,16 +219,32 @@ When `opts.StripMedia = true` (used in the summary generation path), `PartTypeRe
 | `ToModelMessages` (normal RunLoop path) | `ToModelOptions{}` — excerpt rendered |
 | `ToModelMessagesWithOptions` (summary generation) | caller's opts — `StripMedia:true` strips excerpt |
 
-**Post-compaction context seen by LLM (with fix):**
+**Post-compaction context seen by LLM:**
 ```
 [boundary user msg]
   "What did we do so far?"
   ---
   以下是压缩前最近的对话原文：
-  **[用户]** <verbatim user turn N-1>
-  **[助手]** - 调用工具: X → ...  <verbatim assistant turn N-1>
+  **[用户]** <verbatim user turn N-1>  ← last turn of head (RecentHead excerpt)
+  **[助手]** - 调用工具: X → ...
 [summary assistant msg: high-level summary]
-[tail: last 2 turns verbatim]
+[tail turn B verbatim]    ← spliced back by FilterCompacted via TailStartID
+[tail turn C verbatim]    ← spliced back by FilterCompacted via TailStartID
+[new messages after compaction...]
+```
+
+**Storage order in DB (insertion order):**
+```
+head messages (rowids 1..N-2)  ← summarised, invisible after compaction
+tail messages (rowids N-1..M)  ← sit BEFORE boundary in store, spliced back by FilterCompacted
+boundary user msg (rowid M+1)  ← has PartTypeCompaction with TailStartID="first tail msg ID"
+summary assistant msg (rowid M+2)
+new messages (rowid M+3...)
+```
+
+`FilterCompacted` reads `TailStartID` from `CompactionPartData` and splices tail back:
+```go
+out = [boundary, summary, tail..., post-boundary new msgs]
 ```
 
 **Summary LLM input (StripMedia strips the excerpt):**
@@ -238,6 +254,13 @@ When `opts.StripMedia = true` (used in the summary generation path), `PartTypeRe
 [head turn A] ...
 [head turn B] ...
 [SummaryTemplate prompt]
+```
+
+**`CompactionPartData`** carries `TailStartID` so `FilterCompacted` can reconstruct the tail:
+```go
+type CompactionPartData struct {
+    TailStartID string // ID of first tail message; empty = entire history summarised
+}
 ```
 
 ### Context lifetime — `context.WithoutCancel` in Compact() and handleChat
