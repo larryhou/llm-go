@@ -718,3 +718,43 @@ func Prune(ctx context.Context, sessionID string, s store.Store, cfg *config.Inf
 
 	return nil
 }
+
+// RecoverOrphanedTools scans all tool parts in the session and marks any that
+// are still in pending or running state as error+interrupted. This repairs
+// parts left behind when a process was killed mid-stream (SIGKILL, crash, or
+// 250ms cleanup timeout) before tool goroutines could write their final status.
+//
+// Call this once per session at startup, before the first RunLoop, to ensure
+// the store is in a consistent state. It is idempotent and safe to call on
+// sessions that have no orphaned parts.
+func RecoverOrphanedTools(ctx context.Context, sessionID string, s store.Store) error {
+	allParts, err := s.ListPartsBySession(ctx, sessionID)
+	if err != nil {
+		return fmt.Errorf("recover orphaned tools: list parts: %w", err)
+	}
+
+	for _, parts := range allParts {
+		for _, p := range parts {
+			if p.Type != store.PartTypeTool {
+				continue
+			}
+			d, ok := store.DataAs[*store.ToolPartData](p)
+			if !ok {
+				continue
+			}
+			if d.Status != store.ToolStatusPending && d.Status != store.ToolStatusRunning {
+				continue
+			}
+			d.Status = store.ToolStatusError
+			d.Interrupted = true
+			if d.Error == "" {
+				d.Error = "Tool execution aborted: process exited before completion"
+			}
+			p.Data = d
+			if err := s.UpdatePart(ctx, p); err != nil {
+				return fmt.Errorf("recover orphaned tools: update part %q: %w", p.ID, err)
+			}
+		}
+	}
+	return nil
+}

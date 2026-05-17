@@ -514,6 +514,17 @@ on this channel before writing the user message or calling `loadMessages`. Pass
 - `Done` is closed only after `cleanup()` **and** `Prune()` complete.
 - `Cancel()` is idempotent (`sync.Once`); concurrent calls from multiple goroutines are safe.
 
+### Startup recovery — `RecoverOrphanedTools`
+
+Call once per session **before** the first `RunLoop` to repair any tool parts left in `pending`/`running` state by a previous process kill or 250ms cleanup timeout:
+
+```go
+// session/compaction.go
+func RecoverOrphanedTools(ctx context.Context, sessionID string, s store.Store) error
+```
+
+Scans all tool parts for the session via `ListPartsBySession`, sets `Status=error`, `Interrupted=true` on any `pending`/`running` part. Idempotent and safe to call on sessions with no orphaned parts.
+
 ### Message.Status — interrupted turn handling
 
 When `Cancel()` fires mid-turn, the assistant message placeholder is marked with a `Status` field:
@@ -524,7 +535,10 @@ When `Cancel()` fires mid-turn, the assistant message placeholder is marked with
 | `"cancelled"` | No content emitted before cancel | Skipped; silent `" "` placeholder inserted between consecutive user messages to satisfy Anthropic/OpenAI alternating-role protocol |
 | `"interrupted"` | Partial content emitted (text or tools) | Kept with special handling (see above) |
 
-**Known race:** `cleanup()` waits up to 250ms for tool goroutines. After that timeout, a goroutine may still write `ToolStatusCompleted` after `markAssistantCancelled` reads `ListParts`. In that case the message may be classified `cancelled` instead of `interrupted`, losing the completed tool result from the next turn's context. This window is small; eliminating it requires unconditional goroutine drain (future work).
+**Known race:** `cleanup()` waits up to 250ms for tool goroutines. After that timeout, a goroutine may still write `ToolStatusCompleted` after `markAssistantCancelled` reads `ListParts`, misclassifying a completed tool result as `cancelled` rather than `interrupted`. Two guards prevent data corruption:
+
+1. **`isAlreadyInterrupted` conservative return** — on `GetPart` error or when the part is already `error+interrupted`, `executeTool` blocks the write (returns `true` rather than `false`). Even if a goroutine outlives the 250ms window, it cannot overwrite the `interrupted` mark set by `cleanup()`.
+2. **`RecoverOrphanedTools`** — at next startup, any `pending`/`running` tool parts left by a mid-stream process kill are repaired to `error+interrupted` before the first `RunLoop`.
 
 ### Usage pattern
 
@@ -634,6 +648,7 @@ Always use `DataAs` instead of bare `p.Data.(T)` assertions. The JSON fallback e
 - `sessionOrder []string` (added) mirrors the same design for sessions → `ListSessions` is now O(n), no sort needed.
 - `hasPartType(ps []*store.Part, partType string) bool` — internal helper in `session/compaction.go`, used by both `FilterCompacted` (via `context.go`) and `Select()` to identify compaction boundary messages by `PartTypeCompaction`.
 - `DeleteSession(ctx, id)` — removes all parts, messages, and session record in a single write-lock pass. Idempotent (returns nil if session does not exist). Used by `session_reset` tool.
+- **Foreign-key enforcement**: `CreateMessage` checks that `m.SessionID` exists; `CreatePart` checks that `p.MessageID` exists. Both return an error on violation, matching SQLite FK behaviour. Tests that relied on inserting orphaned records were silently wrong and have been fixed.
 - `Message.Status string` — lifecycle state for assistant messages set by `RunLoopAsync` on cancellation. Zero value (`""` = `MessageStatusNormal`) requires no special handling; `"interrupted"` and `"cancelled"` are handled by `ToModelMessages` and `ToModelMessagesWithOptions`. The `memory.Store` copies structs by value so the new field is automatically persisted with zero-value compatibility.
 
 ---

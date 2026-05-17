@@ -238,35 +238,41 @@ func (s *SessionHistorySource) Reset() error {
 // coverage regardless of what is currently cached in Bleve.
 //
 //  1. Bleve.Search → hot hits with gse scoring (may be empty if Bleve is cold)
-//  2. SQLite.Peek  → full-history hits via SQL LIKE
+//  2. SQLite.Peek  → full-history hits via SQL LIKE (only when Bleve < size)
 //  3. Merge: Bleve hits first (sorted by score), then unique SQLite hits appended
 //  4. Touch LRU for every seq that appeared in Bleve results
+//
+// SQLite I/O is performed outside the mutex to avoid serialising knowledge
+// searches with concurrent Hook calls.
 func (s *SessionHistorySource) Peek(ctx context.Context, q knowledge.Query) ([]knowledge.Result, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	if s.index == nil {
-		return nil, fmt.Errorf("session history peek: index unavailable (reset in progress)")
-	}
-
 	size := q.MaxResults
 	if size <= 0 {
 		size = snippetMaxResults
 	}
 
-	// ── L1: Bleve search ─────────────────────────────────────────────────────
+	// ── L1: Bleve search (under lock — Bleve index is not thread-safe) ────────
+	s.mu.Lock()
+	if s.index == nil {
+		s.mu.Unlock()
+		return nil, fmt.Errorf("session history peek: index unavailable (reset in progress)")
+	}
 	bleveResults, bleveSeqs := s.bleveSearch(ctx, q.Input, size)
-
 	// Touch LRU for every seq that contributed a Bleve hit.
 	for seq := range bleveSeqs {
 		s.touchLRU(seq)
 	}
+	// Capture persistStore reference while holding the lock.
+	ps := s.persistStore
+	s.mu.Unlock()
 
-	// ── L2: SQLite search (via persistStore as Source) ────────────────────────
+	// ── L2: SQLite search — outside the lock ──────────────────────────────────
+	// Skip SQLite entirely when Bleve already returned a full page (Issue-33 fix).
 	var sqlResults []knowledge.Result
-	if s.persistStore != nil {
-		if src, ok := s.persistStore.(knowledge.Source); ok {
-			sqlResults, _ = src.Peek(ctx, q)
+	if len(bleveResults) < size && ps != nil {
+		if src, ok := ps.(knowledge.Source); ok {
+			remaining := q
+			remaining.MaxResults = size - len(bleveResults)
+			sqlResults, _ = src.Peek(ctx, remaining)
 		}
 	}
 
@@ -296,27 +302,31 @@ func (s *SessionHistorySource) Peek(ctx context.Context, q knowledge.Query) ([]k
 //
 // Locates the owning seq for docID (L0 → SQLite FindSeqByDocID on miss),
 // page-ins that seq into Bleve if needed, then returns the full text.
+//
+// SQLite I/O (FindSeqByDocID, LoadRecordsBySeq) is performed outside the
+// mutex to avoid serialising Fetch with concurrent Hook/Peek calls.
 func (s *SessionHistorySource) Fetch(ctx context.Context, q knowledge.Query) ([]knowledge.Result, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	if s.index == nil {
-		return nil, fmt.Errorf("session history fetch: index unavailable (reset in progress)")
-	}
-
 	docID := q.Input
 	if pfx := sessionHistorySourceID + ":"; strings.HasPrefix(docID, pfx) {
 		docID = strings.TrimPrefix(docID, pfx)
 	}
 
-	// ── Locate owning seq ─────────────────────────────────────────────────────
+	// ── Step 1: locate owning seq from L0 (in-memory, fast) ──────────────────
+	s.mu.Lock()
+	if s.index == nil {
+		s.mu.Unlock()
+		return nil, fmt.Errorf("session history fetch: index unavailable (reset in progress)")
+	}
 	seq, found := s.seqForDoc(docID)
+	ps := s.persistStore
+	s.mu.Unlock()
+
+	// ── Step 2: L0 miss → SQLite FindSeqByDocID (outside lock) ───────────────
 	if !found {
-		// L0 miss: ask SQLite.
-		if s.persistStore == nil {
+		if ps == nil {
 			return nil, fmt.Errorf("session history fetch %q: not found", docID)
 		}
-		sqlSeq, ok, err := s.persistStore.FindSeqByDocID(ctx, s.sessionID, docID)
+		sqlSeq, ok, err := ps.FindSeqByDocID(ctx, s.sessionID, docID)
 		if err != nil {
 			return nil, fmt.Errorf("session history fetch %q: %w", docID, err)
 		}
@@ -324,32 +334,70 @@ func (s *SessionHistorySource) Fetch(ctx context.Context, q knowledge.Query) ([]
 			return nil, fmt.Errorf("session history fetch %q: not found", docID)
 		}
 		seq = sqlSeq
-		// Promote seq into L0.
+
+		// Promote seq into L0 (needs the lock; addToL0 may call LoadRecordsBySeq
+		// inside the lock, but that is an infrequent cold-path operation for a
+		// single seq that was just resolved from SQLite).
+		s.mu.Lock()
 		s.addToL0(ctx, seq)
+		s.mu.Unlock()
 	}
 
-	// ── Page-in seq into Bleve if not already loaded ──────────────────────────
-	if _, loaded := s.loadedSeqs[seq]; !loaded {
-		if err := s.pageIn(ctx, seq); err != nil {
-			// page-in failed; fall back to SQLite direct fetch.
+	// ── Step 3: page-in seq into Bleve if not already loaded ─────────────────
+	// Check whether the seq is already in L1 under the lock; do the SQLite
+	// read (LoadRecordsBySeq) outside the lock, then re-acquire to update state.
+	s.mu.Lock()
+	_, loaded := s.loadedSeqs[seq]
+	s.mu.Unlock()
+
+	if !loaded {
+		// Load records from SQLite outside the lock.
+		var recs []Record
+		if ps != nil {
+			var err error
+			recs, err = ps.LoadRecordsBySeq(ctx, s.sessionID, seq)
+		if err != nil {
+			// page-in failed; fall back to SQLite direct fetch (no lock held).
 			return s.fetchFromSQLite(ctx, docID)
 		}
-	}
-	s.touchLRU(seq)
+		}
 
-	// ── Return from Bleve ─────────────────────────────────────────────────────
+		// Re-acquire lock to update Bleve and loadedSeqs.
+		s.mu.Lock()
+		if s.index == nil {
+			s.mu.Unlock()
+			return nil, fmt.Errorf("session history fetch: index unavailable (reset in progress)")
+		}
+		for _, rec := range recs {
+			_ = s.index.Index(rec.ID, rec)
+		}
+		s.loadedSeqs[seq] = struct{}{}
+		s.touchLRU(seq)
+		s.evictL1IfNeeded()
+		s.mu.Unlock()
+	}
+
+	// ── Step 4: return from Bleve (under lock) ────────────────────────────────
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.touchLRU(seq)
 	return s.fetchFromBleve(docID)
 }
 
 // Hook returns a CompactionHook that indexes the compacted head messages.
 // Each new compaction round is persisted to SQLite (L2) and indexed in Bleve
 // (L1), then LRU eviction is applied to both L0 and L1 if caps are exceeded.
+//
+// SQLite I/O (SaveRecords) is performed outside the mutex so that a slow disk
+// write does not block concurrent Peek/Fetch calls. The seq counter is
+// reserved under the lock before the SQLite write; on failure it is rolled
+// back only if no concurrent Hook has since advanced currentSeq further.
 func (s *SessionHistorySource) Hook() CompactionHook {
 	return func(head []*Message, parts map[string][]*Part) {
+		// ── Step 1: build records and reserve seq (under lock) ────────────────
 		s.mu.Lock()
-		defer s.mu.Unlock()
-
 		if s.index == nil {
+			s.mu.Unlock()
 			return
 		}
 
@@ -363,17 +411,39 @@ func (s *SessionHistorySource) Hook() CompactionHook {
 			ids = append(ids, m.ID)
 			recs = append(recs, rec)
 		}
+		ps := s.persistStore
+		s.mu.Unlock()
 
-		// Persist atomically: all records for this seq in one transaction.
+		// ── Step 2: persist to SQLite (outside lock) ──────────────────────────
 		// Index into Bleve only after SQLite confirms the write, so that a
 		// failed persist never leaves ghost documents in L1 that cannot be
 		// evicted (they would violate loadedSeqs ⊆ compactionDocs).
-		if s.persistStore != nil {
-			if err := s.persistStore.SaveRecords(context.Background(), s.sessionID, recs); err != nil {
+		if ps != nil {
+			if err := ps.SaveRecords(context.Background(), s.sessionID, recs); err != nil {
 				log.Printf("session history hook: SaveRecords seq=%d: %v", seq, err)
-				s.currentSeq--
+				// Roll back the reserved seq only if no concurrent Hook call has
+				// already advanced currentSeq further. If another goroutine
+				// succeeded with a higher seq in the meantime, leave currentSeq
+				// alone — the failed seq is simply skipped (it was never written
+				// to SQLite, so no data is lost and no ghost entry exists).
+				s.mu.Lock()
+				if s.currentSeq == seq {
+					s.currentSeq--
+				}
+				s.mu.Unlock()
 				return
 			}
+		}
+
+		// ── Step 3: update in-memory state and Bleve (under lock) ────────────
+		s.mu.Lock()
+		defer s.mu.Unlock()
+
+		if s.index == nil {
+			// Reset() was called while the SQLite write was in-flight.
+			// The SQLite row is already written; it will be cleaned up by
+			// the next Reset() → DeleteAllRecords call.
+			return
 		}
 
 		// SQLite write succeeded (or no persist store); now index into Bleve.
@@ -484,29 +554,7 @@ func (s *SessionHistorySource) removeLRU(seq int) {
 	}
 }
 
-// ── internal: page-in / L0 promotion ─────────────────────────────────────────
-
-// pageIn loads all Records for seq from SQLite into Bleve.
-// Assumes seq is already in compactionDocs (L0).
-// Must be called with s.mu held.
-func (s *SessionHistorySource) pageIn(ctx context.Context, seq int) error {
-	if s.persistStore == nil {
-		return fmt.Errorf("no persist store for page-in")
-	}
-	recs, err := s.persistStore.LoadRecordsBySeq(ctx, s.sessionID, seq)
-	if err != nil {
-		return fmt.Errorf("pageIn seq=%d: %w", seq, err)
-	}
-	for _, rec := range recs {
-		_ = s.index.Index(rec.ID, rec)
-	}
-	s.loadedSeqs[seq] = struct{}{}
-	// Touch LRU so the freshly page-in'd seq is treated as most recently used
-	// and is not immediately evicted by evictL1IfNeeded.
-	s.touchLRU(seq)
-	s.evictL1IfNeeded()
-	return nil
-}
+// ── internal: L0 promotion ────────────────────────────────────────────────────
 
 // addToL0 fetches the doc IDs for seq from SQLite and inserts the seq into
 // compactionDocs, then applies L0 eviction if needed.
@@ -645,8 +693,8 @@ func (s *SessionHistorySource) fetchFromBleve(docID string) ([]knowledge.Result,
 }
 
 // fetchFromSQLite falls back to the persistStore Source.Fetch when Bleve
-// page-in failed. Must be called with s.mu held (releases mu temporarily
-// is not needed since SQLite access is via the store, not re-entrant).
+// page-in failed. Must be called WITHOUT s.mu held — it performs SQLite I/O
+// which must not run under the lock.
 func (s *SessionHistorySource) fetchFromSQLite(ctx context.Context, docID string) ([]knowledge.Result, error) {
 	if s.persistStore == nil {
 		return nil, fmt.Errorf("session history fetch %q: no fallback available", docID)

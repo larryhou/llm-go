@@ -220,9 +220,9 @@ flowchart TD
     I -- no --> H
     I -- yes --> J["session.Compact()"]
     J --> K["CompactionHook fires"]
-    K --> L["L2: ps.SaveRecords() atomic tx\n(all records for this seq)"]
-    L --> M["L1: Bleve.Index(m.ID, rec) per record"]
-    M --> N["L0: compactionDocs update\nlruOrder append\nevictL0/L1 if needed"]
+    K --> L["seq reserved under lock\nthen lock released"]
+    L --> M["L2: ps.SaveRecords() — outside lock\natomic tx, all records for this seq\non failure: roll back seq (if no newer seq)"]
+    M --> N["re-acquire lock\nL1: Bleve.Index(m.ID, rec) per record\nL0: compactionDocs update\nlruOrder append\nevictL0/L1 if needed"]
     N --> H
 ```
 
@@ -236,10 +236,12 @@ sequenceDiagram
     participant SQL as L2 SQLite HistorySource
 
     LLM->>SHS: Peek("接口设计", maxResults=5)
-    SHS->>Bleve: SearchInContext(gse query)
+    SHS->>Bleve: SearchInContext(gse query) [under lock]
     Bleve-->>SHS: bleveHits (hot seqs, scored)
     SHS->>SHS: touchLRU for each hit seq
-    SHS->>SQL: HistorySource.Peek(same query)
+    note over SHS: lock released
+    SHS->>SQL: HistorySource.Peek(remaining=5-len(bleveHits)) [outside lock]
+    note over SHS: SQLite skipped entirely if len(bleveHits)>=maxResults
     SQL-->>SHS: sqlHits (all seqs, SQL LIKE)
     SHS->>SHS: Merge: bleveHits first\nthen unique sqlHits appended\nde-dup by RefID, cap to N
     SHS-->>LLM: []Result
@@ -251,9 +253,11 @@ cover seqs not currently in Bleve — **no historical memory is ever lost**.
 ### Fetch: page-in on demand
 
 On a `Fetch(refID)` call:
-1. Find owning `seq` from L0 (`compactionDocs`) — or `FindSeqByDocID` on L0 miss
-2. If seq not in Bleve (`loadedSeqs`): `pageIn(seq)` → `LoadRecordsBySeq` → `Bleve.Index` → `touchLRU`
-3. Return full content from Bleve (`fetchFromBleve`)
+1. Find owning `seq` from L0 (`compactionDocs`) **under lock** — O(1) via `docIndex` reverse map
+2. **Lock released** — `FindSeqByDocID` called outside lock on L0 miss
+3. If seq not in Bleve (`loadedSeqs`): `LoadRecordsBySeq` outside lock → re-acquire lock → `Bleve.Index` → `touchLRU`
+4. Return full content from Bleve (`fetchFromBleve`) under lock
+5. Fallback: if `LoadRecordsBySeq` fails, call `fetchFromSQLite` directly (outside lock)
 
 ### Wiring (with SQLite store)
 

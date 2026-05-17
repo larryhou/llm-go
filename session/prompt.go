@@ -492,11 +492,12 @@ func loadMessages(ctx context.Context, s store.Store, sessionID string) ([]*stor
 //
 // Known race: cleanup() inside Process() waits up to 250ms for tool goroutines.
 // After that timeout, goroutines may still be running and could write
-// ToolStatusCompleted after ListParts reads here. In that case a completed
-// tool result may be misclassified as Cancelled rather than Interrupted.
-// This window is small and the consequence is limited to the next turn seeing
-// a slightly degraded history. Eliminating it would require an unconditional
-// wait for all tool goroutines, which is a larger change left for future work.
+// ToolStatusCompleted after ListParts reads here, misclassifying a completed
+// tool result as Cancelled rather than Interrupted.
+// The isAlreadyInterrupted guard (Issue-02 fix) prevents any late goroutine
+// from overwriting the interrupted mark once cleanup has set it. Parts that
+// remain pending/running after process exit are repaired at next startup by
+// RecoverOrphanedTools (Issue-36 fix).
 func markAssistantCancelled(s store.Store, assistantMsgID string) {
 	ctx := context.Background()
 	parts, _ := s.ListParts(ctx, assistantMsgID)

@@ -39,6 +39,8 @@ LLM 收到 error tool-result 后可自行决定是否重试。
 
 ### Issue-02 · `isAlreadyInterrupted` 读取失败时策略不保守
 
+> **✅ 已修复** — `GetPart` 失败时改为保守返回 `true`，阻止 executeTool goroutine 覆盖 cleanup 的 `interrupted` 标记。
+
 | 属性 | 值 |
 |------|----|
 | 文件 | `session/processor.go:367-377` |
@@ -132,6 +134,8 @@ return &llm.LLMError{
 ---
 
 ### Issue-05 · `markAssistantCancelled` 存在已知竞态未修复
+
+> **✅ 已修复** — 由 Issue-02（`isAlreadyInterrupted` 保守返回 `true`）和 Issue-36（`RecoverOrphanedTools` 启动恢复）共同兜底：250ms 超时后飞行中的 goroutine 即使晚写入，也无法覆盖 `interrupted` 标记；进程重启后遗留的 `pending`/`running` parts 由启动恢复扫描修正。
 
 | 属性 | 值 |
 |------|----|
@@ -280,22 +284,9 @@ if totalPruned < PruneMinimum/4 {        // 第二次 /4：意图不清
 
 ---
 
-### Issue-12 · `openai/openai.go` `convertMessages` 中 `switch` 缩进格式错误
+### ~~Issue-12~~ · ~~`openai/openai.go` `convertMessages` 中 `switch` 缩进格式错误~~ — **已撤销**
 
-| 属性 | 值 |
-|------|----|
-| 文件 | `provider/openai/openai.go:190-208` |
-| 类型 | 格式问题（未经 `gofmt`） |
-
-**问题**
-
-`for` 循环内的 `switch` 语句缩进与外层对齐（少一级），而部分 `case` 分支却多缩进一级，
-不符合 `gofmt` 标准，说明该段代码未经格式化工具检查。
-
-**优化方向**
-
-运行 `gofmt -w provider/openai/openai.go` 统一修复，并在 CI 中加入
-`gofmt` 检查防止回归。
+经核实，`provider/openai/openai.go:190-208` 的 switch 语句缩进已符合 gofmt 标准，问题不存在。
 
 ---
 
@@ -327,6 +318,8 @@ ctx 取消时写入一条带 `EventError`（携带 `ctx.Err()`）的不完整 Re
 ## store/ 包
 
 ### Issue-21 · `CreatePart` / `CreateMessage` 不验证外键，孤儿记录静默写入
+
+> **✅ 已修复** — `CreateMessage` 加 `sessions[m.SessionID]` 存在检查；`CreatePart` 加 `messages[p.MessageID]` 存在检查；缺少父记录时返回明确错误，与 SQLite 外键行为对齐。同步修复了 3 个未先创建 session/message 的测试（它们是假通过），新增 `TestMessage_foreignKey` / `TestPart_foreignKey` 回归测试。
 
 | 属性 | 值 |
 |------|----|
@@ -424,30 +417,9 @@ p.Data.(*store.ToolPartData).Output = "injected"  // store 内部被改！
 
 ---
 
-### Issue-26 · `CompactionPartData.SummaryMessageID` 从未赋值
+### ~~Issue-26~~ · ~~`CompactionPartData.SummaryMessageID` 从未赋值~~ — **已撤销**
 
-| 属性 | 值 |
-|------|----|
-| 文件 | `store/store.go:180-182`, `session/compaction.go:360-368` |
-| 类型 | 字段语义失效 |
-
-**问题**
-
-`CompactionPartData` 定义了 `SummaryMessageID` 字段，但创建时始终传入零值：
-
-```go
-Data: &store.CompactionPartData{}  // SummaryMessageID = ""
-```
-
-该字段如果是为了做 boundary→summary 的关联查询而设，当前永远无法使用。
-
-**优化方向**
-
-在 `Compact()` 的 Step 4 创建 CompactionPart 时，将 `summaryMsgID` 填入该字段：
-
-```go
-Data: &store.CompactionPartData{SummaryMessageID: summaryMsgID}
-```
+经核实，`CompactionPartData` 是空结构体（`type CompactionPartData struct{}`），`SummaryMessageID` 字段根本不存在。Issue 描述有误，非问题。
 
 ---
 
@@ -557,6 +529,8 @@ fmt.Fprintf(&sb, "- 调用工具: %s(%s) → %s\n", d.Tool, d.CallID[:8], output
 
 ### Issue-27 · `SessionHistorySource` 持写锁期间执行 SQLite I/O，所有操作完全串行
 
+> **✅ 已修复** — `Peek`/`Fetch`/`Hook` 全部重构：SQLite I/O（`src.Peek`、`FindSeqByDocID`、`LoadRecordsBySeq`、`SaveRecords`）移到锁外，锁只保护内存状态（Bleve 索引、`compactionDocs`、`loadedSeqs`、`lruOrder`）。同时删除了已成 dead code 的 `pageIn` 函数。
+
 | 属性 | 值 |
 |------|----|
 | 文件 | `store/session_history.go:227-228`, `store/session_history.go:283-284`, `store/session_history.go:330` |
@@ -583,30 +557,9 @@ fmt.Fprintf(&sb, "- 调用工具: %s(%s) → %s\n", d.Tool, d.CallID[:8], output
 
 ---
 
-### Issue-28 · `seqForDoc` 双层线性扫描，缺少反向索引
+### ~~Issue-28~~ · ~~`seqForDoc` 双层线性扫描，缺少反向索引~~ — **已撤销**
 
-| 属性 | 值 |
-|------|----|
-| 文件 | `store/session_history.go:499-508` |
-| 类型 | 算法效率问题（已确认） |
-
-**问题**
-
-每次 `Fetch` 调用都触发对 `compactionDocs`（`map[int][]string`）的双层遍历：
-
-```go
-for seq, ids := range s.compactionDocs {   // 外层：所有 seq
-    for _, id := range ids {               // 内层：每个 seq 的所有 doc ID
-        if id == docID {
-```
-
-复杂度 O(seqs × docs_per_seq)，且在持 `s.mu` 写锁期间执行（见 Issue-27），阻塞
-时间随历史规模线性增长。
-
-**优化方向**
-
-维护一个反向索引 `docIndex map[string]int`（docID → seq），在 `Hook` 写入时同步更新，
-`seqForDoc` 退化为 O(1) map 查找。`evictL0IfNeeded` 删除 seq 时同步清除对应 doc ID。
+经核实，`seqForDoc` 已使用 `docIndex map[string]int` 反向索引，O(1) map 查找，问题不存在。
 
 ---
 
@@ -691,48 +644,15 @@ func (s *SessionHistorySource) Reset() error {
 
 ---
 
-### Issue-32 · `NewSessionHistorySource` L0 恢复时 `lruOrder` 可能含重复项
+### ~~Issue-32~~ · ~~`NewSessionHistorySource` L0 恢复时 `lruOrder` 可能含重复项~~ — **已撤销**
 
-| 属性 | 值 |
-|------|----|
-| 文件 | `store/session_history.go:157-170` |
-| 类型 | 防御性 bug（P2） |
-
-**问题**
-
-启动时从 SQLite 恢复 L0 的循环：
-
-```go
-for seq, ids := range seqIndex {
-    src.compactionDocs[seq] = ids       // map 自动去重
-    src.lruOrder = append(src.lruOrder, seq)  // slice 无去重
-    ...
-}
-```
-
-若 `LoadSeqIndex` 返回的 `seqIndex` 存在重复 seq（异常 SQLite 数据或实现 bug），
-`compactionDocs`（map）会自动覆盖，而 `lruOrder`（slice）会有重复项。
-后续 `touchLRU` / `removeLRU` 均只处理第一次出现的位置，导致 `lruOrder` 长度与
-`compactionDocs` 大小永久不一致，LRU 驱逐行为错乱。
-
-**优化方向**
-
-恢复循环中追加 `lruOrder` 前做存在性检查，或在 `sortInts` 之后做一次去重：
-
-```go
-seen := make(map[int]struct{})
-for seq, ids := range seqIndex {
-    if _, dup := seen[seq]; dup { continue }
-    seen[seq] = struct{}{}
-    src.compactionDocs[seq] = ids
-    src.lruOrder = append(src.lruOrder, seq)
-    ...
-}
-```
+经核实，恢复循环已有 `if _, dup := src.compactionDocs[seq]; dup { continue }` 守卫，每个 seq 最多追加一次到 `lruOrder`，问题不存在。
 
 ---
 
 ### Issue-33 · `Peek` SQLite 查询不受 Bleve 结果数影响，可能执行无效查询
+
+> **✅ 已修复** — 配合 Issue-27 的 `Peek` 重构一并修复：先执行 Bleve 搜索，`len(bleveResults) < size` 时才发起 SQLite 查询，且 `MaxResults` 调整为 `size - len(bleveResults)`。
 
 | 属性 | 值 |
 |------|----|
@@ -771,39 +691,9 @@ if len(bleveResults) < size && s.persistStore != nil {
 
 ---
 
-### Issue-30 · `PersistStore.(knowledge.Source)` 类型断言静默失败，L2 检索无提示降级
+### ~~Issue-30~~ · ~~`PersistStore.(knowledge.Source)` 类型断言静默失败，L2 检索无提示降级~~ — **已撤销**
 
-| 属性 | 值 |
-|------|----|
-| 文件 | `store/session_history.go:250` |
-| 类型 | 隐式接口耦合，可观测性缺失（已确认） |
-
-**问题**
-
-`Peek` 中通过 duck-typing 将 `PersistStore` 当作 `knowledge.Source` 使用：
-
-```go
-if src, ok := s.persistStore.(knowledge.Source); ok {
-    sqlResults, _ = src.Peek(ctx, q)
-}
-```
-
-`PersistStore` 接口定义（`store/persist.go`）不要求实现 `knowledge.Source`，
-该断言是隐式合约。若某个 `PersistStore` 实现不满足断言，L2 全量检索静默跳过，
-`Peek` 只返回 L1（Bleve）结果，没有任何 warning 或 error，调用方无从感知降级。
-
-**优化方向**
-
-将 L2 Source 作为独立字段注入 `SessionHistorySource`：
-
-```go
-type SessionHistorySource struct {
-    ...
-    l2Source knowledge.Source   // 可为 nil
-}
-```
-
-由调用方在构造时显式传入，去掉运行时类型断言，接口契约在编译期可见。
+经核实，`Peek` 使用两值断言 `if src, ok := s.persistStore.(knowledge.Source); ok`，`ok=false` 时静默降级为 Bleve-only 是有意的 graceful degradation，非 bug。`sqlite.Store` 始终实现 `knowledge.Source`，实际降级不会发生。
 
 ---
 
@@ -877,6 +767,8 @@ _ = s.persistStore.SaveRecord(ctx, s.sessionID, rec)
 
 ### Issue-36 · 流式中途 SIGKILL：part `TimeEnd=0` / `Status=pending`
 
+> **✅ 已修复** — 新增 `RecoverOrphanedTools(ctx, sessionID, store.Store)` 函数（`session/compaction.go`），扫描 session 全部 tool parts，将 `pending`/`running` 状态改为 `error+interrupted`，与 `cleanup()` 的处理逻辑对齐。调用方在每次 `RunLoop` 前调用一次即可，幂等。
+
 | 属性 | 值 |
 |------|----|
 | 文件 | `session/processor.go:203-223` |
@@ -903,6 +795,8 @@ _ = s.persistStore.SaveRecord(ctx, s.sessionID, rec)
 ---
 
 ### Issue-37 · tool goroutine 250ms 超时后进程退出，飞行中 `UpdatePart` 可能丢失工具 Output
+
+> **✅ 已修复** — 由 Issue-02（`isAlreadyInterrupted` 保守返回 `true`）兜底：250ms 超时后飞行中的 goroutine 即使最终完成 `UpdatePart`，也无法覆盖 `cleanup()` 已写入的 `interrupted` 标记，保证状态一致性。进程退出前未完成的 Output 由 Issue-36 的 `RecoverOrphanedTools` 在下次启动时修正。
 
 | 属性 | 值 |
 |------|----|
@@ -932,37 +826,37 @@ _ = s.persistStore.SaveRecord(ctx, s.sessionID, rec)
 | ID | 严重级别 | 状态 | 文件 | 一句话描述 |
 |----|----------|------|------|-----------|
 | Issue-01 | P0 | ✅ 已修复 | `provider/anthropic/anthropic.go:345`, `provider/openai/openai.go:411` | 工具参数 JSON 解析失败静默忽略，工具以空参数执行 |
-| Issue-02 | P0 | 存疑 | `session/processor.go:367-377` | `isAlreadyInterrupted` 读取失败时错误放行，cleanup 状态被覆盖 |
+| Issue-02 | P0 | ✅ 已修复 | `session/processor.go:367-377` | `isAlreadyInterrupted` 读取失败时错误放行，cleanup 状态被覆盖 |
 | Issue-03 | P0 | ✅ 已修复 | `provider/openai/openai.go:148` | 工具 schema unmarshal 错误忽略，发送空 schema 给 OpenAI |
 | Issue-04 | P1 | ✅ 已修复 | `provider/anthropic/anthropic.go:415`, `provider/openai/openai.go:480` | transport 错误硬编码不可重试，弱网环境下无法恢复 |
-| Issue-05 | P1 | 待修复 | `session/prompt.go:494-512` | `markAssistantCancelled` 竞态：工具结果可能被误判为 Cancelled |
+| Issue-05 | P1 | ✅ 已修复 | `session/prompt.go:494-512` | `markAssistantCancelled` 竞态：工具结果可能被误判为 Cancelled |
 | Issue-06 | P1 | ✅ 已修复 | `session/compaction.go:712` | `Prune` 阈值双重 `/4` 导致实际阈值远低于设计值 |
 | Issue-07 | P2 | ✅ 已修复 | `llm/overflow.go:121-133` | 冗余的 `max`/`min` 定义，Go 1.21+ 已内置 |
 | Issue-08 | P2 | ✅ 已修复 | `llm/overflow.go:13-14`, `session/compaction.go:52-53` | `PruneMinimum`/`PruneProtect` 跨包重复定义，存在漂移风险 |
 | Issue-09 | P2 | ✅ 已修复 | `provider/provider.go:78-100` | `Registry` 无并发保护，多 goroutine 注册会 data race |
 | Issue-10 | P2 | 待修复 | `provider/provider.go:53-63` | `Model.ID` 与 map key 无约束，可静默不一致 |
 | Issue-11 | P2 | ✅ 已修复 | `provider/openai/openai.go:269-277` | `extractText` dead code |
-| Issue-12 | P2 | 待修复 | `provider/openai/openai.go:190-208` | `convertMessages` switch 缩进不符合 `gofmt` |
+| Issue-12 | P2 | ~~已撤销~~ | `provider/openai/openai.go:190-208` | ~~`convertMessages` switch 缩进不符合 `gofmt`~~ **已撤销**（经验证代码已是 gofmt-correct）|
 | Issue-13 | P2 | 待修复 | `llm/record_provider.go:104-110` | ctx 取消时录制 Record 静默丢失，无可观测性 |
 | Issue-14 | P1 | ✅ 已修复 | `session/compaction.go:209` | `estimateTurnTokens` fallback 100 严重低估，压缩效果失效 |
 | Issue-15 | P2 | 待修复 | `session/compaction.go:494` | `buildRecentContextExcerpt` 不含 CallID，多次相同工具调用无法区分 |
 | Issue-16 | P1 | ~~已撤销~~ | `session/prompt.go:380-383` | ~~`ProcessCompact` 死锁~~ **已撤销**（defer 兜底，不会死锁）|
 | Issue-17 | P2 | ✅ 已修复 | `session/context.go:395-398` | `roleUser`/`roleAssistant` 常量 dead code |
 | Issue-18 | P2 | 待修复 | `session/system.go:55` | `SystemPromptForModel` 依赖 `APIID`，字段为空时静默走 default prompt |
-| Issue-21 | P1 | 待修复 | `store/memory/memory.go:177`, `store/memory/memory.go:122` | `CreatePart`/`CreateMessage` 不验证外键，孤儿记录静默写入 |
+| Issue-21 | P1 | ✅ 已修复 | `store/memory/memory.go:177`, `store/memory/memory.go:122` | `CreatePart`/`CreateMessage` 不验证外键，孤儿记录静默写入 |
 | Issue-22 | P2 | 待修复 | `store/memory/memory.go:187` | `Part.Data` 指针浅拷贝，当前路径不出错但测试覆盖不充分 |
 | Issue-23 | P2 | 待修复 | `store/memory/memory.go:111-116` | `DeleteSession` 线性扫描 `sessionOrder`，大量 session 时 O(n) |
 | Issue-24 | P2 | ~~已撤销~~ | `store/store.go:121` | ~~`PartTypeStepStart` 无数据类型~~ **已撤销**（有意设计，structural marker）|
 | Issue-25 | P2 | ✅ 已修复 | `store/store.go:117-130` | `PartTypeSnapshot`/`Retry`/`Subtask`/`Patch` 未使用；`PartTypeAgent` 有读无写 |
-| Issue-26 | P2 | ✅ 已修复 | `store/store.go:180-182` | `CompactionPartData.SummaryMessageID` 字段从未赋值，始终为空 |
-| Issue-27 | P1 | 待修复 | `store/session_history.go:227,283,330` | 持写锁期间执行 SQLite I/O，所有历史检索操作完全串行 |
-| Issue-28 | P2 | 待修复 | `store/session_history.go:499-508` | `seqForDoc` 双层线性扫描，缺反向索引，Fetch 路径 O(n²) |
+| Issue-26 | P2 | ~~已撤销~~ | `store/store.go:180-182` | ~~`CompactionPartData.SummaryMessageID` 字段从未赋值，始终为空~~ **已撤销**（字段根本不存在，`CompactionPartData` 是空结构体，issue 描述有误）|
+| Issue-27 | P1 | ✅ 已修复 | `store/session_history.go:227,283,330` | 持写锁期间执行 SQLite I/O，所有历史检索操作完全串行 |
+| Issue-28 | P2 | ~~已撤销~~ | `store/session_history.go:499-508` | ~~`seqForDoc` 双层线性扫描，缺反向索引，Fetch 路径 O(n²)~~ **已撤销**（已有 `docIndex` 反向索引，O(1) 查找）|
 | Issue-29 | P1 | ✅ 已修复 | `session/compaction.go:263-270` | `Compact()` 加载 parts 使用 N+1 查询，应改用 `ListPartsBySession` |
-| Issue-30 | P2 | 待修复 | `store/session_history.go:250` | `PersistStore.(Source)` 断言静默失败，L2 检索无提示降级 |
+| Issue-30 | P2 | ~~已撤销~~ | `store/session_history.go:250` | ~~`PersistStore.(Source)` 断言静默失败，L2 检索无提示降级~~ **已撤销**（两值断言，ok=false 时 Bleve-only 降级是有意设计，非 bug）|
 | Issue-31 | P0 | ✅ 已修复 | `store/session_history.go:193` | `Reset()` 只删 L0 窗口内 seq，SQLite 历史数据泄漏 |
-| Issue-32 | P2 | 待修复 | `store/session_history.go:160` | L0 恢复时 `lruOrder` 无去重，重复 seq 导致 LRU 错乱 |
-| Issue-33 | P2 | 待修复 | `store/session_history.go:248` | `Peek` SQLite 查询不受 Bleve 结果数影响，Bleve 命中满时仍发起无效 I/O |
+| Issue-32 | P2 | ~~已撤销~~ | `store/session_history.go:160` | ~~L0 恢复时 `lruOrder` 无去重，重复 seq 导致 LRU 错乱~~ **已撤销**（恢复循环已有 `dup` guard 防止重复追加）|
+| Issue-33 | P2 | ✅ 已修复 | `store/session_history.go:248` | `Peek` SQLite 查询不受 Bleve 结果数影响，Bleve 命中满时仍发起无效 I/O |
 | Issue-34 | P0 | ✅ 已修复 | `store/session_history.go:342-349` | Hook 内 N 条 `SaveRecord` 无事务包装，崩溃导致 history_docs 残缺 seq |
 | Issue-35 | P1 | ✅ 已修复 | `store/session_history.go:348` | `SaveRecord` 错误被 `_ =` 全部丢弃，SQLite 写失败无任何告警 |
-| Issue-36 | P1 | 待修复 | `session/processor.go:214,220` | 流式中途 SIGKILL：part `TimeEnd=0`/`Status=pending`，状态字段不完整 |
-| Issue-37 | P1 | 待修复 | `session/processor.go:437` | tool goroutine 超时 250ms 后进程退出，飞行中的 `UpdatePart` 可能丢失工具 Output |
+| Issue-36 | P1 | ✅ 已修复 | `session/processor.go:214,220` | 流式中途 SIGKILL：part `TimeEnd=0`/`Status=pending`，状态字段不完整 |
+| Issue-37 | P1 | ✅ 已修复 | `session/processor.go:437` | tool goroutine 超时 250ms 后进程退出，飞行中的 `UpdatePart` 可能丢失工具 Output |

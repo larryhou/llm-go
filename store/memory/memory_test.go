@@ -111,11 +111,30 @@ func TestMessage_updateError(t *testing.T) {
 	}
 }
 
+func TestMessage_foreignKey(t *testing.T) {
+	s := newStore()
+	ctx := context.Background()
+	err := s.CreateMessage(ctx, &store.Message{ID: "m1", SessionID: "nonexistent", Role: store.RoleUser})
+	if err == nil {
+		t.Error("expected error creating message with nonexistent session")
+	}
+}
+
+func TestPart_foreignKey(t *testing.T) {
+	s := newStore()
+	ctx := context.Background()
+	err := s.CreatePart(ctx, &store.Part{ID: "p1", MessageID: "nonexistent", SessionID: "sess", Type: store.PartTypeText})
+	if err == nil {
+		t.Error("expected error creating part with nonexistent message")
+	}
+}
+
 // --- Part ---
 
 func TestPart_createAndList(t *testing.T) {
 	s := newStore()
 	ctx := context.Background()
+	_ = s.CreateSession(ctx, &store.Session{ID: "sess"})
 	_ = s.CreateMessage(ctx, &store.Message{ID: "msg", SessionID: "sess", Role: store.RoleAssistant})
 
 	parts := []*store.Part{
@@ -141,9 +160,12 @@ func TestPart_createAndList(t *testing.T) {
 func TestPart_updateStatus(t *testing.T) {
 	s := newStore()
 	ctx := context.Background()
+	_ = s.CreateSession(ctx, &store.Session{ID: "sess"})
+	_ = s.CreateMessage(ctx, &store.Message{ID: "msg", SessionID: "sess", Role: store.RoleAssistant})
 	_ = s.CreatePart(ctx, &store.Part{
 		ID:        "p1",
 		MessageID: "msg",
+		SessionID: "sess",
 		Type:      store.PartTypeTool,
 		Data:      &store.ToolPartData{Status: store.ToolStatusPending},
 	})
@@ -164,7 +186,9 @@ func TestPart_isolation(t *testing.T) {
 	// Ensure returned parts are copies — mutating returned value does not affect store
 	s := newStore()
 	ctx := context.Background()
-	_ = s.CreatePart(ctx, &store.Part{ID: "p1", MessageID: "m1", Type: store.PartTypeText,
+	_ = s.CreateSession(ctx, &store.Session{ID: "sess"})
+	_ = s.CreateMessage(ctx, &store.Message{ID: "m1", SessionID: "sess", Role: store.RoleAssistant})
+	_ = s.CreatePart(ctx, &store.Part{ID: "p1", MessageID: "m1", SessionID: "sess", Type: store.PartTypeText,
 		Data: &store.TextPartData{Text: "original"}})
 
 	p, _ := s.GetPart(ctx, "p1")

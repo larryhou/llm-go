@@ -125,6 +125,10 @@ func (s *Store) CreateMessage(_ context.Context, m *store.Message) error {
 	if _, exists := s.messages[m.ID]; exists {
 		return fmt.Errorf("message %q already exists", m.ID)
 	}
+	// Foreign-key check: session must exist (mirrors SQLite FK constraint).
+	if _, ok := s.sessions[m.SessionID]; !ok {
+		return fmt.Errorf("message %q: session %q not found", m.ID, m.SessionID)
+	}
 	if m.CreatedAt.IsZero() {
 		m.CreatedAt = time.Now()
 	}
@@ -179,6 +183,10 @@ func (s *Store) CreatePart(_ context.Context, p *store.Part) error {
 	defer s.mu.Unlock()
 	if _, exists := s.parts[p.ID]; exists {
 		return fmt.Errorf("part %q already exists", p.ID)
+	}
+	// Foreign-key check: message must exist (mirrors SQLite FK constraint).
+	if _, ok := s.messages[p.MessageID]; !ok {
+		return fmt.Errorf("part %q: message %q not found", p.ID, p.MessageID)
 	}
 	if p.CreatedAt.IsZero() {
 		p.CreatedAt = time.Now()

@@ -363,10 +363,14 @@ func (s *processorState) executeTool(ctx context.Context, callID, toolName, part
 // isAlreadyInterrupted returns true if the part has already been marked as
 // interrupted by cleanup (Status=error AND Interrupted=true). Used to prevent
 // executeTool from overwriting cleanup's authoritative interrupted state.
+//
+// On GetPart failure (DB error, network blip) we conservatively return true to
+// block executeTool from overwriting cleanup's interrupted mark. Cleanup's
+// interrupted state takes precedence over any subsequent tool-goroutine write.
 func isAlreadyInterrupted(s store.Store, partID string) bool {
 	p, err := s.GetPart(context.Background(), partID)
 	if err != nil {
-		return false
+		return true // conservative: block overwrite when store is unreachable
 	}
 	d, ok := store.DataAs[*store.ToolPartData](p)
 	if !ok {
@@ -422,6 +426,17 @@ func (s *processorState) cleanup() {
 	// Cancel all in-flight tool goroutines, then wait up to 250ms for them to exit.
 	// A single shared deadline avoids the N×250ms problem: total wait is at most
 	// 250ms regardless of how many tools are running.
+	//
+	// Tools receive ctx cancellation and normally exit in microseconds.
+	// The 250ms cap is a safety net for tools that are slow to observe
+	// cancellation (e.g. blocked on a system call).
+	//
+	// If the timeout fires, any goroutines still running will eventually call
+	// updateToolCompleted/updateToolStatus after cleanup has already marked the
+	// part as interrupted. The isAlreadyInterrupted guard (Issue-02 fix) ensures
+	// that late writes from timed-out goroutines do not overwrite the interrupted
+	// mark. Parts that are still pending/running after process exit are recovered
+	// at next startup by RecoverOrphanedTools (Issue-36 fix).
 	if s.toolCancel != nil {
 		s.toolCancel()
 	}
