@@ -1019,6 +1019,363 @@ for {
 
 ---
 
+### Issue-43 · `touchLRU`/`lruOldestInL0`/`lruOldestInL1` 均为 O(n) 线性扫描
+
+| 属性 | 值 |
+|------|----|
+| 文件 | `store/session_history.go:528-554` |
+| 类型 | 代码质量 / 潜在性能隐患（P2） |
+
+**问题**
+
+`lruOrder` 是一个 `[]int`，以下三个函数都对它做线性扫描：
+
+```go
+// lruOldestInL0 — session_history.go:528
+for _, seq := range s.lruOrder { ... }  // O(n) 找最老的 L0 seq
+
+// lruOldestInL1 — session_history.go:537
+for _, seq := range s.lruOrder { ... }  // O(n) 找最老的 L1 seq
+
+// removeLRU — session_history.go:548 (touchLRU 调用)
+for i, v := range s.lruOrder {          // O(n) 找并移除 seq
+    if v == seq {
+        s.lruOrder = append(s.lruOrder[:i], s.lruOrder[i+1:]...)
+        return
+    }
+}
+```
+
+三个函数均在持锁期间执行，且 `touchLRU` 在 `Peek` 的锁内（`session_history.go:262`）和 `Fetch` 的锁内（`session_history.go:375,383`）多次被调用。
+
+当前 `maxIndexedSeqs = 80`，单次扫描代价极低（80 个 int）。但如果将来调大 `maxIndexedSeqs` 以支持更大的上下文窗口，这三处线性扫描会成为热路径上的瓶颈。
+
+**优化方向**
+
+用双向链表（`container/list`）+ `map[int]*list.Element` 替代 `[]int`，实现真正 O(1) 的 LRU：
+
+```go
+lruList  *list.List             // 双向链表，Front=LRU，Back=MRU
+lruElems map[int]*list.Element  // seq → 链表节点，O(1) 定位
+
+// touchLRU: O(1)
+func (s *SessionHistorySource) touchLRU(seq int) {
+    if el, ok := s.lruElems[seq]; ok {
+        s.lruList.MoveToBack(el)
+    }
+}
+// lruOldestInL0: 从 Front 向后扫直到找到在 compactionDocs 的 seq（最坏仍 O(n)，但通常 O(1)）
+```
+
+---
+
+### Issue-44 · `addToL0` 持写锁期间执行 SQLite I/O
+
+| 属性 | 值 |
+|------|----|
+| 文件 | `store/session_history.go:341-343, 562-585` |
+| 类型 | 代码质量 / 一致性问题（P2） |
+
+**问题**
+
+`Fetch` 在 L0 miss 时调用 `addToL0` promote 一个 seq，但 `addToL0` 内部调用 `LoadRecordsBySeq`（SQLite I/O），且整个操作**在持写锁期间执行**：
+
+```go
+// session_history.go:341-343
+s.mu.Lock()
+s.addToL0(ctx, seq)   // ← 内部调用 LoadRecordsBySeq (SQLite I/O)
+s.mu.Unlock()
+```
+
+```go
+// addToL0, session_history.go:571
+recs, err := s.persistStore.LoadRecordsBySeq(ctx, s.sessionID, seq)
+```
+
+注释也承认了这一点（`"infrequent cold-path operation"`），但这与 Issue-27 修复以来的设计原则不一致——**所有 SQLite I/O 均应在锁外执行，避免阻塞并发的 Peek/Hook**。
+
+虽然 addToL0 的触发频率极低（仅 L0 miss 时），但一旦触发，整个 `SessionHistorySource` 的写锁会在磁盘 I/O 期间被持有，阻塞所有并发的 `Peek`（锁内 Bleve 搜索）和 `Hook`（锁内 L0/L1 更新）。
+
+**优化方向**
+
+将 `addToL0` 拆成两步：锁外执行 `LoadRecordsBySeq`，锁内仅做内存更新（与 `Fetch` Step 3 的 page-in 模式一致）：
+
+```go
+// 锁外读 SQLite
+recs, err := ps.LoadRecordsBySeq(ctx, s.sessionID, seq)
+if err != nil || len(recs) == 0 { return }
+
+// 锁内仅更新内存结构
+s.mu.Lock()
+if _, exists := s.compactionDocs[seq]; !exists {
+    ids := extractIDs(recs)
+    s.compactionDocs[seq] = ids
+    for _, id := range ids { s.docIndex[id] = seq }
+    s.lruOrder = append(s.lruOrder, seq)
+    s.evictL0IfNeeded()
+}
+s.mu.Unlock()
+```
+
+---
+
+### Issue-45 · `Peek` 的 Bleve 全文搜索在写锁内串行执行
+
+| 属性 | 值 |
+|------|----|
+| 文件 | `store/session_history.go:254-266` |
+| 类型 | 性能隐患（P2） |
+
+**问题**
+
+`Peek` 在持 `s.mu` 写锁期间执行 Bleve 的 `SearchInContext`（全文搜索）：
+
+```go
+// session_history.go:254-266
+s.mu.Lock()
+bleveResults, bleveSeqs := s.bleveSearch(ctx, q.Input, size)  // ← Bleve 全文搜索
+for seq := range bleveSeqs {
+    s.touchLRU(seq)
+}
+ps := s.persistStore
+s.mu.Unlock()
+```
+
+Bleve in-memory 搜索本身不做磁盘 I/O，但全文评分（GSE 分词 + 倒排索引遍历）有一定 CPU 开销。更重要的是，该锁是 `sync.Mutex`（非读写锁），**所有并发的 `Peek` 调用完全串行化**，同时也阻塞 `Hook` 的 Step 3（锁内 L0/L1 写入）。
+
+在多工具并发执行（`executeTool` goroutines）触发多次 `knowledge_search` 的场景下，每次 `knowledge_search` 都会调用 `Peek`，这些调用会互相阻塞，增加工具响应延迟。
+
+**优化方向**
+
+将 `sync.Mutex` 升级为 `sync.RWMutex`，Bleve 搜索在读锁下执行（Bleve in-memory 索引的并发读是安全的），仅 LRU 更新在写锁下执行：
+
+```go
+s.mu.RLock()
+bleveResults, bleveSeqs := s.bleveSearch(ctx, q.Input, size)
+ps := s.persistStore
+s.mu.RUnlock()
+
+// LRU 更新需要写锁，但可批量处理
+if len(bleveSeqs) > 0 {
+    s.mu.Lock()
+    for seq := range bleveSeqs { s.touchLRU(seq) }
+    s.mu.Unlock()
+}
+```
+
+注意：Bleve 官方文档明确支持并发 `Search`，写操作（`Index`/`Delete`）才需要独占。
+
+---
+
+### Issue-46 · Fetch page-in 粒度是整个 seq，单条 doc 触发全 seq SQLite 读
+
+| 属性 | 值 |
+|------|----|
+| 文件 | `store/session_history.go:354-378` |
+| 类型 | 性能特征文档缺失 / 潜在首次访问延迟（P2） |
+
+**问题**
+
+`Fetch` 在 page-in 时无论请求的是哪一条 doc，都加载该 seq 的全部 Records：
+
+```go
+// session_history.go:354-378
+recs, err = ps.LoadRecordsBySeq(ctx, s.sessionID, seq)  // 整个 seq 的所有 Records
+// ...
+for _, rec := range recs {
+    _ = s.index.Index(rec.ID, rec)  // 批量写入 Bleve
+}
+```
+
+一个 seq 通常包含数十条消息（一次 Compact 压缩的全部 head messages）。首次 Fetch 某个历史 seq 中的任意一条 doc 时，会触发整个 seq 的 SQLite 读 + Bleve 批量写入。
+
+这在大多数情况下是合理的预取策略（同 seq 内后续 Fetch 直接命中 L1），但在以下场景下代价偏高：
+- 用户只召回了一个历史片段，但触发了整个 seq（数十条消息）的 page-in
+- seq 的 text 字段很大（长消息 Compact），Bleve 批量 Index 的内存峰值不可控
+
+代码中没有任何注释或文档说明这一 page-in 策略及其代价，维护者难以评估影响。
+
+**优化方向**
+
+短期：在 `Fetch` 和 `addToL0` 附近添加注释，明确 page-in 粒度是整个 seq，以及这是有意的预取策略。
+
+中期：如果实测发现首次 page-in 延迟过高，可以改为先只加载被请求的单条 doc（`LoadRecordByID`），仅在后续 L1 命中率低时触发整个 seq 的 page-in。
+
+---
+
+### Issue-47 · `TruncationDir` 常量永远为空字符串，导出名称具有误导性
+
+| 属性 | 值 |
+|------|----|
+| 文件 | `tool/truncate.go:17` |
+| 类型 | 代码质量（P2） |
+
+**问题**
+
+`tool/truncate.go` 导出了一个名为 `TruncationDir` 的常量，值硬编码为空字符串：
+
+```go
+const (
+    TruncationDir = "" // placeholder; actual temp dir is set in truncDir via init()
+)
+```
+
+`TruncationDir` 常量本身永远是空字符串，与名称暗示的"截断目录"语义不符。实际路径存储在包私有变量 `truncDir` 中（由 `init()` 设置为 `os.TempDir()/opencode-tool-output`）。包外任何调用 `tool.TruncationDir` 的代码都会得到 `""`，无法获取实际截断目录。
+
+当前代码中 `TruncationDir` 没有被任何地方引用（grep 确认），所以目前不造成运行时错误，但常量名称具有误导性。
+
+**优化方向**
+
+方案一：删除 `TruncationDir` 常量，改为导出一个 getter 函数：
+```go
+// TruncationDir returns the directory where truncated output files are stored.
+func TruncationDir() string { return truncDir }
+```
+
+方案二：如果截断目录路径只是内部细节，直接删除 `TruncationDir` 常量即可。
+
+---
+
+### Issue-48 · `normalised` 变量是无效计算，结果被 `_ =` 静默丢弃
+
+| 属性 | 值 |
+|------|----|
+| 文件 | `tool/builtin/edit.go:108,121` |
+| 类型 | 代码质量 / Dead code（P2） |
+
+**问题**
+
+`EditTool.Execute` 中计算了 `normalised` 但从未使用：
+
+```go
+// edit.go:108
+normalised := normalizeLineEndings(content)
+// ...
+// edit.go:121
+_ = normalised // used implicitly via normalizeLineEndings above
+```
+
+注释"used implicitly via normalizeLineEndings above"是错误的。`oldNorm` 和 `newNorm` 由 `convertLineEnding(normalizeLineEndings(...), ending)` 独立计算，`normalised` 没有被传入任何函数。`normalizeLineEndings(content)` 的调用以及赋值给 `normalised` 是完全多余的 dead code，`_ = normalised` 只是为了让编译器不报"declared but not used"错误。
+
+**优化方向**
+
+直接删除第 108 行的 `normalised := normalizeLineEndings(content)` 和第 121 行的 `_ = normalised`，并更新相关注释：
+
+```go
+// Normalise search/replacement strings to LF, then convert to detected ending.
+oldNorm := convertLineEnding(normalizeLineEndings(oldString), ending)
+newNorm := convertLineEnding(normalizeLineEndings(newString), ending)
+```
+
+---
+
+### Issue-49 · `min2`/`max2` 是 Go 1.21+ 内置函数的冗余实现
+
+| 属性 | 值 |
+|------|----|
+| 文件 | `tool/builtin/edit.go:616-628` |
+| 类型 | 代码质量（P2） |
+
+**问题**
+
+`tool/builtin/edit.go` 定义了 `min2` 和 `max2`：
+
+```go
+func min2(a, b int) int { if a < b { return a }; return b }
+func max2(a, b int) int { if a > b { return a }; return b }
+```
+
+Go 1.21 已将 `min`/`max` 作为内置函数（builtin），项目的 `go.mod` 声明 `go 1.21` 或更高（待确认），这两个函数是冗余实现，与 Issue-07（`llm/overflow.go` 中同类问题）完全一致。
+
+**优化方向**
+
+直接删除 `min2`/`max2`，将调用点替换为内置的 `min`/`max`：
+
+```go
+// edit.go:288
+linesToCheck := min(searchBlockSize-2, actualSize-2)
+// edit.go:296
+maxLen := max(len(ol), len(sl))
+// edit.go:610
+matrix[i][j] = min(matrix[i-1][j]+1, min(matrix[i][j-1]+1, matrix[i-1][j-1]+cost))
+```
+
+---
+
+### Issue-50 · `session_reset` 工具成功消息硬编码中文字符串
+
+| 属性 | 值 |
+|------|----|
+| 文件 | `session/reset_tool.go:54` |
+| 类型 | 代码质量（P2） |
+
+**问题**
+
+`ResetTool.Execute` 的成功输出硬编码了中文：
+
+```go
+return tool.Result{
+    Output: "会话已完全重置，所有历史记录已清空。",
+    Title:  "session_reset",
+}, nil
+```
+
+整个代码库所有其他工具的输出均为英文（`"Edit applied successfully."`、`"Wrote file successfully."` 等），中文字符串是明显的不一致。如果系统提示语言为英文，LLM 会收到一条中文工具结果，可能造成混淆。
+
+**优化方向**
+
+```go
+Output: "Session has been fully reset. All history has been cleared.",
+```
+
+---
+
+### Issue-51 · `knowledge/manager.go` fetch 路由用 `strings.Cut` 按首个 `:` 分隔，URL 类 RefID 会截断
+
+| 属性 | 值 |
+|------|----|
+| 文件 | `knowledge/manager.go:151` |
+| 类型 | 行为与文档不符（P2） |
+
+**问题**
+
+`fetch` 使用 `strings.Cut(q.Input, ":")` 来分离 sourceID 和 internalKey：
+
+```go
+sourceID, internalKey, hasPfx := strings.Cut(q.Input, ":")
+```
+
+`strings.Cut` 在**第一个** `:` 处分割。当 RefID 格式为 `"{sourceID}:{internal-key}"` 时这是正确的。但 `Source` 接口文档明确提到 Web 类 Source 的 RefID 示例为 `"web:https://example.com/page"`，此时 `internalKey` 会被截断为 `"//example.com/page"`（丢失了 `https:`），导致 Web Source 的 Fetch 调用收到错误的内部 key。
+
+具体场景：
+- `q.Input = "web:https://example.com/page"`
+- `strings.Cut` → `sourceID="web"`, `internalKey="//example.com/page"`
+- Source.Fetch 收到的是 `"//example.com/page"` 而不是 `"https://example.com/page"`
+
+**优化方向**
+
+改为只在第一个 `:` 分割，且 `sourceID` 中不含 `/`（排除 URL scheme）：
+
+```go
+// Only treat as sourceID:key if the prefix looks like a plain identifier
+// (no slashes), not like a URL scheme (e.g. "https").
+if idx := strings.Index(q.Input, ":"); idx > 0 && !strings.Contains(q.Input[:idx], "/") {
+    sourceID := q.Input[:idx]
+    internalKey := q.Input[idx+1:]
+    // ... existing routing logic
+}
+```
+
+或者约定 sourceID 不能包含 `:` 且专门用 `://` 来识别 URL（和 sourceID prefix 互斥）：
+
+```go
+if hasPfx && !strings.HasPrefix(internalKey, "//") {
+    // valid sourceID:key routing
+}
+```
+
+---
+
 ## 汇总
 
 | ID | 严重级别 | 状态 | 文件 | 一句话描述 |
@@ -1059,7 +1416,16 @@ for {
 | Issue-36 | P1 | ✅ 已修复 | `session/processor.go:214,220` | 流式中途 SIGKILL：part `TimeEnd=0`/`Status=pending`，状态字段不完整 |
 | Issue-37 | P1 | ✅ 已修复 | `session/processor.go:437` | tool goroutine 超时 250ms 后进程退出，飞行中的 `UpdatePart` 可能丢失工具 Output |
 | Issue-38 | P2 | 待修复 | `store/session_history.go:404-433` | CompactionHook seq 回滚依赖实际不存在的并发场景，防御代码无效 |
-| Issue-39 | P2 | 待修复 | `store/session_history.go:451` | Bleve 写入错误 `_ =` 丢弃，L1/L2 不一致靠 P3 双路查询侥幸掩盖 |
-| Issue-40 | P1 | 待修复 | `store/session_history.go:744-750` | `buildDoc` 丢弃工具参数和输出，`knowledge_search` 无法召回工具执行上下文 |
-| Issue-41 | P2 | 待修复 | `session/context.go:369`, `session/prompt.go:234` | `FilterCompacted` 每个 agentic step 全量 O(n) 扫描，session 越长越慢 |
-| Issue-42 | P1 | 待修复 | `llm/client.go:78` | `Client.Stream` 无空闲超时，provider hang 住时永久阻塞 |
+| Issue-39 | P2 | ~~已撤销~~ | `store/session_history.go:451` | ~~Bleve 写入错误 `_ =` 丢弃，L1/L2 不一致靠 P3 双路查询侥幸掩盖~~ **已撤销**（in-memory Bleve 正常运行时 `index.Index()` 无实证失败路径；`Reset()` 路径已有 `index==nil` guard 拦截）|
+| Issue-40 | P1 | ~~已撤销~~ | `store/session_history.go:744-750` | ~~`buildDoc` 丢弃工具参数和输出，`knowledge_search` 无法召回工具执行上下文~~ **已撤销**（工具执行历史是过程记录而非知识；LLM 能力不依赖历史工具参数的召回，可重复操作；`buildDoc` 只索引对话文本是合理设计选择）|
+| Issue-41 | P2 | ~~已撤销~~ | `session/context.go:369`, `session/prompt.go:234` | ~~`FilterCompacted` 每个 agentic step 全量 O(n) 扫描，session 越长越慢~~ **已撤销**（外层循环从尾部往前找 summary，正常运行时 1～2 步命中即 return；未 Compact 时全量扫描但消息量本身有限）|
+| Issue-42 | P1 | ~~已撤销~~ | `llm/client.go:78` | ~~`Client.Stream` 无空闲超时，provider hang 住时永久阻塞~~ **已撤销**（provider goroutine 均有 `defer close(ch)`，channel 必然关闭；底层 SDK hang 不在本项目控制范围内，无代码实证支撑）|
+| Issue-43 | P2 | ~~已撤销~~ | `store/session_history.go:528-554` | ~~`touchLRU`/`lruOldestInL0`/`lruOldestInL1` 均为 O(n) 线性扫描，maxIndexedSeqs 调大后成热路径瓶颈~~ **已撤销**（n=80，纯内存操作，无实证性能问题）|
+| Issue-44 | P2 | ~~已撤销~~ | `store/session_history.go:341-343,562-585` | ~~`addToL0` 持写锁期间执行 SQLite I/O，违背 Issue-27 修复以来的设计原则~~ **已撤销**（L0 miss 是极低频冷路径，代码注释明确说明，属有意设计）|
+| Issue-45 | P2 | ~~已撤销~~ | `store/session_history.go:254-266` | ~~`Peek` 的 Bleve 全文搜索在写锁内执行，并发 Peek 完全串行化~~ **已撤销**（代码注释明确说明 Bleve index is not thread-safe，持锁是有意设计）|
+| Issue-46 | P2 | ~~已撤销~~ | `store/session_history.go:354-378` | ~~Fetch page-in 粒度是整个 seq，单条 doc 触发全 seq SQLite 读，无代码注释说明~~ **已撤销**（SQLite I/O 在锁外，按 seq 整体 page-in 是有意的预取策略，无实证性能问题）|
+| Issue-47 | P2 | 待修复 | `tool/truncate.go:17` | `TruncationDir` 常量永远为空字符串，导出名称具有误导性，无任何调用方 |
+| Issue-48 | P2 | 待修复 | `tool/builtin/edit.go:108,121` | `normalised` 变量是无效计算：`normalizeLineEndings(content)` 结果被 `_ =` 静默丢弃 |
+| Issue-49 | P2 | 待修复 | `tool/builtin/edit.go:616-628` | `min2`/`max2` 是 Go 1.21+ 内置 `min`/`max` 的冗余实现，与 Issue-07 同类 |
+| Issue-50 | P2 | 待修复 | `session/reset_tool.go:54` | `session_reset` 工具的成功消息硬编码中文字符串，与整体英文代码风格不一致 |
+| Issue-51 | P2 | 待修复 | `knowledge/manager.go:151` | `fetch` 的 sourceID 路由依赖第一个 `:` 分隔，RefID 含多个 `:` 时（如 URL）internalKey 会截断 |

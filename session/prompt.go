@@ -381,12 +381,15 @@ func runLoopInternal(ctx context.Context, s store.Store, input RunInput, h *RunH
 				return RunResultStop, fmt.Errorf("runloop: compaction failed: %w", err)
 			}
 			log.Printf("[session] compact done")
-			// Invalidate cache — compaction rewrote history.
-			msgs, allParts, err = loadMessages(ctx, s, input.SessionID)
-			if err != nil {
-				return RunResultStop, err
-			}
-			continue
+			// Compaction is a save-point: the current turn is complete.
+			// The tail (preserved verbatim in context) already contains the
+			// tool results from the step that triggered overflow. Continuing
+			// the loop here would send a request with the summary assistant
+			// message as the last message — no new user turn — which causes
+			// proxies and the Anthropic API to return an empty response
+			// (usage=0). Stop and let the next user message continue naturally.
+			h.closeStoreDone()
+			return RunResultStop, nil
 
 		case ProcessContinue:
 			// Last step always terminates — the LLM has been asked to summarise.

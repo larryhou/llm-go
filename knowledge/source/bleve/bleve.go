@@ -150,8 +150,17 @@ func (s *Source) Fetch(ctx context.Context, q knowledge.Query) ([]knowledge.Resu
 	}
 
 	// Extract fields from the Bleve document via VisitFields.
+	// Numeric fields (stored as trie-encoded binary) must be decoded via
+	// index.NumericField.Number() — string(f.Value()) on a numeric field
+	// yields garbage bytes, not a digit string.
 	fields := make(map[string]string)
 	doc.VisitFields(func(f index.Field) {
+		if nf, ok := f.(index.NumericField); ok {
+			if v, err := nf.Number(); err == nil {
+				fields[f.Name()] = fmt.Sprintf("%g", v)
+			}
+			return
+		}
 		fields[f.Name()] = string(f.Value())
 	})
 

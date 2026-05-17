@@ -41,6 +41,10 @@ func ToModelMessages(msgs []*store.Message, parts map[string][]*store.Part) ([]l
 				drop = true
 			} else if m.Error != nil && !hasRealContent(ps) {
 				drop = true
+			} else if m.Status == "" && m.Error == nil && !hasRealContent(ps) && !hasToolCalls(ps) {
+				// Assistant responded with usage=0 / empty body (proxy swallowed the
+				// request silently). No text, no tool calls — treat like cancelled.
+				drop = true
 			}
 			if drop {
 				// Also drop the preceding user message if it is there.

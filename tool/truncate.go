@@ -14,7 +14,7 @@ import (
 const (
 	DefaultMaxLines = 2000
 	DefaultMaxBytes = 50 * 1024 // 51,200 bytes
-	TruncationDir   = "" // set at init from os.TempDir()
+	TruncationDir   = "" // placeholder; actual temp dir is set in truncDir via init()
 	RetentionDays   = 7
 )
 

@@ -656,27 +656,45 @@ func (s *SessionHistorySource) fetchFromBleve(docID string) ([]knowledge.Result,
 		return nil, fmt.Errorf("session history fetch %q: not found in bleve", docID)
 	}
 
-	fieldVals := make(map[string]*strings.Builder)
+	// Collect text fields into string builders; collect numeric fields separately.
+	// Numeric fields (compaction_seq, turn_index) are stored in Bleve as trie-
+	// encoded binary — calling f.Value() on them yields raw bytes, not digits.
+	// Use index.NumericField.Number() to decode them properly.
+	textVals := make(map[string]*strings.Builder)
+	numVals := make(map[string]float64)
 	doc.VisitFields(func(f index.Field) {
-		b := fieldVals[f.Name()]
+		if nf, ok := f.(index.NumericField); ok {
+			if v, err := nf.Number(); err == nil {
+				numVals[f.Name()] = v
+			}
+			return
+		}
+		b := textVals[f.Name()]
 		if b == nil {
 			b = &strings.Builder{}
-			fieldVals[f.Name()] = b
+			textVals[f.Name()] = b
 		}
 		b.Write(f.Value())
 	})
-	get := func(key string) string {
-		if b := fieldVals[key]; b != nil {
+	getText := func(key string) string {
+		if b := textVals[key]; b != nil {
 			return b.String()
 		}
 		return ""
 	}
+	getInt := func(key string) int {
+		v, ok := numVals[key]
+		if !ok {
+			log.Printf("[session_history] fetchFromBleve %q: numeric field %q missing from stored document", docID, key)
+		}
+		return int(v)
+	}
 
-	seq := get("compaction_seq")
-	turnIdx := get("turn_index")
-	role := get(fieldRole)
-	text := get(fieldText)
-	title := fmt.Sprintf("[来源：历史对话 第%s轮 turn#%s role=%s]", seq, turnIdx, role)
+	seq := getInt("compaction_seq")
+	turnIdx := getInt("turn_index")
+	role := getText(fieldRole)
+	text := getText(fieldText)
+	title := fmt.Sprintf("[来源：历史对话 第%d轮 turn#%d role=%s]", seq, turnIdx, role)
 
 	return []knowledge.Result{{
 		RefID:   sessionHistorySourceID + ":" + docID,
