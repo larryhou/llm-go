@@ -123,7 +123,7 @@ func (p *Processor) Process(ctx context.Context, assistantMsgID string, input Pr
 	for ev := range events {
 		r, err := state.handleEvent(ctx, ev)
 		if err != nil {
-			state.cleanup()
+			state.cleanup(true) // error path: cancel in-flight tools immediately
 			return ProcessStop, err
 		}
 		if r != ProcessContinue {
@@ -135,7 +135,11 @@ func (p *Processor) Process(ctx context.Context, assistantMsgID string, input Pr
 		}
 	}
 
-	state.cleanup()
+	// Normal stream end: do NOT cancel toolCtx here — tools launched by the
+	// LLM are still executing asynchronously and must be allowed to complete.
+	// Only wait for them; cancelTools=false skips toolCancel().
+	cancelled := ctx.Err() != nil
+	state.cleanup(cancelled)
 	return result, nil
 }
 
@@ -404,11 +408,27 @@ func (s *processorState) checkDoomLoop(toolName, inputKey string) bool {
 // cleanup finalises any open parts when the stream ends (normally or abnormally).
 // Aligned with processor.ts cleanup().
 //
+// cancelTools distinguishes the two exit paths:
+//
+//   - cancelTools=true  (session cancelled or stream error): call toolCancel()
+//     immediately so all tool goroutines receive a cancellation signal, then
+//     wait up to 250ms for them to exit. Any parts still pending/running after
+//     the timeout are marked Status=error/Interrupted ("Tool execution aborted").
+//     The isAlreadyInterrupted guard in executeTool prevents a late-finishing
+//     goroutine from overwriting that mark.
+//
+//   - cancelTools=false (normal stream end): tools are legitimate LLM dispatches
+//     with their own timeouts (e.g. ShellTool defaults to 120s). Do NOT call
+//     toolCancel() — that would abort them prematurely and produce spurious
+//     "Tool execution aborted" errors (the bug introduced in e62476b). Instead,
+//     wait unconditionally for all goroutines to finish before returning, so
+//     the caller always sees consistent store state (all parts completed/error).
+//
 // IMPORTANT: cleanup always uses context.Background() for store writes, never
 // the caller's ctx. When triggered by cancellation the caller's ctx is already
 // done; using it for store operations would cause every write to fail silently
 // in a real database backend, leaving tool parts permanently in pending state.
-func (s *processorState) cleanup() {
+func (s *processorState) cleanup(cancelTools bool) {
 	ctx := context.Background()
 
 	// Finalise open text part
@@ -437,23 +457,53 @@ func (s *processorState) cleanup() {
 	// that late writes from timed-out goroutines do not overwrite the interrupted
 	// mark. Parts that are still pending/running after process exit are recovered
 	// at next startup by RecoverOrphanedTools (Issue-36 fix).
-	if s.toolCancel != nil {
-		s.toolCancel()
-	}
-
 	waitDone := make(chan struct{})
 	go func() {
 		s.toolWg.Wait()
 		close(waitDone)
 	}()
-	select {
-	case <-waitDone:
-		// all goroutines finished cleanly
-	case <-time.After(250 * time.Millisecond):
-		// timed out — goroutines are cancelled but may not have exited yet
+
+	if cancelTools {
+		// Cancel path: signal all tool goroutines to stop, then give them a
+		// brief grace period (250ms) to exit cleanly before we forcibly mark
+		// any stragglers as interrupted.
+		// A single shared deadline avoids the N×250ms problem.
+		if s.toolCancel != nil {
+			s.toolCancel()
+		}
+		select {
+		case <-waitDone:
+			// all goroutines finished cleanly within the grace period
+		case <-time.After(250 * time.Millisecond):
+			// timed out — goroutines received cancel signal but may not have
+			// exited yet; mark any still-pending/running parts as interrupted.
+		}
+	} else {
+		// Normal path: tools are legitimate LLM dispatches with their own
+		// timeouts (e.g. ShellTool defaults to 120s). Wait for all of them to
+		// finish so the caller always sees consistent store state.
+		// toolCancel is NOT called here — that would abort them prematurely.
+		//
+		// However, if the session is cancelled while we are waiting (e.g.
+		// h.Cancel() arrives after the stream ended but before all tools
+		// completed), we must not block forever. In that case fall through to
+		// the interrupted-mark logic below as if cancelTools were true.
+		select {
+		case <-waitDone:
+			// all goroutines finished — fast path, no interruption needed
+			if s.toolCancel != nil {
+				s.toolCancel() // release context resources
+			}
+			return
+		case <-s.toolCtx.Done():
+			// session was cancelled while we were waiting; treat as cancel path
+		}
+		// fall through to the interrupted-mark logic below
 	}
 
 	// Mark any parts that are still pending/running as interrupted.
+	// Only reached on the cancel path (cancelTools=true) or when a late
+	// cancel arrives during a normal-path wait (the select above fell through).
 	s.toolMu.Lock()
 	activeSnapshot := make(map[string]string, len(s.activeToolParts))
 	for k, v := range s.activeToolParts {
@@ -471,6 +521,13 @@ func (s *processorState) cleanup() {
 			continue
 		}
 		_ = s.updateToolStatus(ctx, partID, store.ToolStatusError, map[string]any{"interrupted": true}, "Tool execution aborted")
+	}
+
+	// Always release the toolCtx child-context entry from the parent chain,
+	// regardless of path. On the cancel path toolCancel() was already called
+	// above; calling it again is a no-op (CancelFunc is idempotent).
+	if s.toolCancel != nil {
+		s.toolCancel()
 	}
 }
 

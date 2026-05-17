@@ -15,6 +15,8 @@ package main
 import (
 	"bufio"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"flag"
 	"fmt"
 	"os"
@@ -31,9 +33,9 @@ import (
 	"github.com/larryhou/llm-go/knowledge"
 	blevesource "github.com/larryhou/llm-go/knowledge/source/bleve"
 	"github.com/larryhou/llm-go/llm"
+	providerPkg "github.com/larryhou/llm-go/provider"
 	anthropicProv "github.com/larryhou/llm-go/provider/anthropic"
 	openaiProv "github.com/larryhou/llm-go/provider/openai"
-	providerPkg "github.com/larryhou/llm-go/provider"
 	"github.com/larryhou/llm-go/session"
 	"github.com/larryhou/llm-go/store"
 	"github.com/larryhou/llm-go/store/memory"
@@ -41,6 +43,7 @@ import (
 	"github.com/larryhou/llm-go/tool"
 	"github.com/larryhou/llm-go/tool/builtin"
 )
+
 // ── config ────────────────────────────────────────────────────────────────────
 
 type appConfig struct {
@@ -220,7 +223,7 @@ func main() {
 	flag.IntVar(&cfg.maxSteps, "max-steps", 20, "max agentic steps per turn")
 	flag.IntVar(&cfg.contextLimit, "context-limit", 128000, "context window token limit")
 	flag.StringVar(&cfg.skillsDir, "skills", ".opencode", "skills root directory to index")
-	flag.StringVar(&cfg.storeDSN, "store", "sqlite:memory.sqlite", "store DSN: \"memory\" or \"sqlite:<path>\"")
+	flag.StringVar(&cfg.storeDSN, "store", "sqlite:memory.db", "store DSN: \"memory\" or \"sqlite:<path>\"")
 	flag.BoolVar(&cfg.web, "web", false, "start web UI instead of REPL (port chosen automatically)")
 	flag.BoolVar(&cfg.debug, "debug", false, "record each turn to <session-id>/chat-<ts>.json")
 	flag.Parse()
@@ -353,8 +356,10 @@ func main() {
 
 	// ── skills index + knowledge tools ───────────────────────────────────────
 
-	// sessionID declared here so it can be used by SessionHistorySource below.
-	sessionID := fmt.Sprintf("control-%d", time.Now().UnixNano())
+	// sessionID is derived from the working directory so that the same
+	// directory always resumes the same session across process restarts.
+	h := sha256.Sum256([]byte(cwd))
+	sessionID := "control-" + hex.EncodeToString(h[:8])
 
 	skillsCount := 0
 	skillsAbsDir := cfg.skillsDir
@@ -413,12 +418,14 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM)
 	defer stop()
 	tool.StartCleanup(ctx)
-	if err := sessionStore.CreateSession(ctx, &store.Session{
-		ID:    sessionID,
-		Model: cfg.provider + "/" + cfg.modelID,
-	}); err != nil {
-		fmt.Fprintf(os.Stderr, "create session: %v\n", err)
-		os.Exit(1)
+	if _, err := sessionStore.GetSession(ctx, sessionID); err != nil {
+		if err := sessionStore.CreateSession(ctx, &store.Session{
+			ID:    sessionID,
+			Model: cfg.provider + "/" + cfg.modelID,
+		}); err != nil {
+			fmt.Fprintf(os.Stderr, "create session: %v\n", err)
+			os.Exit(1)
+		}
 	}
 
 	// session_reset: control is single-session, no server-level lock needed.
@@ -486,12 +493,16 @@ func main() {
 
 	if cfg.web {
 		app := &appState{
-			cwd:         cwd,
-			tools:       tools,
-			extraSystem: extraSystem,
-			model:       model,
-			prov:        innerProv,
-			cfg:         sessionCfg,
+			cwd:            cwd,
+			tools:          tools,
+			extraSystem:    extraSystem,
+			model:          model,
+			prov:           innerProv,
+			cfg:            sessionCfg,
+			maxSteps:       cfg.maxSteps,
+			compactionHook: compactionHook,
+			sessStore:      sessionStore,
+			sessID:         sessionID,
 		}
 		if err := runWebServer(app); err != nil {
 			fmt.Fprintf(os.Stderr, "web server: %v\n", err)

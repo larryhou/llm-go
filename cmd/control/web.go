@@ -12,7 +12,6 @@ import (
 	"github.com/larryhou/llm-go/llm"
 	"github.com/larryhou/llm-go/session"
 	"github.com/larryhou/llm-go/store"
-	"github.com/larryhou/llm-go/store/memory"
 	"github.com/larryhou/llm-go/tool"
 )
 
@@ -28,12 +27,16 @@ type webServer struct {
 
 // appState holds shared state initialised once in main.
 type appState struct {
-	cwd         string
-	tools       []tool.Tool
-	extraSystem []string
-	model       llm.Model
-	prov        llm.Provider // RecordProvider(real) in -debug, real otherwise
-	cfg         *config.Info
+	cwd            string
+	tools          []tool.Tool
+	extraSystem    []string
+	model          llm.Model
+	prov           llm.Provider // RecordProvider(real) in -debug, real otherwise
+	cfg            *config.Info
+	maxSteps       int
+	compactionHook store.CompactionHook
+	sessStore      store.Store
+	sessID         string
 }
 
 // ── web server ────────────────────────────────────────────────────────────────
@@ -46,16 +49,7 @@ func runWebServer(app *appState) error {
 	addr := ln.Addr().(*net.TCPAddr)
 	url := fmt.Sprintf("http://127.0.0.1:%d", addr.Port)
 
-	sessID := fmt.Sprintf("web-%d", addr.Port)
-	sessStore := memory.New()
-	if err := sessStore.CreateSession(context.Background(), &store.Session{
-		ID:    sessID,
-		Model: app.model.ProviderID + "/" + app.model.ID,
-	}); err != nil {
-		return fmt.Errorf("create session: %w", err)
-	}
-
-	srv := &webServer{app: app, sessStore: sessStore, sessID: sessID}
+	srv := &webServer{app: app, sessStore: app.sessStore, sessID: app.sessID}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", srv.handleUI)
 	mux.HandleFunc("/chat", srv.handleChat)
@@ -170,9 +164,10 @@ func (s *webServer) handleChat(w http.ResponseWriter, r *http.Request) {
 		Provider:    turnProv,
 		Tools:       s.app.tools,
 		ExtraSystem: s.app.extraSystem,
-		MaxSteps:    20,
+		MaxSteps:    s.app.maxSteps,
 		Config:      s.app.cfg,
 		WaitFor:     waitFor,
+		OnCompact:   s.app.compactionHook,
 	})
 	s.activeHandle = h
 	s.mu.Unlock()

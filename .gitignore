@@ -12,3 +12,11 @@ vendor/
 /web-*/
 /.DS_Store
 SESSION_RECALL.md
+
+# SQLite runtime databases and WAL files
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+
+# debug/replay ndjson dumps
+debug-*.ndjson

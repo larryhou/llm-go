@@ -821,6 +821,204 @@ _ = s.persistStore.SaveRecord(ctx, s.sessionID, rec)
 
 ---
 
+---
+
+## 架构审查（本次新增）
+
+### Issue-38 · `CompactionHook` seq 回滚逻辑依赖实际上不存在的并发场景
+
+| 属性 | 值 |
+|------|----|
+| 文件 | `store/session_history.go:404-433` |
+| 类型 | 无效防御代码 / 维护隐患（P2） |
+
+**问题**
+
+`Hook()` 在锁外执行 SQLite 写入（`SaveRecords`），失败时用以下逻辑回滚 seq：
+
+```go
+s.mu.Lock()
+if s.currentSeq == seq {   // ← 只有无并发 Hook 时才回滚
+    s.currentSeq--
+}
+s.mu.Unlock()
+```
+
+这段代码的前提是"可能存在并发 Hook 调用"。但 `Hook()` 的唯一调用点是 `Compact()` 的 Step5（`session/compaction.go:376`），而 `Compact()` 在 `RunLoop` 的主循环中串行执行，不存在两个 Compact 并发的路径。因此 `currentSeq == seq` 这个条件**在实际运行中永远为 true**，并发保护从未生效，反而让代码逻辑难以理解。
+
+**优化方向**
+
+移除并发判断，直接回滚：
+```go
+s.mu.Lock()
+s.currentSeq--
+s.mu.Unlock()
+```
+或在注释中明确说明"当前 Hook 不会并发调用，条件判断是防御性保留"，避免后续维护者误解。
+
+---
+
+### Issue-39 · Bleve 写入错误被 `_ =` 丢弃，L1/L2 不一致靠 P3 侥幸救回
+
+| 属性 | 值 |
+|------|----|
+| 文件 | `store/session_history.go:451` |
+| 类型 | 可观测性缺失 / 静默降级（P2） |
+
+**问题**
+
+SQLite 写入成功后，Bleve 写入错误被完全丢弃：
+
+```go
+for i, m := range head {
+    _ = s.index.Index(m.ID, recs[i])  // ← 错误静默丢弃
+}
+```
+
+Bleve 写入失败时：
+- L2（SQLite）有记录，L1（Bleve）没有
+- `loadedSeqs` 未更新（在 Bleve 写之后），该 seq 不在热点缓存中
+- `Peek` 时靠 P3 双路查询的 SQL 兜底路径返回结果，行为看起来"正常"
+
+这是靠 P3 架构侥幸掩盖了错误，而不是设计上的保障。调用方无任何感知，问题在监控上完全不可见。
+
+**优化方向**
+
+```go
+if err := s.index.Index(m.ID, recs[i]); err != nil {
+    log.Printf("session history hook: bleve index seq=%d id=%s: %v", seq, m.ID, err)
+}
+```
+至少记录日志，保证可观测性。
+
+---
+
+### Issue-40 · `buildDoc` 丢弃工具参数和输出，`knowledge_search` 无法召回工具执行上下文
+
+| 属性 | 值 |
+|------|----|
+| 文件 | `store/session_history.go:744-750` |
+| 类型 | 功能缺失（P1） |
+
+**问题**
+
+`buildDoc` 构建检索文档时，对 `PartTypeTool` 只提取工具名称，完全丢弃参数和输出：
+
+```go
+case PartTypeTool:
+    d, ok := DataAs[*ToolPartData](p)
+    if ok && d.Tool != "" {
+        toolCalls = append(toolCalls, d.Tool)  // ← 只有名字
+        // d.Input  — 丢弃（工具参数）
+        // d.Output — 丢弃（工具执行结果）
+    }
+```
+
+后果：用户问"上次读文件 X 返回了什么内容"，`knowledge_search` 召回的 `Record.Text` 里没有工具输出，LLM 无法从历史中获取答案，必须重新执行工具。对于代价高昂或不可重现的工具调用（如写文件、网络请求）尤其有损。
+
+**优化方向**
+
+将工具输出纳入可检索文本：
+```go
+case PartTypeTool:
+    d, ok := DataAs[*ToolPartData](p)
+    if ok && d.Tool != "" {
+        toolCalls = append(toolCalls, d.Tool)
+        if d.Output != "" {
+            textParts = append(textParts, fmt.Sprintf("[%s] %s", d.Tool, d.Output))
+        }
+    }
+```
+工具参数（`d.Input`）可选择性纳入，视 schema 复杂度决定是否 JSON 序列化后追加。
+
+---
+
+### Issue-41 · `FilterCompacted` 在每个 agentic step 全量扫描消息列表，O(n) 随 session 线性增长
+
+| 属性 | 值 |
+|------|----|
+| 文件 | `session/context.go:369`，`session/prompt.go:217,234` |
+| 类型 | 性能隐患（P2） |
+
+**问题**
+
+`FilterCompacted` 每次从后向前遍历全部消息寻找最近的 compaction pair：
+
+```go
+func FilterCompacted(msgs []*store.Message, ...) []*store.Message {
+    for i := len(msgs) - 1; i >= 1; i-- {  // ← O(n) 全量扫描
+        ...
+    }
+}
+```
+
+调用点在 RunLoop 主循环内（`prompt.go:234`），**每个 agentic step 都执行一次**。随着 session 历史增长，消息列表线性增大，扫描时间也线性增长。对于长达数百轮的 session，在高频工具调用场景下累积开销不可忽视。
+
+**优化方向**
+
+`loadMessages` 之后做一次 `FilterCompacted`，将结果缓存为 `filteredMsgs`；仅在 `Compact` 后（触发 `loadMessages` 重载时）重新计算。主循环内直接使用缓存结果，避免重复扫描：
+
+```go
+msgs, allParts, err = loadMessages(...)
+filteredMsgs := FilterCompacted(msgs, allParts)  // 计算一次，缓存
+
+for {
+    // 直接使用 filteredMsgs，不再每轮调用 FilterCompacted
+    modelMsgs, _ := ToModelMessages(filteredMsgs, allParts)
+    ...
+    // Compact 后重新计算
+    msgs, allParts, _ = loadMessages(...)
+    filteredMsgs = FilterCompacted(msgs, allParts)
+}
+```
+
+---
+
+### Issue-42 · `Client.Stream` 无单次流式超时，provider hang 住时永久阻塞
+
+| 属性 | 值 |
+|------|----|
+| 文件 | `llm/client.go:78` |
+| 类型 | 可靠性隐患（P1） |
+
+**问题**
+
+`doStream` 消费事件的循环没有空闲超时（idle timeout）：
+
+```go
+for ev := range events {  // ← 纯粹依赖 ctx 取消和 provider 主动关闭
+    ...
+}
+```
+
+若 provider 在建立连接后不发送任何事件、也不关闭 channel（网络层 hang、proxy 无响应、服务端 bug），此循环永久阻塞。唯一出路是调用方传入的 ctx 超时取消，但调用方（`RunLoop`）默认不设置超时，`context.WithoutCancel`（`Compact` 路径）甚至明确脱离了父 ctx 的取消信号。
+
+**优化方向**
+
+在事件循环中加入空闲超时：
+```go
+idleTimeout := 60 * time.Second
+timer := time.NewTimer(idleTimeout)
+defer timer.Stop()
+
+for {
+    select {
+    case ev, ok := <-events:
+        if !ok { return false, true }
+        timer.Reset(idleTimeout)
+        // 处理事件...
+    case <-timer.C:
+        out <- Event{Type: EventError, Err: fmt.Errorf("stream idle timeout after %v", idleTimeout)}
+        return false, true
+    case <-ctx.Done():
+        out <- Event{Type: EventError, Err: ctx.Err()}
+        return false, true
+    }
+}
+```
+
+---
+
 ## 汇总
 
 | ID | 严重级别 | 状态 | 文件 | 一句话描述 |
@@ -860,3 +1058,8 @@ _ = s.persistStore.SaveRecord(ctx, s.sessionID, rec)
 | Issue-35 | P1 | ✅ 已修复 | `store/session_history.go:348` | `SaveRecord` 错误被 `_ =` 全部丢弃，SQLite 写失败无任何告警 |
 | Issue-36 | P1 | ✅ 已修复 | `session/processor.go:214,220` | 流式中途 SIGKILL：part `TimeEnd=0`/`Status=pending`，状态字段不完整 |
 | Issue-37 | P1 | ✅ 已修复 | `session/processor.go:437` | tool goroutine 超时 250ms 后进程退出，飞行中的 `UpdatePart` 可能丢失工具 Output |
+| Issue-38 | P2 | 待修复 | `store/session_history.go:404-433` | CompactionHook seq 回滚依赖实际不存在的并发场景，防御代码无效 |
+| Issue-39 | P2 | 待修复 | `store/session_history.go:451` | Bleve 写入错误 `_ =` 丢弃，L1/L2 不一致靠 P3 双路查询侥幸掩盖 |
+| Issue-40 | P1 | 待修复 | `store/session_history.go:744-750` | `buildDoc` 丢弃工具参数和输出，`knowledge_search` 无法召回工具执行上下文 |
+| Issue-41 | P2 | 待修复 | `session/context.go:369`, `session/prompt.go:234` | `FilterCompacted` 每个 agentic step 全量 O(n) 扫描，session 越长越慢 |
+| Issue-42 | P1 | 待修复 | `llm/client.go:78` | `Client.Stream` 无空闲超时，provider hang 住时永久阻塞 |
