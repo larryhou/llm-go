@@ -113,6 +113,30 @@ func main() {
 		fmt.Printf("┌─ Turn %d: %q\n", i+1, truncate(turn.userMsg, 70))
 
 		prov := llm.NewReplayProviderFromRecords(turn.steps)
+		if *verbose {
+			prov.OnRequest = func(stepIdx int, req llm.Request) {
+				if len(req.Messages) == 0 {
+					return
+				}
+				last := req.Messages[len(req.Messages)-1]
+				// Detect max-steps injection: last message is user with PromptMaxSteps text.
+				isMaxStepsInject := false
+				if last.Role == llm.RoleUser {
+					for _, cp := range last.Content {
+						if cp.Type == llm.PartTypeText && strings.HasPrefix(cp.Text, session.PromptMaxSteps[:40]) {
+							isMaxStepsInject = true
+							break
+						}
+					}
+				}
+				marker := ""
+				if isMaxStepsInject {
+					marker = "  ← MAX-STEPS INJECTION (role=user) ✓"
+				}
+				hasTools := len(req.Tools) > 0
+				fmt.Printf("│  step %d: last_role=%-9s tools=%v%s\n", stepIdx+1, last.Role, hasTools, marker)
+			}
+		}
 
 		_, runErr := session.RunLoop(ctx, sessStore, session.RunInput{
 			SessionID:   sessID,

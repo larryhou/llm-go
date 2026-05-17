@@ -22,8 +22,9 @@ import (
 // Each call to Stream() consumes the next Record in order.
 // Construct with NewReplayProvider (from file) or NewReplayProviderFromRecords (from slice).
 type ReplayProvider struct {
-	steps []Record
-	idx   atomic.Int64
+	steps     []Record
+	idx       atomic.Int64
+	OnRequest func(stepIdx int, req Request) // called before each step is replayed; optional
 }
 
 // NewReplayProvider loads all Records from the ndjson recording at path.
@@ -69,10 +70,13 @@ func (p *ReplayProvider) Records() []Record { return p.steps }
 // Stream satisfies llm.Provider. It replays the next recorded Record as a
 // live event stream, synthesising low-level lifecycle events from the stored
 // higher-level ones so that session.Processor behaves identically to a real run.
-func (p *ReplayProvider) Stream(_ context.Context, _ Request) (<-chan Event, error) {
+func (p *ReplayProvider) Stream(_ context.Context, req Request) (<-chan Event, error) {
 	i := int(p.idx.Add(1) - 1)
 	if i >= len(p.steps) {
 		return nil, fmt.Errorf("replay provider: no more steps (have %d, attempted step %d)", len(p.steps), i+1)
+	}
+	if p.OnRequest != nil {
+		p.OnRequest(i, req)
 	}
 	step := p.steps[i]
 
