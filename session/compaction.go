@@ -154,6 +154,31 @@ func Select(msgs []*store.Message, allParts map[string][]*store.Part, model llm.
 		}
 	}
 
+	// Minimum tail content guard: if the selected tail is less than minKeepRatio
+	// of the total session token weight, the verbatim context after compaction
+	// would be too thin to aid context recovery. Keep pulling earlier turns into
+	// the tail until the threshold is met, leaving at least 1 turn in the head
+	// for the summary LLM to compress.
+	// Large-turn guard: if a candidate turn exceeds 5% of total session tokens,
+	// stop expanding — absorbing it would disproportionately shrink the head.
+	minTailRatio := config.DefaultCompactionMinKeepRatio
+	if cfg != nil && cfg.Compaction != nil && cfg.Compaction.MinKeepRatio != nil {
+		minTailRatio = *cfg.Compaction.MinKeepRatio
+	}
+	totalSessionTokens := estimateTurnTokens(msgs)
+	minTailTokens := int(float64(totalSessionTokens) * minTailRatio)
+	maxCandidateTokens := int(float64(totalSessionTokens) * 0.05)
+	for totalTokens < minTailTokens && tailStartTurnIdx > 1 {
+		candidateIdx := tailStartTurnIdx - 1
+		t := turns[candidateIdx]
+		size := estimateTurnTokens(msgs[t.StartIdx:t.EndIdx])
+		if size > maxCandidateTokens {
+			break
+		}
+		totalTokens += size
+		tailStartTurnIdx = candidateIdx
+	}
+
 	// Ensure tail keeps at least 1 turn.
 	if tailStartTurnIdx >= len(turns) {
 		tailStartTurnIdx = len(turns) - 1

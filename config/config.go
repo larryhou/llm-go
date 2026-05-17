@@ -192,11 +192,12 @@ type ToolOutputConfig struct {
 
 // CompactionConfig matches opencode's compaction config.
 type CompactionConfig struct {
-	Auto                 *bool `json:"auto,omitempty"`                    // default true
-	Prune                *bool `json:"prune,omitempty"`                   // default false; set true to enable background tool-output pruning
-	TailTurns            *int  `json:"tail_turns,omitempty"`              // default 2
-	PreserveRecentTokens *int  `json:"preserve_recent_tokens,omitempty"`
-	Reserved             *int  `json:"reserved,omitempty"`
+	Auto                 *bool    `json:"auto,omitempty"`                   // default true
+	Prune                *bool    `json:"prune,omitempty"`                  // default false; set true to enable background tool-output pruning
+	TailTurns            *int     `json:"tail_turns,omitempty"`             // default 2
+	PreserveRecentTokens *int     `json:"preserve_recent_tokens,omitempty"`
+	Reserved             *int     `json:"reserved,omitempty"`
+	MinKeepRatio         *float64 `json:"min_keep_ratio,omitempty"`         // default 0.1; minimum verbatim-tail token fraction of total session tokens
 }
 
 // ExperimentalConfig holds experimental feature flags.
@@ -244,11 +245,12 @@ const (
 	DefaultToolOutputMaxLines = 2000
 	DefaultToolOutputMaxBytes = 50 * 1024 // 51200
 
-	DefaultCompactionTailTurns           = 2
-	DefaultCompactionMinPreserveTokens   = 2_000
-	DefaultCompactionMaxPreserveTokens   = 8_000
-	DefaultCompactionBuffer              = 20_000
-	DefaultProviderTimeout               = 300_000 // 5 minutes in ms
+	DefaultCompactionTailTurns         = 2
+	DefaultCompactionMinPreserveTokens = 2_000
+	DefaultCompactionMaxPreserveTokens = 8_000
+	DefaultCompactionBuffer            = 20_000
+	DefaultCompactionMinKeepRatio      = 0.1 // minimum verbatim-tail token fraction of total session tokens
+	DefaultProviderTimeout             = 300_000 // 5 minutes in ms
 )
 
 // Load reads the llm-go config from standard locations.

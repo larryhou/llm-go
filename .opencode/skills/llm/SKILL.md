@@ -163,12 +163,42 @@ flowchart LR
     PushForward --> TailStart
     TailStart --> TailMsgIdx{"tailMsgIdx == 0?"}
     TailMsgIdx -- Yes --> AllHead
-    TailMsgIdx -- No --> Head["head = msgs[:tailMsgIdx]\n→ summarised by LLM"]
-    TailMsgIdx -- No --> Tail["tail → preserved verbatim"]
+    TailMsgIdx -- No --> MinKeep["Min-keep guard:\ntotalTokens < total×min_keep_ratio\n(default 10%)?"]
+    MinKeep -- No --> Head["head = msgs[:tailMsgIdx]\n→ summarised by LLM"]
+    MinKeep -- Yes --> Expand["Pull earlier turns into tail\nuntil threshold met\nor candidate turn > total×5%\nor tailStartTurnIdx == 1"]
+    Expand --> Head
+    Head --> Tail["tail → preserved verbatim"]
     Head --> RecentHead{"tailStartTurnIdx >= 1?"}
     RecentHead -- Yes --> RH["recentTurnIdx = max(0, tailStartTurnIdx-2)\nRecentHead = msgs[turns[recentTurnIdx].StartIdx : tailMsgIdx]"]
     RecentHead -- No --> RHNil["RecentHead = nil"]
 ```
+
+#### Minimum-keep guard (`min_keep_ratio`)
+
+After the initial `tailTurns` selection, `Select()` checks whether the tail's estimated token count meets a minimum fraction of the total session token weight. If not, it expands the tail backward (pulling more turns from the head) until the threshold is satisfied.
+
+**Expansion stops when any of these conditions is met:**
+1. `totalTokens ≥ totalSessionTokens × min_keep_ratio` — threshold satisfied
+2. Candidate turn size > `totalSessionTokens × 5%` — turn is too large, would disproportionately shrink the head; skip and stop
+3. `tailStartTurnIdx == 1` — head must retain at least 1 turn for the summary LLM
+
+This guard ensures that after compaction the LLM always receives a meaningful verbatim tail, even when individual turns are very short (e.g. single-sentence exchanges).
+
+**Configuration:**
+
+```jsonc
+// ~/.config/llm/llm.json
+{
+  "compaction": {
+    "min_keep_ratio": 0.1   // default 0.1 (10%); set lower to allow thinner tails
+  }
+}
+```
+
+| Constant | Value | Meaning |
+|---|---|---|
+| `config.DefaultCompactionMinKeepRatio` | `0.1` | tail must be ≥ 10% of total session tokens |
+| hard-coded large-turn threshold | `0.05` | candidate turn > 5% of total → stop expanding |
 
 #### Recent-context anchor (`PartTypeRecentContext`, `store/store.go`)
 
@@ -838,6 +868,7 @@ These are all aligned with opencode's `overflow.ts` and `compaction.ts`:
 | `llm.ToolOutputMaxCharsCompaction` | 2,000 chars | truncation during compaction summary |
 | `llm.MinPreserveRecentTokens` | 2,000 tokens | minimum tail to keep verbatim |
 | `llm.MaxPreserveRecentTokens` | 8,000 tokens | maximum tail to keep verbatim |
+| `config.DefaultCompactionMinKeepRatio` | 0.1 | tail must be ≥ 10% of total session tokens after compaction |
 | `session.DoomLoopThreshold` | 3 | identical tool+args calls before doom-loop |
 | `session.DefaultTailTurns` | 2 | user turns to keep in tail |
 | `tool.DefaultMaxLines` | 2,000 lines | tool output line limit |
