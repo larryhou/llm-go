@@ -543,6 +543,372 @@ fmt.Fprintf(&sb, "- 调用工具: %s(%s) → %s\n", d.Tool, d.CallID[:8], output
 
 ---
 
+## store/ 包（续）
+
+### Issue-27 · `SessionHistorySource` 持写锁期间执行 SQLite I/O，所有操作完全串行
+
+| 属性 | 值 |
+|------|----|
+| 文件 | `store/session_history.go:227-228`, `store/session_history.go:283-284`, `store/session_history.go:330` |
+| 类型 | 并发性能缺陷（已确认） |
+
+**问题**
+
+`Peek`、`Fetch`、`Hook` 三个公开方法均在持有 `s.mu`（写锁）期间直接调用 SQLite I/O：
+
+- `Peek`（`session_history.go:251`）：锁内调用 `src.Peek()` → SQLite `LIKE` 查询
+- `Fetch`（`session_history.go:301`）：锁内调用 `FindSeqByDocID()` → SQLite 查询
+- `Fetch`（`session_history.go:485`）：锁内调用 `LoadRecordsBySeq()` → SQLite 查询（page-in）
+- `Hook`（`session_history.go:348`）：锁内调用 `SaveRecord()` → SQLite 写
+
+后果：任意时刻只有一个 goroutine 能执行历史检索，`RunLoop` 的 `knowledge_search`
+工具调用与 `Compact` 触发的 `Hook` 之间完全串行，SQLite I/O 延迟（通常 1-10ms）
+被放大为整个历史系统的吞吐瓶颈。
+
+**优化方向**
+
+将 I/O 移到锁外：先无锁（或读锁）完成 SQLite 查询，再短暂加写锁修改内存状态
+（`compactionDocs`、`loadedSeqs`、`lruOrder`）。`Hook` 的 `SaveRecord` 可在锁外
+异步写入，或在锁外完成后再更新内存索引。
+
+---
+
+### Issue-28 · `seqForDoc` 双层线性扫描，缺少反向索引
+
+| 属性 | 值 |
+|------|----|
+| 文件 | `store/session_history.go:499-508` |
+| 类型 | 算法效率问题（已确认） |
+
+**问题**
+
+每次 `Fetch` 调用都触发对 `compactionDocs`（`map[int][]string`）的双层遍历：
+
+```go
+for seq, ids := range s.compactionDocs {   // 外层：所有 seq
+    for _, id := range ids {               // 内层：每个 seq 的所有 doc ID
+        if id == docID {
+```
+
+复杂度 O(seqs × docs_per_seq)，且在持 `s.mu` 写锁期间执行（见 Issue-27），阻塞
+时间随历史规模线性增长。
+
+**优化方向**
+
+维护一个反向索引 `docIndex map[string]int`（docID → seq），在 `Hook` 写入时同步更新，
+`seqForDoc` 退化为 O(1) map 查找。`evictL0IfNeeded` 删除 seq 时同步清除对应 doc ID。
+
+---
+
+### Issue-29 · `Compact()` 加载 parts 使用 N+1 查询
+
+| 属性 | 值 |
+|------|----|
+| 文件 | `session/compaction.go:263-270` |
+| 类型 | 性能问题（已确认） |
+
+**问题**
+
+`Compact()` 加载所有消息的 parts 时，对每条消息单独调用一次 `ListParts`：
+
+```go
+for _, m := range msgs {
+    ps, err := c.store.ListParts(ctx, m.ID)   // ← 每条消息一次 SQLite 查询
+    ...
+    allParts[m.ID] = ps
+}
+```
+
+消息数量为 N 时产生 N+1 次数据库查询。`runLoopInternal` 的 `loadMessages`
+（`prompt.go:476`）已有 `ListPartsBySession` 单次批量查询的正确实现，
+`Compact` 没有复用。
+
+**优化方向**
+
+将 `Compact` 中的 N+1 循环替换为 `ListPartsBySession` 单次查询：
+
+```go
+allParts, err := c.store.ListPartsBySession(ctx, sessionID)
+```
+
+与 `loadMessages` 保持一致。
+
+---
+
+### Issue-31 · `Reset()` 只删 L0 窗口内的 seq，SQLite 历史数据泄漏
+
+| 属性 | 值 |
+|------|----|
+| 文件 | `store/session_history.go:188-215` |
+| 类型 | 语义正确性 bug（P0） |
+
+**问题**
+
+`Reset()` 遍历 `s.compactionDocs` 逐 seq 调用 `DeleteRecordsBySeq`：
+
+```go
+for seq := range s.compactionDocs {
+    _ = s.persistStore.DeleteRecordsBySeq(ctx, s.sessionID, seq)
+}
+```
+
+`compactionDocs` 最多持有 `maxIndexedSeqs`（默认 80）个 seq。若历史上发生过 L0 驱逐
+（累计超过 80 次 compaction），SQLite 中仍保有更老的 seq 记录——这些 seq 不在
+`compactionDocs` 里，`Reset()` 不会删除它们。
+
+调用方调用 `Reset()` 的语义预期是"清空该 session 的全部历史"，但实际上 SQLite 里留有
+孤儿数据，下次重启后 `LoadSeqIndex` 会把它们重新加载回 L0，历史记录"复活"。
+
+**优化方向**
+
+`PersistStore` 补充 `DeleteAllRecords(ctx, sessionID)` 接口方法，`Reset()` 改为调用该方法
+一次性删除该 session 的全部历史记录，不依赖 `compactionDocs` 的内存快照：
+
+```go
+func (s *SessionHistorySource) Reset() error {
+    s.mu.Lock()
+    defer s.mu.Unlock()
+    if s.persistStore != nil {
+        _ = s.persistStore.DeleteAllRecords(context.Background(), s.sessionID)
+    }
+    ...
+}
+```
+
+---
+
+### Issue-32 · `NewSessionHistorySource` L0 恢复时 `lruOrder` 可能含重复项
+
+| 属性 | 值 |
+|------|----|
+| 文件 | `store/session_history.go:157-170` |
+| 类型 | 防御性 bug（P2） |
+
+**问题**
+
+启动时从 SQLite 恢复 L0 的循环：
+
+```go
+for seq, ids := range seqIndex {
+    src.compactionDocs[seq] = ids       // map 自动去重
+    src.lruOrder = append(src.lruOrder, seq)  // slice 无去重
+    ...
+}
+```
+
+若 `LoadSeqIndex` 返回的 `seqIndex` 存在重复 seq（异常 SQLite 数据或实现 bug），
+`compactionDocs`（map）会自动覆盖，而 `lruOrder`（slice）会有重复项。
+后续 `touchLRU` / `removeLRU` 均只处理第一次出现的位置，导致 `lruOrder` 长度与
+`compactionDocs` 大小永久不一致，LRU 驱逐行为错乱。
+
+**优化方向**
+
+恢复循环中追加 `lruOrder` 前做存在性检查，或在 `sortInts` 之后做一次去重：
+
+```go
+seen := make(map[int]struct{})
+for seq, ids := range seqIndex {
+    if _, dup := seen[seq]; dup { continue }
+    seen[seq] = struct{}{}
+    src.compactionDocs[seq] = ids
+    src.lruOrder = append(src.lruOrder, seq)
+    ...
+}
+```
+
+---
+
+### Issue-33 · `Peek` SQLite 查询不受 Bleve 结果数影响，可能执行无效查询
+
+| 属性 | 值 |
+|------|----|
+| 文件 | `store/session_history.go:248-253` |
+| 类型 | 性能浪费（P2） |
+
+**问题**
+
+`Peek` 中 Bleve 和 SQLite 搜索并行独立执行，两者均以 `size`（`q.MaxResults`）为上限：
+
+```go
+bleveResults, _ := s.bleveSearch(ctx, q.Input, size)   // 最多 size 条
+// ...
+if src, ok := s.persistStore.(knowledge.Source); ok {
+    sqlResults, _ = src.Peek(ctx, q)   // 也是 size 条（q.MaxResults 未调整）
+}
+```
+
+当 Bleve 已返回 `size` 条结果时，合并阶段 `merged` 已满，SQLite 结果一条也不会被采用，
+但 SQLite 查询依然已经发出并完成，造成一次无效 I/O。
+
+**优化方向**
+
+先执行 Bleve 搜索，若 `len(bleveResults) >= size` 则跳过 SQLite 查询：
+
+```go
+bleveResults, bleveSeqs := s.bleveSearch(ctx, q.Input, size)
+var sqlResults []knowledge.Result
+if len(bleveResults) < size && s.persistStore != nil {
+    if src, ok := s.persistStore.(knowledge.Source); ok {
+        remaining := knowledge.Query{...q, MaxResults: size - len(bleveResults)}
+        sqlResults, _ = src.Peek(ctx, remaining)
+    }
+}
+```
+
+---
+
+### Issue-30 · `PersistStore.(knowledge.Source)` 类型断言静默失败，L2 检索无提示降级
+
+| 属性 | 值 |
+|------|----|
+| 文件 | `store/session_history.go:250` |
+| 类型 | 隐式接口耦合，可观测性缺失（已确认） |
+
+**问题**
+
+`Peek` 中通过 duck-typing 将 `PersistStore` 当作 `knowledge.Source` 使用：
+
+```go
+if src, ok := s.persistStore.(knowledge.Source); ok {
+    sqlResults, _ = src.Peek(ctx, q)
+}
+```
+
+`PersistStore` 接口定义（`store/persist.go`）不要求实现 `knowledge.Source`，
+该断言是隐式合约。若某个 `PersistStore` 实现不满足断言，L2 全量检索静默跳过，
+`Peek` 只返回 L1（Bleve）结果，没有任何 warning 或 error，调用方无从感知降级。
+
+**优化方向**
+
+将 L2 Source 作为独立字段注入 `SessionHistorySource`：
+
+```go
+type SessionHistorySource struct {
+    ...
+    l2Source knowledge.Source   // 可为 nil
+}
+```
+
+由调用方在构造时显式传入，去掉运行时类型断言，接口契约在编译期可见。
+
+---
+
+## 持久化完整性（进程崩溃 / 意外退出）
+
+> 以下 Issue-34 ～ Issue-37 专门针对"程序退出或崩溃时数据是否安全落盘"这一问题。
+
+### Issue-34 · `Hook()` N 条 `SaveRecord` 无事务，崩溃导致 `history_docs` 残缺 seq
+
+| 属性 | 值 |
+|------|----|
+| 文件 | `store/session_history.go:342-349` |
+| 类型 | 数据完整性 bug（P0） |
+
+**问题**
+
+`Hook()` 内对每条 head message 单独调用一次 `SaveRecord`（独立 INSERT），没有显式事务：
+
+```go
+for i, m := range head {
+    rec := buildDoc(m, parts[m.ID], seq, i)
+    _ = s.index.Index(m.ID, rec)
+    if s.persistStore != nil {
+        _ = s.persistStore.SaveRecord(ctx, s.sessionID, rec)  // 独立 INSERT
+    }
+}
+```
+
+SQLite WAL 模式保证单条 SQL 的原子性，但不保证多条 SQL 之间的原子性。
+若进程在第 k 条 INSERT 完成、第 k+1 条之前收到 SIGKILL：
+- `history_docs` 里留下一个只有前 k 行的残缺 seq
+- 重启后 `LoadSeqIndex` 会把这个残缺 seq 加载进 L0
+- 后续 `Fetch` 只能找到部分文档，历史召回内容不完整且无法感知
+
+**修复方案**
+
+在 `PersistStore` 接口增加 `SaveRecords(ctx, sessionID, []Record) error`，`sqlite.Store` 实现使用单个显式事务（`BeginTx` → `PrepareContext` → 逐行 `Exec` → `Commit`，失败时 `Rollback`）。`Hook()` 改为先构造完整 `[]Record` 切片，再调用一次 `SaveRecords`，保证整个 seq 的写入是原子的。
+
+---
+
+### Issue-35 · `Hook()` 中 `SaveRecord` 错误全部静默丢弃
+
+| 属性 | 值 |
+|------|----|
+| 文件 | `store/session_history.go:348` |
+| 类型 | 可观测性缺失（P1） |
+
+**问题**
+
+```go
+_ = s.persistStore.SaveRecord(ctx, s.sessionID, rec)
+```
+
+`SaveRecord` 失败（磁盘满、SQLite 锁超时、I/O 错误）时错误被 `_ =` 完全丢弃。
+内存层（Bleve / `compactionDocs`）认为写入成功，SQLite 实际上没有写。
+重启后该 seq 从 SQLite 恢复为空，Bleve 也已清空，该次 compaction 的所有历史文档
+**永久消失**，且调用方无任何感知。
+
+**修复方案**
+
+配合 Issue-34 改为 `SaveRecords`，失败时：
+1. 不更新内存层（`compactionDocs` / `loadedSeqs` / `lruOrder`），回滚 `currentSeq`
+2. 至少 `log.Printf` 记录错误，保证可观测性
+3. 可选：返回 error 给 `Hook` 调用方（`Compact` step 5），让 compaction 感知持久化失败
+
+---
+
+### Issue-36 · 流式中途 SIGKILL：part `TimeEnd=0` / `Status=pending`
+
+| 属性 | 值 |
+|------|----|
+| 文件 | `session/processor.go:203-223` |
+| 类型 | 状态字段不完整（P1） |
+
+**问题**
+
+流式过程中每个 delta 实时调用 `UpdatePart`，文本内容会落盘，但 `TimeEnd` 和
+最终 `Status` 只在 `EventTextEnd` / `EventRequestFinish` 时写入。
+若进程在流式传输中途收到 SIGKILL：
+- `TextPartData.TimeEnd == 0`（未关闭计时）
+- `ToolPartData.Status` 留在 `pending` 或 `running`
+- `Message.Tokens` 未更新（`finaliseAssistantMessage` 未执行）
+
+消息文本内容本身已落盘，但这些状态字段不干净，`ToModelMessages`
+处理 `pending` 工具 part 时行为依赖上层逻辑，可能产生格式错误的 LLM 请求。
+
+**修复方案**
+
+启动时对当前 session 的所有 `Status=pending/running` 的 tool part 做一次修复扫描：
+将其标记为 `ToolStatusError`（携带 `interrupted=true`），与 `cleanup()` 的处理逻辑对齐。
+`TimeEnd=0` 的 text part 可在加载时以 `UpdatedAt` 作为兜底时间戳填充。
+
+---
+
+### Issue-37 · tool goroutine 250ms 超时后进程退出，飞行中 `UpdatePart` 可能丢失工具 Output
+
+| 属性 | 值 |
+|------|----|
+| 文件 | `session/processor.go:422-439` |
+| 类型 | 竞态 / 数据丢失（P1） |
+
+**问题**
+
+`cleanup()` 等待 tool goroutine 最多 250ms，超时后继续执行（`processor.go:437`）。
+此时 goroutine 仍在运行，持有的 `UpdatePart` 调用可能正在飞行中。
+若进程在 goroutine 完成 `UpdatePart` 之前退出（如 `os.Exit` 或 SIGKILL），
+该工具的 `Output` 字段丢失，重启后该 part 永久留在 `interrupted` 状态。
+
+与 Issue-05（已记录的 race）不同，Issue-05 关注的是状态覆盖；此处关注的是进程退出时
+工具结果的持久化窗口。
+
+**修复方案**
+
+最彻底的方案是移除 250ms 上限，改为无条件 `toolWg.Wait()`（工具已收到 ctx 取消信号，
+正常情况下会快速退出）。若必须保留超时，可在超时后将飞行中 goroutine 的 part 标记为
+`interrupted`，防止后续写入覆盖该标记（Issue-02 的修复也有助于此）。
+
+---
+
 ## 汇总
 
 | ID | 严重级别 | 文件 | 一句话描述 |
@@ -571,3 +937,14 @@ fmt.Fprintf(&sb, "- 调用工具: %s(%s) → %s\n", d.Tool, d.CallID[:8], output
 | Issue-24 | P2 | `store/store.go:121` | ~~`PartTypeStepStart` 无数据类型~~ **已撤销**（有意设计，structural marker）|
 | Issue-25 | P2 | `store/store.go:117-130` | `PartTypeSnapshot`/`Retry`/`Subtask`/`Patch` 未使用；`PartTypeAgent` 有读无写 |
 | Issue-26 | P2 | `store/store.go:180-182` | `CompactionPartData.SummaryMessageID` 字段从未赋值，始终为空 |
+| Issue-27 | P1 | `store/session_history.go:227,283,330` | 持写锁期间执行 SQLite I/O，所有历史检索操作完全串行 |
+| Issue-28 | P2 | `store/session_history.go:499-508` | `seqForDoc` 双层线性扫描，缺反向索引，Fetch 路径 O(n²) |
+| Issue-29 | P1 | `session/compaction.go:263-270` | `Compact()` 加载 parts 使用 N+1 查询，应改用 `ListPartsBySession` |
+| Issue-30 | P2 | `store/session_history.go:250` | `PersistStore.(Source)` 断言静默失败，L2 检索无提示降级 |
+| Issue-31 | P0 | `store/session_history.go:193` | `Reset()` 只删 L0 窗口内 seq，SQLite 历史数据泄漏 |
+| Issue-32 | P2 | `store/session_history.go:160` | L0 恢复时 `lruOrder` 无去重，重复 seq 导致 LRU 错乱 |
+| Issue-33 | P2 | `store/session_history.go:248` | `Peek` SQLite 查询不受 Bleve 结果数影响，Bleve 命中满时仍发起无效 I/O |
+| Issue-34 | P0 | `store/session_history.go:342-349` | Hook 内 N 条 `SaveRecord` 无事务包装，崩溃导致 history_docs 残缺 seq |
+| Issue-35 | P1 | `store/session_history.go:348` | `SaveRecord` 错误被 `_ =` 全部丢弃，SQLite 写失败无任何告警 |
+| Issue-36 | P1 | `session/processor.go:214,220` | 流式中途 SIGKILL：part `TimeEnd=0`/`Status=pending`，状态字段不完整 |
+| Issue-37 | P1 | `session/processor.go:437` | tool goroutine 超时 250ms 后进程退出，飞行中的 `UpdatePart` 可能丢失工具 Output |

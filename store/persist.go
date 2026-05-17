@@ -40,8 +40,20 @@ type PersistStore interface {
 	// CompactionHook so a clean process exit never loses a round.
 	SaveRecord(ctx context.Context, sessionID string, rec Record) error
 
+	// SaveRecords persists a batch of records atomically in a single
+	// transaction. All records share the same compaction_seq. Preferred over
+	// individual SaveRecord calls inside Hook() to guarantee that a partial
+	// write caused by a mid-flush crash never leaves a residual incomplete seq
+	// in history_docs.
+	SaveRecords(ctx context.Context, sessionID string, recs []Record) error
+
 	// DeleteRecordsBySeq permanently removes all records for the given
 	// compaction round from storage. Called during Reset() to honour the
 	// user's intent to wipe session memory.
 	DeleteRecordsBySeq(ctx context.Context, sessionID string, seq int) error
+
+	// DeleteAllRecords permanently removes all history_docs for this session.
+	// Called during Reset() to guarantee a full wipe even when some seqs have
+	// been evicted from the in-memory L0 window.
+	DeleteAllRecords(ctx context.Context, sessionID string) error
 }

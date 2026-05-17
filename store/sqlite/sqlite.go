@@ -812,14 +812,61 @@ func (s *Store) FindSeqByDocID(ctx context.Context, sessionID string, docID stri
 	return seq, true, nil
 }
 
-// SaveRecord implements knowledge.PersistStore.
+// SaveRecord implements store.PersistStore.
 func (s *Store) SaveRecord(ctx context.Context, sessionID string, rec store.Record) error {
 	return s.SaveHistoryDoc(ctx, sessionID, rec)
 }
 
-// DeleteRecordsBySeq implements knowledge.PersistStore.
+// SaveRecords implements store.PersistStore.
+// All records are written in a single transaction so that a mid-flush crash
+// never leaves a residual incomplete seq in history_docs.
+func (s *Store) SaveRecords(ctx context.Context, sessionID string, recs []store.Record) error {
+	if len(recs) == 0 {
+		return nil
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("SaveRecords begin tx: %w", err)
+	}
+	stmt, err := tx.PrepareContext(ctx, `
+		INSERT OR REPLACE INTO history_docs
+			(id, session_id, role, text, tool_calls, turn_index, compaction_seq, created_at)
+		VALUES (?,?,?,?,?,?,?,?)`)
+	if err != nil {
+		_ = tx.Rollback()
+		return fmt.Errorf("SaveRecords prepare: %w", err)
+	}
+	defer stmt.Close()
+	for _, rec := range recs {
+		toolCallsJSON, _ := json.Marshal(rec.ToolCalls)
+		if _, err := stmt.ExecContext(ctx,
+			rec.ID, sessionID, rec.Role, rec.Text,
+			string(toolCallsJSON), rec.TurnIndex, rec.CompactionSeq, rec.CreatedAt,
+		); err != nil {
+			_ = tx.Rollback()
+			return fmt.Errorf("SaveRecords insert %q: %w", rec.ID, err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("SaveRecords commit: %w", err)
+	}
+	return nil
+}
+
+// DeleteRecordsBySeq implements store.PersistStore.
 func (s *Store) DeleteRecordsBySeq(ctx context.Context, sessionID string, seq int) error {
 	return s.DeleteHistoryDocsForSeq(ctx, sessionID, seq)
+}
+
+// DeleteAllRecords implements store.PersistStore.
+// Removes all history_docs for the given session in one DELETE statement.
+func (s *Store) DeleteAllRecords(ctx context.Context, sessionID string) error {
+	_, err := s.db.ExecContext(ctx,
+		`DELETE FROM history_docs WHERE session_id = ?`, sessionID)
+	if err != nil {
+		return fmt.Errorf("DeleteAllRecords %q: %w", sessionID, err)
+	}
+	return nil
 }
 
 // ── HistorySource: knowledge.PersistStore delegation ─────────────────────────
@@ -845,14 +892,24 @@ func (h *HistorySource) FindSeqByDocID(ctx context.Context, sessionID string, do
 	return h.store.FindSeqByDocID(ctx, sessionID, docID)
 }
 
-// SaveRecord implements knowledge.PersistStore.
+// SaveRecord implements store.PersistStore.
 func (h *HistorySource) SaveRecord(ctx context.Context, sessionID string, rec store.Record) error {
 	return h.store.SaveRecord(ctx, sessionID, rec)
 }
 
-// DeleteRecordsBySeq implements knowledge.PersistStore.
+// SaveRecords implements store.PersistStore.
+func (h *HistorySource) SaveRecords(ctx context.Context, sessionID string, recs []store.Record) error {
+	return h.store.SaveRecords(ctx, sessionID, recs)
+}
+
+// DeleteRecordsBySeq implements store.PersistStore.
 func (h *HistorySource) DeleteRecordsBySeq(ctx context.Context, sessionID string, seq int) error {
 	return h.store.DeleteRecordsBySeq(ctx, sessionID, seq)
+}
+
+// DeleteAllRecords implements store.PersistStore.
+func (h *HistorySource) DeleteAllRecords(ctx context.Context, sessionID string) error {
+	return h.store.DeleteAllRecords(ctx, sessionID)
 }
 
 // sqlLikeEscape escapes special LIKE characters in a search term.

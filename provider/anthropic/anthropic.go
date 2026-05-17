@@ -8,6 +8,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"net"
 	"net/http"
 
 	"github.com/anthropics/anthropic-sdk-go"
@@ -342,7 +344,18 @@ func runStream(ctx context.Context, stream *ssestream.Stream[anthropic.MessageSt
 			} else if currentToolID != "" {
 				var input any
 				if len(toolInputBuf) > 0 {
-					_ = json.Unmarshal(toolInputBuf, &input)
+					if err := json.Unmarshal(toolInputBuf, &input); err != nil {
+						out <- llm.Event{
+							Type:       llm.EventToolError,
+							ToolCallID: currentToolID,
+							ToolName:   currentToolName,
+							Err:        fmt.Errorf("tool %q: unmarshal input: %w", currentToolName, err),
+						}
+						currentToolID = ""
+						currentToolName = ""
+						toolInputBuf = nil
+						continue
+					}
 				}
 				out <- llm.Event{
 					Type:       llm.EventToolCall,
@@ -415,6 +428,35 @@ func classifyError(err error) error {
 	return &llm.LLMError{
 		Kind:        llm.ErrTransport,
 		Message:     err.Error(),
-		IsRetryable: false,
+		IsRetryable: isRetryableTransportError(err),
 	}
+}
+
+// isRetryableTransportError returns true for transient network errors that are
+// worth retrying (connection reset, EOF, timeouts) and false for permanent
+// failures (TLS certificate errors, DNS resolution failures, etc.).
+func isRetryableTransportError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+		return true
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) {
+		if netErr.Timeout() {
+			return true
+		}
+	}
+	var opErr *net.OpError
+	if errors.As(err, &opErr) {
+		// "read"/"write" ops cover ECONNRESET, EPIPE and similar mid-stream
+		// failures. "dial" (ECONNREFUSED) is intentionally excluded — a refused
+		// connection means the endpoint is not reachable, which is not transient.
+		switch opErr.Op {
+		case "read", "write":
+			return true
+		}
+	}
+	return false
 }

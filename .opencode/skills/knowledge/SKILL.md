@@ -220,8 +220,8 @@ flowchart TD
     I -- no --> H
     I -- yes --> J["session.Compact()"]
     J --> K["CompactionHook fires"]
-    K --> L["L2: ps.SaveRecord() sync"]
-    L --> M["L1: Bleve.Index(m.ID, rec)"]
+    K --> L["L2: ps.SaveRecords() atomic tx\n(all records for this seq)"]
+    L --> M["L1: Bleve.Index(m.ID, rec) per record"]
     M --> N["L0: compactionDocs update\nlruOrder append\nevictL0/L1 if needed"]
     N --> H
 ```
@@ -500,6 +500,7 @@ blevesource.New(idx, "docs", 0, &blevesource.Config{
 
 ### Session reset (`session_reset` tool)
 - `session.NewResetTool(resetFn)` — the `resetFn` callback must be wired under the server's session lock to prevent concurrent request races between `DeleteSession` and `CreateSession`.
+- `historySrc.Reset()` calls `PersistStore.DeleteAllRecords` (not a per-seq loop) so that seqs older than the L0 window (`maxIndexedSeqs`) are also deleted from SQLite. This prevents history from "resurrecting" after a restart when old seqs were evicted from the in-memory L0 window.
 - `historySrc.Reset()` sets `s.index = nil` before rebuilding — all `Peek`/`Fetch`/`Hook` calls guard against nil index.
 - Cache `resetTool` on `chatSession` alongside `hook`; do not recreate per request.
 - Build `allTools` with an explicit `make([]tool.Tool, 0, cap)` to avoid aliasing `km.Tools()`'s backing array.
@@ -517,7 +518,7 @@ blevesource.New(idx, "docs", 0, &blevesource.Config{
 | `knowledge/fetch_tool.go` | `knowledge_fetch` tool exposed to LLM — input schema + Fetch invocation |
 | `knowledge/knowledge_test.go` | Manager routing, priority, truncation, timeout, partial failure tests |
 | `knowledge/source/bleve/bleve.go` | Reference Source implementation — use as template for new sources |
-| `store/persist.go` | `store.PersistStore` interface + `store.Record` type — L2 persistence contract |
+| `store/persist.go` | `store.PersistStore` interface + `store.Record` type — L2 persistence contract; includes `SaveRecords` (atomic batch) and `DeleteAllRecords` |
 | `store/session_history.go` | `store.SessionHistorySource` — L0/L1 cache, P3 Peek, page-in Fetch, LRU eviction |
 | `store/session_history_test.go` | 19 layered tests: pure-memory → PersistStore stub → invariants |
 | `store/sqlite/sqlite.go` | `Store` (PersistStore impl) + `HistorySource` (Source + PersistStore impl) |

@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"fmt"
+	"log"
 	"regexp"
 	"strings"
 	"sync"
@@ -190,8 +191,12 @@ func (s *SessionHistorySource) Reset() error {
 	defer s.mu.Unlock()
 
 	if s.persistStore != nil {
-		for seq := range s.compactionDocs {
-			_ = s.persistStore.DeleteRecordsBySeq(context.Background(), s.sessionID, seq)
+		// Use DeleteAllRecords so that seqs evicted from the in-memory L0
+		// window (older than maxIndexedSeqs) are also removed from SQLite.
+		// The previous approach of iterating s.compactionDocs left those old
+		// seqs in SQLite, which caused history to "resurrect" after restart.
+		if err := s.persistStore.DeleteAllRecords(context.Background(), s.sessionID); err != nil {
+			return fmt.Errorf("session history reset: delete all records: %w", err)
 		}
 	}
 
@@ -338,15 +343,29 @@ func (s *SessionHistorySource) Hook() CompactionHook {
 		s.currentSeq++
 		seq := s.currentSeq
 		var ids []string
+		var recs []Record
 
 		for i, m := range head {
 			rec := buildDoc(m, parts[m.ID], seq, i)
-			_ = s.index.Index(m.ID, rec)
 			ids = append(ids, m.ID)
+			recs = append(recs, rec)
+		}
 
-			if s.persistStore != nil {
-				_ = s.persistStore.SaveRecord(context.Background(), s.sessionID, rec)
+		// Persist atomically: all records for this seq in one transaction.
+		// Index into Bleve only after SQLite confirms the write, so that a
+		// failed persist never leaves ghost documents in L1 that cannot be
+		// evicted (they would violate loadedSeqs ⊆ compactionDocs).
+		if s.persistStore != nil {
+			if err := s.persistStore.SaveRecords(context.Background(), s.sessionID, recs); err != nil {
+				log.Printf("session history hook: SaveRecords seq=%d: %v", seq, err)
+				s.currentSeq--
+				return
 			}
+		}
+
+		// SQLite write succeeded (or no persist store); now index into Bleve.
+		for i, m := range head {
+			_ = s.index.Index(m.ID, recs[i])
 		}
 
 		// Add to L0.

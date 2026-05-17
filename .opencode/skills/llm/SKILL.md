@@ -202,7 +202,7 @@ Excerpt format (rendered by `buildRecentContextExcerpt`):
 - Role labels are only written when the message has actual text or tool content (`hasContent` guard).
 - If `RecentHead` is nil (no user turns in head) or produces no text/tool content, Step 6 is skipped entirely.
 
-After writing the part, `Compact()` calls `store.GetMessage` + `store.UpdateMessage` to set `boundary.Tokens.Input = len(excerpt)/4` — preventing `estimateTurnTokens` from under-counting the boundary message on the next compaction round (fallback would be 100 tokens).
+After writing the part, `Compact()` calls `store.GetMessage` + `store.UpdateMessage` to set `boundary.Tokens.Input = len(excerpt)/4` — preventing `estimateTurnTokens` from under-counting the boundary message on the next compaction round (fallback is 500 for user messages, 300 for others).
 
 #### `buildUserParts` and `StripMedia` (`session/context.go`)
 
@@ -317,7 +317,7 @@ flowchart TD
     ProtectCheck -- Yes --> Protect["tokensProtected += outputTokens\nSkip (protect recent tool output)"]
     ProtectCheck -- No --> MarkCompacted["part.Data.Compacted = now\nUpdatePart()\ntotalPruned += outputTokens"]
 
-    MarkCompacted --> MinCheck{"totalPruned ≥ PruneMinimum/4\n(5,000 est. tokens)?"}
+    MarkCompacted --> MinCheck{"totalPruned ≥ PruneMinimum\n(20,000 est. tokens)?"}
     MinCheck -- No --> Fail["return error: not enough pruned"]
     MinCheck -- Yes --> OK["return nil"]
 ```
@@ -343,6 +343,51 @@ instead of the original output. The tool call itself (name + input) is preserved
 | input token drop | small (tool outputs only) | large |
 | LLM call required | no | yes (summary generation) |
 | Crosses summary boundary | no (stops at summary) | creates new summary |
+
+---
+
+## Provider Error Handling
+
+### Tool input JSON parse errors
+
+When a streaming tool call's argument buffer fails `json.Unmarshal`, both Anthropic and OpenAI providers emit `EventToolError` instead of proceeding with a `nil` input:
+
+```go
+// provider/anthropic/anthropic.go, provider/openai/openai.go
+if err := json.Unmarshal(inputBuf, &input); err != nil {
+    out <- llm.Event{
+        Type:       llm.EventToolError,
+        ToolCallID: id,
+        ToolName:   name,
+        Err:        fmt.Errorf("tool %q: unmarshal input: %w", name, err),
+    }
+    continue // skip EventToolCall; processor marks tool as error
+}
+```
+
+This prevents the doom-loop scenario where a mal-formed tool input causes an LLM → tool → re-call cycle with permanently empty arguments.
+
+### Tool schema build errors
+
+In the OpenAI provider, `buildParams` now returns a proper error when `json.Unmarshal` of the tool schema fails (previously silently sent an empty schema):
+
+```go
+if err := json.Unmarshal(schemaBytes, &schemaMap); err != nil {
+    return params, fmt.Errorf("tool %q: unmarshal schema: %w", t.Name, err)
+}
+```
+
+### Transport error retryability
+
+Both providers classify transport (non-API) errors via `isRetryableTransportError`:
+
+| Error | Retryable |
+|-------|-----------|
+| `io.EOF`, `io.ErrUnexpectedEOF` | Yes — connection reset mid-stream |
+| `net.Error.Timeout()` | Yes — network timeout |
+| `net.OpError{Op:"read"}`, `{Op:"write"}` | Yes — ECONNRESET, EPIPE mid-stream |
+| `net.OpError{Op:"dial"}` | No — ECONNREFUSED (endpoint unreachable) |
+| TLS certificate errors, DNS failures | No — permanent |
 
 ---
 

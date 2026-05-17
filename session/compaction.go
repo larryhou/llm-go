@@ -207,7 +207,15 @@ func estimateTurnTokens(msgs []*store.Message) int {
 		if n := t.Input + t.Output + t.CacheRead + t.CacheWrite; n > 0 {
 			total += n
 		} else {
-			total += 100 // fallback for messages without stored usage data
+			// Conservative fallback: 500 tokens for user messages (typically
+			// 500-2000 tokens), 300 for others. The old value of 100 was a
+			// severe underestimate that caused Select to retain more messages
+			// in the tail than intended, making compaction ineffective.
+			if m.Role == store.RoleUser {
+				total += 500
+			} else {
+				total += 300
+			}
 		}
 	}
 	return total
@@ -259,14 +267,10 @@ func (c *Compactor) Compact(ctx context.Context, sessionID string, input Process
 		return "", fmt.Errorf("compaction: list messages: %w", err)
 	}
 
-	// Load all parts
-	allParts := make(map[string][]*store.Part, len(msgs))
-	for _, m := range msgs {
-		ps, err := c.store.ListParts(ctx, m.ID)
-		if err != nil {
-			return "", fmt.Errorf("compaction: list parts for %s: %w", m.ID, err)
-		}
-		allParts[m.ID] = ps
+	// Load all parts in a single query (avoids N+1 — one ListParts per message).
+	allParts, err := c.store.ListPartsBySession(ctx, sessionID)
+	if err != nil {
+		return "", fmt.Errorf("compaction: list parts: %w", err)
 	}
 
 	// Filter to post-compaction messages only
@@ -709,7 +713,7 @@ func Prune(ctx context.Context, sessionID string, s store.Store, cfg *config.Inf
 		}
 	}
 
-	if totalPruned < PruneMinimum/4 { // /4 for rough token-to-char ratio
+	if totalPruned < PruneMinimum { // totalPruned is already in estimated tokens (chars/4)
 		return fmt.Errorf("prune: not enough content to prune (%d estimated tokens)", totalPruned)
 	}
 

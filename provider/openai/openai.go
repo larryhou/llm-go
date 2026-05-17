@@ -8,6 +8,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"net"
 	"net/http"
 
 	"github.com/openai/openai-go"
@@ -145,7 +147,9 @@ func buildParams(req llm.Request) (openai.ChatCompletionNewParams, error) {
 				return params, fmt.Errorf("tool %q: marshal schema: %w", t.Name, err)
 			}
 			var schemaMap map[string]any
-			_ = json.Unmarshal(schemaBytes, &schemaMap)
+			if err := json.Unmarshal(schemaBytes, &schemaMap); err != nil {
+				return params, fmt.Errorf("tool %q: unmarshal schema: %w", t.Name, err)
+			}
 			tools = append(tools, openai.ChatCompletionToolParam{
 				Function: openai.FunctionDefinitionParam{
 					Name:        t.Name,
@@ -187,11 +191,11 @@ func convertMessages(system []string, msgs []llm.Message) ([]openai.ChatCompleti
 			// file parts; otherwise fall back to a plain text message.
 			var parts []openai.ChatCompletionContentPartUnionParam
 			for _, p := range m.Content {
-			switch p.Type {
-			case llm.PartTypeText:
-				if p.Text != "" {
-					parts = append(parts, openai.TextContentPart(p.Text))
-				}
+				switch p.Type {
+				case llm.PartTypeText:
+					if p.Text != "" {
+						parts = append(parts, openai.TextContentPart(p.Text))
+					}
 				case llm.PartTypeImage:
 					if p.URL != "" {
 						parts = append(parts, openai.ImageContentPart(
@@ -204,7 +208,7 @@ func convertMessages(system []string, msgs []llm.Message) ([]openai.ChatCompleti
 							},
 						))
 					}
-				// PartTypeFile: no standard OpenAI multi-modal file part; skip silently
+					// PartTypeFile: no standard OpenAI multi-modal file part; skip silently
 				}
 			}
 			if len(parts) == 0 {
@@ -408,7 +412,15 @@ func runStream(ctx context.Context, providerID string, stream *ssestream.Stream[
 			for _, ts := range toolByIndex {
 				var input any
 				if len(ts.args) > 0 {
-					_ = json.Unmarshal(ts.args, &input)
+					if err := json.Unmarshal(ts.args, &input); err != nil {
+						out <- llm.Event{
+							Type:       llm.EventToolError,
+							ToolCallID: ts.id,
+							ToolName:   ts.name,
+							Err:        fmt.Errorf("tool %q: unmarshal input: %w", ts.name, err),
+						}
+						continue
+					}
 				}
 				out <- llm.Event{
 					Type:       llm.EventToolCall,
@@ -480,6 +492,38 @@ func classifyError(providerID string, err error) error {
 	return &llm.LLMError{
 		Kind:        llm.ErrTransport,
 		Message:     err.Error(),
-		IsRetryable: false,
+		IsRetryable: isRetryableTransportError(err),
 	}
+}
+
+// isRetryableTransportError returns true for transient network errors that are
+// worth retrying (connection reset, EOF, timeouts) and false for permanent
+// failures (TLS certificate errors, DNS resolution failures, etc.).
+func isRetryableTransportError(err error) bool {
+	if err == nil {
+		return false
+	}
+	// io.EOF and io.ErrUnexpectedEOF typically indicate connection reset by peer.
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+		return true
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) {
+		// Timeout is always retryable.
+		if netErr.Timeout() {
+			return true
+		}
+	}
+	// Unwrap and check for specific connection errors.
+	var opErr *net.OpError
+	if errors.As(err, &opErr) {
+		// "read"/"write" ops cover ECONNRESET, EPIPE and similar mid-stream
+		// failures. "dial" (ECONNREFUSED) is intentionally excluded — a refused
+		// connection means the endpoint is not reachable, which is not transient.
+		switch opErr.Op {
+		case "read", "write":
+			return true
+		}
+	}
+	return false
 }

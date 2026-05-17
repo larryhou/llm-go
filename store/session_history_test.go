@@ -139,11 +139,29 @@ func (m *memPersist) SaveRecord(_ context.Context, sessionID string, rec store.R
 	return nil
 }
 
+func (m *memPersist) SaveRecords(_ context.Context, sessionID string, recs []store.Record) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.saveCount += len(recs)
+	sd := m.sesData(sessionID)
+	for _, rec := range recs {
+		sd[rec.CompactionSeq] = append(sd[rec.CompactionSeq], rec)
+	}
+	return nil
+}
+
 func (m *memPersist) DeleteRecordsBySeq(_ context.Context, sessionID string, seq int) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.deleteSeqCount++
 	delete(m.sesData(sessionID), seq)
+	return nil
+}
+
+func (m *memPersist) DeleteAllRecords(_ context.Context, sessionID string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.data, sessionID)
 	return nil
 }
 
