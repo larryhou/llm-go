@@ -249,7 +249,8 @@ func buildUserParts(ps []*store.Part, opts ToModelOptions) []llm.ContentPart {
 				parts = append(parts, llm.NewTextPart(d.Excerpt))
 			}
 		case store.PartTypeAgent:
-			parts = append(parts, llm.NewTextPart("The following tool was executed by the user"))
+			// reserved: PartTypeAgent is schema-aligned with TypeScript but no Go writer exists.
+			// Parts of this type are silently ignored when building LLM context.
 		}
 	}
 	return parts
@@ -392,7 +393,4 @@ func FilterCompacted(msgs []*store.Message, parts map[string][]*store.Part) []*s
 }
 
 // Message role constants (reused from store for convenience).
-const (
-	roleUser      = "user"
-	roleAssistant = "assistant"
-)
+// Removed: roleUser / roleAssistant were dead constants; use store.RoleUser / store.RoleAssistant.

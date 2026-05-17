@@ -5,6 +5,7 @@ package provider
 import (
 	"fmt"
 	"strings"
+	"sync"
 
 	"github.com/larryhou/llm-go/auth"
 	"github.com/larryhou/llm-go/config"
@@ -75,7 +76,9 @@ type Info struct {
 }
 
 // Registry holds all registered providers and their factories.
+// All methods are safe for concurrent use.
 type Registry struct {
+	mu        sync.RWMutex
 	providers map[string]*Info
 	factories map[string]Factory
 }
@@ -90,23 +93,31 @@ func NewRegistry() *Registry {
 
 // Register adds or replaces a provider info entry.
 func (r *Registry) Register(p *Info) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	r.providers[p.ID] = p
 }
 
 // RegisterFactory registers a constructor factory for a provider ID.
 // Call this once per provider package (e.g. from an init-style setup function).
 func (r *Registry) RegisterFactory(id string, f Factory) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	r.factories[id] = f
 }
 
 // Get returns the provider info for a given ID.
 func (r *Registry) Get(id string) (*Info, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
 	p, ok := r.providers[id]
 	return p, ok
 }
 
 // GetModel looks up a model by "providerID/modelID".
 func (r *Registry) GetModel(providerID, modelID string) (*Model, error) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
 	p, ok := r.providers[providerID]
 	if !ok {
 		return nil, fmt.Errorf("provider %q not found", providerID)
@@ -122,7 +133,9 @@ func (r *Registry) GetModel(providerID, modelID string) (*Model, error) {
 // cfg may be nil if no provider-specific config is available.
 // authStore may be nil; auth.ResolveKey handles nil gracefully.
 func (r *Registry) BuildProvider(id string, cfg *config.ProviderInfo, authStore *auth.Store) (llm.Provider, error) {
+	r.mu.RLock()
 	f, ok := r.factories[id]
+	r.mu.RUnlock()
 	if !ok {
 		return nil, fmt.Errorf("provider %q: no factory registered (call RegisterFactory first)", id)
 	}
@@ -141,6 +154,8 @@ func ParseModel(s string) (providerID, modelID string, err error) {
 
 // List returns all registered providers.
 func (r *Registry) List() map[string]*Info {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
 	out := make(map[string]*Info, len(r.providers))
 	for k, v := range r.providers {
 		out[k] = v

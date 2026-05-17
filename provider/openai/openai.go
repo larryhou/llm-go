@@ -270,16 +270,6 @@ func convertMessages(system []string, msgs []llm.Message) ([]openai.ChatCompleti
 	return out, nil
 }
 
-func extractText(parts []llm.ContentPart) string {
-	text := ""
-	for _, p := range parts {
-		if p.Type == llm.PartTypeText {
-			text += p.Text
-		}
-	}
-	return text
-}
-
 func encodeBase64(data []byte) string {
 	return base64.StdEncoding.EncodeToString(data)
 }
@@ -507,23 +497,24 @@ func isRetryableTransportError(err error) bool {
 	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
 		return true
 	}
-	var netErr net.Error
-	if errors.As(err, &netErr) {
-		// Timeout is always retryable.
-		if netErr.Timeout() {
-			return true
-		}
-	}
-	// Unwrap and check for specific connection errors.
+	// Check OpError before net.Error: *net.OpError implements net.Error, so
+	// checking Timeout() first would cause a dial OpError with a timeout inner
+	// error to incorrectly return true. Op takes precedence.
 	var opErr *net.OpError
 	if errors.As(err, &opErr) {
 		// "read"/"write" ops cover ECONNRESET, EPIPE and similar mid-stream
 		// failures. "dial" (ECONNREFUSED) is intentionally excluded — a refused
-		// connection means the endpoint is not reachable, which is not transient.
+		// connection means the endpoint is unreachable, which is not transient.
 		switch opErr.Op {
 		case "read", "write":
 			return true
 		}
+		return false // dial and all other ops
+	}
+	// For non-OpError net.Error (e.g. a plain timeout wrapper), use Timeout().
+	var netErr net.Error
+	if errors.As(err, &netErr) {
+		return netErr.Timeout()
 	}
 	return false
 }

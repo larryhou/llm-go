@@ -60,6 +60,10 @@ type memPersist struct {
 	loadBySeqCount    int
 	findSeqCount      int
 	deleteSeqCount    int
+	deleteAllCount    int
+
+	// failSave, when true, causes SaveRecords to return an error.
+	failSave bool
 }
 
 func newMemPersist() *memPersist {
@@ -142,6 +146,9 @@ func (m *memPersist) SaveRecord(_ context.Context, sessionID string, rec store.R
 func (m *memPersist) SaveRecords(_ context.Context, sessionID string, recs []store.Record) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if m.failSave {
+		return fmt.Errorf("memPersist: SaveRecords injected failure")
+	}
 	m.saveCount += len(recs)
 	sd := m.sesData(sessionID)
 	for _, rec := range recs {
@@ -161,6 +168,7 @@ func (m *memPersist) DeleteRecordsBySeq(_ context.Context, sessionID string, seq
 func (m *memPersist) DeleteAllRecords(_ context.Context, sessionID string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	m.deleteAllCount++
 	delete(m.data, sessionID)
 	return nil
 }
@@ -935,5 +943,121 @@ func TestSHS_3e_PeekOrder_BleveBeforeL2(t *testing.T) {
 	firstIsBleve := all[0].Source == "session-history"
 	if !firstIsBleve {
 		t.Errorf("P3 ordering: first result should be from Bleve (session-history), got %q", all[0].Source)
+	}
+}
+
+// ── Fix regression tests (Issue-31, Issue-34, Issue-35) ──────────────────────
+
+// Issue-34 + Issue-35: When SaveRecords fails, Hook must NOT add the seq to
+// L0/L1, must NOT increment currentSeq permanently, and must log the error
+// (observable indirectly by verifying no records appear in L2 or Bleve).
+func TestSHS_Fix34_Hook_RollsBackOnSaveFailure(t *testing.T) {
+	ps := newMemPersist()
+	ps.failSave = true // inject failure
+
+	src := newSrcWithPS(t, 4, 8, ps)
+	hook := src.Hook()
+
+	// Fire hook — SaveRecords will fail.
+	fireHook(hook, testSessID, []struct{ id, text string }{
+		{"fail-doc", "保存失败测试内容"},
+	})
+
+	// L2: no records written.
+	if ps.totalRecords(testSessID) != 0 {
+		t.Errorf("SaveRecords failed but L2 has %d records, want 0", ps.totalRecords(testSessID))
+	}
+
+	// L1: Bleve must have no documents (Bleve is written only after SaveRecords).
+	results := peek(t, src, "保存失败")
+	if len(results) != 0 {
+		t.Errorf("SaveRecords failed but Bleve returned %d results, want 0", len(results))
+	}
+
+	// currentSeq must be rolled back: a subsequent successful hook gets seq 1.
+	ps.failSave = false
+	fireHook(hook, testSessID, []struct{ id, text string }{
+		{"ok-doc", "成功保存测试内容"},
+	})
+
+	if ps.totalRecords(testSessID) != 1 {
+		t.Errorf("after recovery, L2 has %d records, want 1", ps.totalRecords(testSessID))
+	}
+
+	// The successful record must be findable in Bleve with seq = 1 (not 2).
+	results2 := peek(t, src, "成功保存")
+	if !containsDocID(results2, "ok-doc") {
+		t.Error("ok-doc should be in Bleve after successful hook")
+	}
+	// Seq numbering: after one failed attempt and one success, exactly seq 1 exists.
+	if ps.recordSeqCount(testSessID) != 1 {
+		t.Errorf("expected 1 seq in L2, got %d", ps.recordSeqCount(testSessID))
+	}
+}
+
+// Issue-34: When SaveRecords succeeds, Bleve must contain the documents
+// (i.e. Bleve is populated after — not before — the SQLite write).
+func TestSHS_Fix34_Hook_BlevePopulatedAfterSQLiteSuccess(t *testing.T) {
+	ps := newMemPersist()
+	src := newSrcWithPS(t, 4, 8, ps)
+	hook := src.Hook()
+
+	fireHook(hook, testSessID, []struct{ id, text string }{
+		{"bleve-after-sql", "写入顺序验证内容"},
+	})
+
+	// Both L2 and L1 must have the record.
+	if ps.totalRecords(testSessID) != 1 {
+		t.Fatalf("L2 has %d records, want 1", ps.totalRecords(testSessID))
+	}
+	results := peek(t, src, "写入顺序")
+	if !containsDocID(results, "bleve-after-sql") {
+		t.Error("bleve-after-sql not found in Bleve after successful hook")
+	}
+}
+
+// Issue-31: Reset() must delete ALL records from L2 including seqs that have
+// been evicted from the L0 memory window (i.e. older than maxIndexedSeqs).
+// It must use DeleteAllRecords (not per-seq DeleteRecordsBySeq), so
+// deleteSeqCount remains 0 after Reset.
+func TestSHS_Fix31_Reset_DeletesEvictedSeqs(t *testing.T) {
+	// maxL0=2: only 2 seqs fit in the L0 window; earlier seqs are evicted.
+	ps := newMemPersist()
+	src := newSrcWithPS(t, 1, 2, ps)
+	hook := src.Hook()
+
+	// Add 3 seqs — seq 1 will be evicted from L0.
+	fireHook(hook, testSessID, []struct{ id, text string }{{"evicted-1", "被驱逐的第一轮内容"}})
+	fireHook(hook, testSessID, []struct{ id, text string }{{"evicted-2", "被驱逐的第二轮内容"}})
+	fireHook(hook, testSessID, []struct{ id, text string }{{"live-3", "活跃的第三轮内容"}})
+
+	if ps.totalRecords(testSessID) != 3 {
+		t.Fatalf("expected 3 records in L2 before Reset, got %d", ps.totalRecords(testSessID))
+	}
+
+	if err := src.Reset(); err != nil {
+		t.Fatalf("Reset: %v", err)
+	}
+
+	// All records — including evicted seqs — must be gone from L2.
+	if ps.totalRecords(testSessID) != 0 {
+		t.Errorf("L2 has %d records after Reset, want 0", ps.totalRecords(testSessID))
+	}
+
+	// Reset must use DeleteAllRecords, not per-seq DeleteRecordsBySeq.
+	// deleteSeqCount == 0 proves the old loop is gone.
+	if ps.deleteSeqCount != 0 {
+		t.Errorf("deleteSeqCount = %d after Reset, want 0 (should use DeleteAllRecords)", ps.deleteSeqCount)
+	}
+
+	// deleteAllCount must be exactly 1.
+	if ps.deleteAllCount != 1 {
+		t.Errorf("deleteAllCount = %d after Reset, want 1", ps.deleteAllCount)
+	}
+
+	// L1 (Bleve) must also be clear.
+	results := peek(t, src, "内容")
+	if len(results) != 0 {
+		t.Errorf("Bleve returned %d results after Reset, want 0", len(results))
 	}
 }

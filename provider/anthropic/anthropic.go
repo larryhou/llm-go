@@ -442,21 +442,20 @@ func isRetryableTransportError(err error) bool {
 	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
 		return true
 	}
-	var netErr net.Error
-	if errors.As(err, &netErr) {
-		if netErr.Timeout() {
-			return true
-		}
-	}
 	var opErr *net.OpError
 	if errors.As(err, &opErr) {
-		// "read"/"write" ops cover ECONNRESET, EPIPE and similar mid-stream
-		// failures. "dial" (ECONNREFUSED) is intentionally excluded — a refused
-		// connection means the endpoint is not reachable, which is not transient.
+		// Check OpError before generic net.Error so that Op field takes
+		// precedence. "dial" means endpoint unreachable (not transient);
+		// "read"/"write" (ECONNRESET, EPIPE, mid-stream timeout) are retryable.
 		switch opErr.Op {
 		case "read", "write":
 			return true
 		}
+		return false
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) {
+		return netErr.Timeout()
 	}
 	return false
 }

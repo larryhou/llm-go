@@ -48,9 +48,8 @@ Any other context that would be essential to continue the work.
 List of files that have been created, modified, or are important to the task.`
 
 // Compaction constants, aligned with packages/opencode/src/session/compaction.ts.
+// PruneMinimum and PruneProtect are defined in llm package; use llm.PruneMinimum / llm.PruneProtect.
 const (
-	PruneMinimum    = 20_000
-	PruneProtect    = 40_000
 	DefaultTailTurns = 2
 )
 
@@ -699,7 +698,7 @@ func Prune(ctx context.Context, sessionID string, s store.Store, cfg *config.Inf
 			// Estimate token size of this tool output
 			outputTokens := len(d.Output) / 4 // rough: 4 chars per token
 
-			if tokensProtected < PruneProtect {
+			if tokensProtected < llm.PruneProtect {
 				tokensProtected += outputTokens
 				continue
 			}
@@ -713,7 +712,7 @@ func Prune(ctx context.Context, sessionID string, s store.Store, cfg *config.Inf
 		}
 	}
 
-	if totalPruned < PruneMinimum { // totalPruned is already in estimated tokens (chars/4)
+	if totalPruned < llm.PruneMinimum { // totalPruned is already in estimated tokens (chars/4)
 		return fmt.Errorf("prune: not enough content to prune (%d estimated tokens)", totalPruned)
 	}
 

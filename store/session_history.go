@@ -72,6 +72,7 @@ type Record struct {
 // # Invariant
 //
 //	loadedSeqs ⊆ compactionDocs  (L1 ⊆ L0)
+//	docIndex keys == union of all docIDs in compactionDocs values
 //
 // # Peek strategy (P3)
 //
@@ -99,6 +100,10 @@ type SessionHistorySource struct {
 	// Bounded by maxIndexedSeqs; LRU eviction removes oldest entry from memory
 	// (SQLite copy is untouched).
 	compactionDocs map[int][]string
+
+	// docIndex is a reverse index: docID → seq.  Maintained in sync with
+	// compactionDocs to make seqForDoc O(1) instead of O(seqs × docs_per_seq).
+	docIndex map[string]int
 
 	// currentSeq is the highest seq seen so far (monotonically increasing).
 	currentSeq int
@@ -149,6 +154,7 @@ func NewSessionHistorySource(sessionID string, maxCompactions, maxIndexedSeqs in
 		maxCompactions: maxCompactions,
 		maxIndexedSeqs: maxIndexedSeqs,
 		compactionDocs: make(map[int][]string),
+		docIndex:       make(map[string]int),
 		loadedSeqs:     make(map[int]struct{}),
 		persistStore:   ps,
 	}
@@ -159,7 +165,13 @@ func NewSessionHistorySource(sessionID string, maxCompactions, maxIndexedSeqs in
 		seqIndex, err := ps.LoadSeqIndex(context.Background(), sessionID, maxIndexedSeqs)
 		if err == nil {
 			for seq, ids := range seqIndex {
+				if _, dup := src.compactionDocs[seq]; dup {
+					continue // defensive: skip duplicate seqs from SQLite
+				}
 				src.compactionDocs[seq] = ids
+				for _, id := range ids {
+					src.docIndex[id] = seq
+				}
 				src.lruOrder = append(src.lruOrder, seq)
 				if seq > src.currentSeq {
 					src.currentSeq = seq
@@ -213,6 +225,7 @@ func (s *SessionHistorySource) Reset() error {
 	}
 	s.index = idx
 	s.compactionDocs = make(map[int][]string)
+	s.docIndex = make(map[string]int)
 	s.loadedSeqs = make(map[int]struct{})
 	s.lruOrder = nil
 	s.currentSeq = 0
@@ -370,6 +383,9 @@ func (s *SessionHistorySource) Hook() CompactionHook {
 
 		// Add to L0.
 		s.compactionDocs[seq] = ids
+		for _, id := range ids {
+			s.docIndex[id] = seq
+		}
 		s.lruOrder = append(s.lruOrder, seq)
 		s.evictL0IfNeeded()
 
@@ -414,6 +430,9 @@ func (s *SessionHistorySource) evictL0IfNeeded() {
 			delete(s.loadedSeqs, oldest)
 		}
 		delete(s.compactionDocs, oldest)
+		for _, id := range ids {
+			delete(s.docIndex, id)
+		}
 		s.removeLRU(oldest)
 	}
 }
@@ -510,20 +529,17 @@ func (s *SessionHistorySource) addToL0(ctx context.Context, seq int) {
 		ids[i] = r.ID
 	}
 	s.compactionDocs[seq] = ids
+	for _, id := range ids {
+		s.docIndex[id] = seq
+	}
 	s.lruOrder = append(s.lruOrder, seq)
 	s.evictL0IfNeeded()
 }
 
-// seqForDoc returns the seq that owns docID by scanning compactionDocs (L0).
+// seqForDoc returns the seq that owns docID using the reverse index (O(1)).
 func (s *SessionHistorySource) seqForDoc(docID string) (int, bool) {
-	for seq, ids := range s.compactionDocs {
-		for _, id := range ids {
-			if id == docID {
-				return seq, true
-			}
-		}
-	}
-	return 0, false
+	seq, ok := s.docIndex[docID]
+	return seq, ok
 }
 
 // ── internal: Bleve helpers ───────────────────────────────────────────────────

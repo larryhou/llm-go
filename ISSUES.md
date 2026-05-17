@@ -937,24 +937,24 @@ _ = s.persistStore.SaveRecord(ctx, s.sessionID, rec)
 | Issue-04 | P1 | ✅ 已修复 | `provider/anthropic/anthropic.go:415`, `provider/openai/openai.go:480` | transport 错误硬编码不可重试，弱网环境下无法恢复 |
 | Issue-05 | P1 | 待修复 | `session/prompt.go:494-512` | `markAssistantCancelled` 竞态：工具结果可能被误判为 Cancelled |
 | Issue-06 | P1 | ✅ 已修复 | `session/compaction.go:712` | `Prune` 阈值双重 `/4` 导致实际阈值远低于设计值 |
-| Issue-07 | P2 | 待修复 | `llm/overflow.go:121-133` | 冗余的 `max`/`min` 定义，Go 1.21+ 已内置 |
-| Issue-08 | P2 | 待修复 | `llm/overflow.go:13-14`, `session/compaction.go:52-53` | `PruneMinimum`/`PruneProtect` 跨包重复定义，存在漂移风险 |
-| Issue-09 | P2 | 待修复 | `provider/provider.go:78-100` | `Registry` 无并发保护，多 goroutine 注册会 data race |
+| Issue-07 | P2 | ✅ 已修复 | `llm/overflow.go:121-133` | 冗余的 `max`/`min` 定义，Go 1.21+ 已内置 |
+| Issue-08 | P2 | ✅ 已修复 | `llm/overflow.go:13-14`, `session/compaction.go:52-53` | `PruneMinimum`/`PruneProtect` 跨包重复定义，存在漂移风险 |
+| Issue-09 | P2 | ✅ 已修复 | `provider/provider.go:78-100` | `Registry` 无并发保护，多 goroutine 注册会 data race |
 | Issue-10 | P2 | 待修复 | `provider/provider.go:53-63` | `Model.ID` 与 map key 无约束，可静默不一致 |
-| Issue-11 | P2 | 待修复 | `provider/openai/openai.go:269-277` | `extractText` dead code |
+| Issue-11 | P2 | ✅ 已修复 | `provider/openai/openai.go:269-277` | `extractText` dead code |
 | Issue-12 | P2 | 待修复 | `provider/openai/openai.go:190-208` | `convertMessages` switch 缩进不符合 `gofmt` |
 | Issue-13 | P2 | 待修复 | `llm/record_provider.go:104-110` | ctx 取消时录制 Record 静默丢失，无可观测性 |
 | Issue-14 | P1 | ✅ 已修复 | `session/compaction.go:209` | `estimateTurnTokens` fallback 100 严重低估，压缩效果失效 |
 | Issue-15 | P2 | 待修复 | `session/compaction.go:494` | `buildRecentContextExcerpt` 不含 CallID，多次相同工具调用无法区分 |
 | Issue-16 | P1 | ~~已撤销~~ | `session/prompt.go:380-383` | ~~`ProcessCompact` 死锁~~ **已撤销**（defer 兜底，不会死锁）|
-| Issue-17 | P2 | 待修复 | `session/context.go:395-398` | `roleUser`/`roleAssistant` 常量 dead code |
+| Issue-17 | P2 | ✅ 已修复 | `session/context.go:395-398` | `roleUser`/`roleAssistant` 常量 dead code |
 | Issue-18 | P2 | 待修复 | `session/system.go:55` | `SystemPromptForModel` 依赖 `APIID`，字段为空时静默走 default prompt |
 | Issue-21 | P1 | 待修复 | `store/memory/memory.go:177`, `store/memory/memory.go:122` | `CreatePart`/`CreateMessage` 不验证外键，孤儿记录静默写入 |
 | Issue-22 | P2 | 待修复 | `store/memory/memory.go:187` | `Part.Data` 指针浅拷贝，当前路径不出错但测试覆盖不充分 |
 | Issue-23 | P2 | 待修复 | `store/memory/memory.go:111-116` | `DeleteSession` 线性扫描 `sessionOrder`，大量 session 时 O(n) |
 | Issue-24 | P2 | ~~已撤销~~ | `store/store.go:121` | ~~`PartTypeStepStart` 无数据类型~~ **已撤销**（有意设计，structural marker）|
-| Issue-25 | P2 | 待修复 | `store/store.go:117-130` | `PartTypeSnapshot`/`Retry`/`Subtask`/`Patch` 未使用；`PartTypeAgent` 有读无写 |
-| Issue-26 | P2 | 待修复 | `store/store.go:180-182` | `CompactionPartData.SummaryMessageID` 字段从未赋值，始终为空 |
+| Issue-25 | P2 | ✅ 已修复 | `store/store.go:117-130` | `PartTypeSnapshot`/`Retry`/`Subtask`/`Patch` 未使用；`PartTypeAgent` 有读无写 |
+| Issue-26 | P2 | ✅ 已修复 | `store/store.go:180-182` | `CompactionPartData.SummaryMessageID` 字段从未赋值，始终为空 |
 | Issue-27 | P1 | 待修复 | `store/session_history.go:227,283,330` | 持写锁期间执行 SQLite I/O，所有历史检索操作完全串行 |
 | Issue-28 | P2 | 待修复 | `store/session_history.go:499-508` | `seqForDoc` 双层线性扫描，缺反向索引，Fetch 路径 O(n²) |
 | Issue-29 | P1 | ✅ 已修复 | `session/compaction.go:263-270` | `Compact()` 加载 parts 使用 N+1 查询，应改用 `ListPartsBySession` |

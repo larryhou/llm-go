@@ -122,11 +122,13 @@ const (
 	PartTypeStepFinish = "step-finish"
 	PartTypeCompaction    = "compaction"
 	PartTypeRecentContext = "recent-context"
-	PartTypeSnapshot      = "snapshot"
-	PartTypeRetry      = "retry"
-	PartTypeAgent      = "agent"
-	PartTypeSubtask    = "subtask"
-	PartTypePatch      = "patch"
+	// The following part types are declared for schema alignment with message-v2.ts
+	// but have not yet been ported to Go (no writer exists). Reserved for future use.
+	PartTypeSnapshot = "snapshot"
+	PartTypeRetry    = "retry"
+	PartTypeAgent    = "agent"
+	PartTypeSubtask  = "subtask"
+	PartTypePatch    = "patch"
 )
 
 // TextPartData holds data for a text part.
@@ -177,8 +179,9 @@ type StepFinishData struct {
 }
 
 // CompactionPartData marks a point where compaction occurred.
+// Note: TypeScript uses parentID on the summary assistant message to link back
+// to the compaction boundary; no additional fields are needed here.
 type CompactionPartData struct {
-	SummaryMessageID string
 }
 
 // RecentContextPartData holds a verbatim excerpt of the turns immediately

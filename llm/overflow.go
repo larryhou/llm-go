@@ -118,16 +118,4 @@ func PreserveRecentBudget(m Model, cfg *config.Info) int {
 	return budget
 }
 
-func max(a, b int) int {
-	if a > b {
-		return a
-	}
-	return b
-}
 
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
-}
