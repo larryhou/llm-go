@@ -384,6 +384,93 @@ func (s *SessionHistorySource) Fetch(ctx context.Context, q knowledge.Query) ([]
 	return s.fetchFromBleve(docID)
 }
 
+// RollbackTo removes all history index entries whose message IDs appear in
+// deletedMsgIDs — the list returned by session.SoftReset. It finds the owning
+// compaction seqs for those IDs, deletes them from Bleve (L1), removes their
+// entries from L0, and permanently deletes them from SQLite (L2).
+//
+// This prevents stale history_docs entries from producing duplicate search
+// results if the same head messages are re-indexed on the next compaction.
+//
+// Call this after SoftReset, under the same session-level lock, before the
+// next RunLoop starts.
+func (s *SessionHistorySource) RollbackTo(ctx context.Context, deletedMsgIDs []string) {
+	if len(deletedMsgIDs) == 0 {
+		return
+	}
+
+	// Build a set for O(1) lookup.
+	deleted := make(map[string]struct{}, len(deletedMsgIDs))
+	for _, id := range deletedMsgIDs {
+		deleted[id] = struct{}{}
+	}
+
+	// ── Step 1: find affected seqs from L0 (under lock) ──────────────────────
+	s.mu.Lock()
+	affectedSeqs := make(map[int]struct{})
+	var coldIDs []string // IDs not found in L0 — need SQLite lookup
+
+	for id := range deleted {
+		if seq, ok := s.docIndex[id]; ok {
+			affectedSeqs[seq] = struct{}{}
+		} else {
+			coldIDs = append(coldIDs, id)
+		}
+	}
+
+	// Evict affected seqs from L1 (Bleve) and L0.
+	for seq := range affectedSeqs {
+		ids := s.compactionDocs[seq]
+		if _, inL1 := s.loadedSeqs[seq]; inL1 {
+			for _, id := range ids {
+				_ = s.index.Delete(id)
+			}
+			delete(s.loadedSeqs, seq)
+		}
+		for _, id := range ids {
+			delete(s.docIndex, id)
+		}
+		delete(s.compactionDocs, seq)
+		s.removeLRU(seq)
+	}
+	ps := s.persistStore
+	s.mu.Unlock()
+
+	// ── Step 2: resolve cold IDs via SQLite FindSeqByDocID (outside lock) ────
+	// IDs evicted from L0 are not in docIndex but may still have history_docs
+	// entries. Find their seq so we can delete them from SQLite.
+	if ps != nil && len(coldIDs) > 0 {
+		coldSeqs := make(map[int]struct{})
+		for _, id := range coldIDs {
+			seq, found, err := ps.FindSeqByDocID(ctx, s.sessionID, id)
+			if err != nil {
+				log.Printf("session history rollback: FindSeqByDocID %q: %v", id, err)
+				continue
+			}
+			if found {
+				coldSeqs[seq] = struct{}{}
+			}
+		}
+		for seq := range coldSeqs {
+			if _, already := affectedSeqs[seq]; already {
+				continue // already deleted above
+			}
+			if err := ps.DeleteRecordsBySeq(ctx, s.sessionID, seq); err != nil {
+				log.Printf("session history rollback: DeleteRecordsBySeq seq=%d: %v", seq, err)
+			}
+		}
+	}
+
+	// ── Step 3: delete hot seqs from SQLite (outside lock) ───────────────────
+	if ps != nil {
+		for seq := range affectedSeqs {
+			if err := ps.DeleteRecordsBySeq(ctx, s.sessionID, seq); err != nil {
+				log.Printf("session history rollback: DeleteRecordsBySeq seq=%d: %v", seq, err)
+			}
+		}
+	}
+}
+
 // Hook returns a CompactionHook that indexes the compacted head messages.
 // Each new compaction round is persisted to SQLite (L2) and indexed in Bleve
 // (L1), then LRU eviction is applied to both L0 and L1 if caps are exceeded.

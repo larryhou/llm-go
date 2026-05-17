@@ -23,6 +23,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"sort"
+	"strings"
 	"time"
 
 	_ "modernc.org/sqlite" // register "sqlite" driver
@@ -264,6 +265,29 @@ func (s *Store) DeleteSession(ctx context.Context, id string) error {
 	// history_docs has no FK to sessions; delete separately.
 	if _, err := s.db.ExecContext(ctx, `DELETE FROM history_docs WHERE session_id = ?`, id); err != nil {
 		return fmt.Errorf("DeleteSession history_docs %q: %w", id, err)
+	}
+	return nil
+}
+
+// DeleteMessagesByIDs removes the specified messages (and their parts via
+// ON DELETE CASCADE) from the session. Idempotent: missing IDs are ignored.
+func (s *Store) DeleteMessagesByIDs(ctx context.Context, sessionID string, ids []string) error {
+	if len(ids) == 0 {
+		return nil
+	}
+	// Build a single DELETE with IN clause. SQLite handles up to ~32k items
+	// in an IN list; sessions will never have that many messages.
+	placeholders := make([]string, len(ids))
+	args := make([]any, 0, len(ids)+1)
+	args = append(args, sessionID)
+	for i, id := range ids {
+		placeholders[i] = "?"
+		args = append(args, id)
+	}
+	query := "DELETE FROM messages WHERE session_id = ? AND id IN (" +
+		strings.Join(placeholders, ",") + ")"
+	if _, err := s.db.ExecContext(ctx, query, args...); err != nil {
+		return fmt.Errorf("DeleteMessagesByIDs: %w", err)
 	}
 	return nil
 }

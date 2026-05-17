@@ -430,23 +430,35 @@ func main() {
 
 	// session_reset: control is single-session, no server-level lock needed.
 	// historySrc may be nil if the skills directory was not found.
-	tools = append(tools, session.NewResetTool(func(resetCtx context.Context) error {
-		if err := sessionStore.DeleteSession(resetCtx, sessionID); err != nil {
-			return err
-		}
-		if err := sessionStore.CreateSession(resetCtx, &store.Session{
-			ID:    sessionID,
-			Model: cfg.provider + "/" + cfg.modelID,
-		}); err != nil {
-			return err
-		}
-		if historySrc != nil {
-			if err := historySrc.Reset(); err != nil {
-				fmt.Fprintf(os.Stderr, "[warn] session history index reset failed: %v\n", err)
+	tools = append(tools, session.NewResetTool(
+		func(resetCtx context.Context, fresh bool) error {
+			deletedIDs, err := session.SoftReset(resetCtx, sessionID, sessionStore, fresh)
+			if err != nil {
+				return err
 			}
-		}
-		return nil
-	}))
+			if historySrc != nil {
+				historySrc.RollbackTo(resetCtx, deletedIDs)
+			}
+			return nil
+		},
+		func(resetCtx context.Context) error {
+			if err := sessionStore.DeleteSession(resetCtx, sessionID); err != nil {
+				return err
+			}
+			if err := sessionStore.CreateSession(resetCtx, &store.Session{
+				ID:    sessionID,
+				Model: cfg.provider + "/" + cfg.modelID,
+			}); err != nil {
+				return err
+			}
+			if historySrc != nil {
+				if err := historySrc.Reset(); err != nil {
+					fmt.Fprintf(os.Stderr, "[warn] session history index reset failed: %v\n", err)
+				}
+			}
+			return nil
+		},
+	))
 
 	// ── system prompt ─────────────────────────────────────────────────────────
 

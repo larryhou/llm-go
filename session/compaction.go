@@ -744,6 +744,133 @@ func Prune(ctx context.Context, sessionID string, s store.Store, cfg *config.Inf
 	return nil
 }
 
+// SoftReset rolls back the session to the most recent compaction save-point.
+//
+// It locates the most recent compaction boundary (the user message carrying a
+// PartTypeCompaction part + summary assistant pair), then deletes that boundary
+// message and everything after it (summary, tail, post-boundary new messages).
+//
+// fresh controls what happens after the rollback:
+//
+//   - fresh=false (normal rollback): the head messages that were summarised are
+//     left intact and become visible to the LLM again on the next turn —
+//     exactly as if the compaction never happened.
+//
+//   - fresh=true (soft-refresh): after the rollback a new compaction boundary +
+//     empty summary are inserted at the end of the message list. FilterCompacted
+//     will hide all head messages (they remain in SQLite and are searchable via
+//     knowledge_search), giving the LLM a clean slate while preserving history
+//     for recall.
+//
+// Returns the message IDs that were deleted. Callers should pass these to
+// SessionHistorySource.RollbackTo so the corresponding Bleve/L0/SQLite history
+// index entries are cleaned up — preventing duplicate search results if the
+// same head messages are re-indexed on the next compaction.
+//
+// If no compaction boundary is found (the session has never been compacted),
+// SoftReset returns ErrNoCompactionBoundary so the caller can fall back to a
+// hard reset or report a meaningful error to the user.
+//
+// The caller is responsible for holding any session-level lock across this call
+// to prevent concurrent RunLoop writes from interleaving with the delete.
+func SoftReset(ctx context.Context, sessionID string, s store.Store, fresh bool) (deletedIDs []string, err error) {
+	msgs, err := s.ListMessages(ctx, sessionID)
+	if err != nil {
+		return nil, fmt.Errorf("soft reset: list messages: %w", err)
+	}
+	allParts, err := s.ListPartsBySession(ctx, sessionID)
+	if err != nil {
+		return nil, fmt.Errorf("soft reset: list parts: %w", err)
+	}
+
+	// Walk backward to find the most recent compaction boundary.
+	// A boundary is a user message that has a PartTypeCompaction part AND is
+	// immediately followed (possibly with gap) by a summary assistant message.
+	// We use the same paired-search as FilterCompacted to avoid mis-matching.
+	var boundaryIdx int = -1
+	for i := len(msgs) - 1; i >= 1; i-- {
+		if msgs[i].Role != store.RoleAssistant || !msgs[i].Summary {
+			continue
+		}
+		// Found a summary — look for its boundary user message just before it.
+		for j := i - 1; j >= 0; j-- {
+			if msgs[j].Role != store.RoleUser {
+				continue
+			}
+			if hasPartType(allParts[msgs[j].ID], store.PartTypeCompaction) {
+				boundaryIdx = j
+				break
+			}
+			// Hit a real user message before finding a boundary — stop search.
+			break
+		}
+		if boundaryIdx >= 0 {
+			break
+		}
+	}
+
+	if boundaryIdx < 0 {
+		return nil, ErrNoCompactionBoundary
+	}
+
+	// Collect the IDs of all messages that will be deleted (boundary onward).
+	for i := boundaryIdx; i < len(msgs); i++ {
+		deletedIDs = append(deletedIDs, msgs[i].ID)
+	}
+
+	// Delete by explicit ID list — precise and immune to timestamp collisions.
+	if err := s.DeleteMessagesByIDs(ctx, sessionID, deletedIDs); err != nil {
+		return nil, err
+	}
+
+	// fresh=true: insert a new compaction boundary + empty summary so that
+	// FilterCompacted hides the now-visible head messages while keeping them
+	// in SQLite for knowledge_search recall.
+	if fresh {
+		now := time.Now()
+		freshBoundaryID := newID()
+		if err := s.CreateMessage(ctx, &store.Message{
+			ID:        freshBoundaryID,
+			SessionID: sessionID,
+			Role:      store.RoleUser,
+			CreatedAt: now,
+			UpdatedAt: now,
+		}); err != nil {
+			// Non-fatal: head messages become visible but nothing is corrupted.
+			// Return the already-deleted IDs so RollbackTo still runs.
+			return deletedIDs, fmt.Errorf("soft reset fresh: create boundary: %w", err)
+		}
+		if err := s.CreatePart(ctx, &store.Part{
+			ID:        newID(),
+			MessageID: freshBoundaryID,
+			SessionID: sessionID,
+			Type:      store.PartTypeCompaction,
+			CreatedAt: now,
+			UpdatedAt: now,
+			Data:      &store.CompactionPartData{TailStartID: ""},
+		}); err != nil {
+			return deletedIDs, fmt.Errorf("soft reset fresh: create boundary part: %w", err)
+		}
+		freshSummaryID := newID()
+		if err := s.CreateMessage(ctx, &store.Message{
+			ID:        freshSummaryID,
+			SessionID: sessionID,
+			Role:      store.RoleAssistant,
+			Summary:   true,
+			CreatedAt: now.Add(time.Millisecond),
+			UpdatedAt: now.Add(time.Millisecond),
+		}); err != nil {
+			return deletedIDs, fmt.Errorf("soft reset fresh: create summary: %w", err)
+		}
+	}
+
+	return deletedIDs, nil
+}
+
+// ErrNoCompactionBoundary is returned by SoftReset when the session has no
+// compaction boundary to roll back to.
+var ErrNoCompactionBoundary = fmt.Errorf("soft reset: no compaction boundary found")
+
 // RecoverOrphanedTools scans all tool parts in the session and marks any that
 // are still in pending or running state as error+interrupted. This repairs
 // parts left behind when a process was killed mid-stream (SIGKILL, crash, or

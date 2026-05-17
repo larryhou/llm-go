@@ -35,6 +35,12 @@ type Store interface {
 	// keyed by message ID. Implementations should return all parts in a single
 	// operation to avoid N+1 queries against real databases.
 	ListPartsBySession(ctx context.Context, sessionID string) (map[string][]*Part, error)
+
+	// DeleteMessagesByIDs removes the specified messages (and their parts via
+	// cascade) from the given session. More precise than time-based deletion —
+	// avoids accidental removal of messages with the same created_at timestamp.
+	// Idempotent: IDs that do not exist are silently ignored.
+	DeleteMessagesByIDs(ctx context.Context, sessionID string, ids []string) error
 }
 
 // Session is a top-level conversation container.

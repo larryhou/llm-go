@@ -77,7 +77,15 @@ type PersistStore interface {
     LoadRecordsBySeq(ctx, sessionID string, seq int) ([]Record, error)
     FindSeqByDocID(ctx, sessionID string, docID string) (int, bool, error)
     SaveRecord(ctx, sessionID string, rec Record) error
+    // SaveRecords persists a batch atomically in one transaction.
+    // Preferred over SaveRecord inside Hook() — a partial crash never
+    // leaves an incomplete seq in history_docs.
+    SaveRecords(ctx, sessionID string, recs []Record) error
     DeleteRecordsBySeq(ctx, sessionID string, seq int) error
+    // DeleteAllRecords removes ALL history_docs for the session in one
+    // DELETE. Used by Reset() to guarantee a full wipe even when some
+    // seqs have been LRU-evicted from the in-memory L0 window.
+    DeleteAllRecords(ctx, sessionID string) error
 }
 ```
 
@@ -386,18 +394,51 @@ LIMIT ?;
 
 ## Reset Semantics
 
-`Reset()` = "wipe memory for this session":
+`Reset()` = "wipe memory for this session" (hard reset of the history index):
 
 ```
 Reset()
-  1. DeleteRecordsBySeq() for every seq in compactionDocs  ← SQLite DELETE
-  2. Bleve.Close() + bleve.NewMemOnly()                    ← L1 rebuilt empty
-  3. compactionDocs = {}                                   ← L0 cleared
+  1. DeleteAllRecords() for the session  ← single SQLite DELETE, covers all
+                                            seqs including L0-evicted ones
+  2. Bleve.Close() + bleve.NewMemOnly()  ← L1 rebuilt empty
+  3. compactionDocs = {}                 ← L0 cleared
   4. loadedSeqs = {} / lruOrder = nil / currentSeq = 0
 ```
 
 After Reset, the source is fully functional — new Hook calls will re-populate
 all three layers from scratch.
+
+**Why `DeleteAllRecords` instead of iterating `compactionDocs`?**
+Seqs evicted from L0 are no longer in `compactionDocs` but still exist in
+SQLite. Iterating only `compactionDocs` would leave those old seqs behind,
+causing history to "resurrect" after a restart.
+
+---
+
+## RollbackTo — Soft Reset Cache Cleanup
+
+`RollbackTo(ctx, deletedMsgIDs []string)` is called after `session.SoftReset`
+to clean up Bleve/L0/SQLite for the compaction seq(s) that owned the deleted
+messages. Without this, the same head messages would produce duplicate search
+results when re-indexed on the next compaction.
+
+```
+RollbackTo(deletedMsgIDs)
+  Hot path (IDs in L0 docIndex):
+    1. Find affected seqs via docIndex (O(1) per ID)
+    2. Delete from Bleve (L1) + L0 (compactionDocs/docIndex/lruOrder)
+    3. DeleteRecordsBySeq() from SQLite for each affected seq
+
+  Cold path (IDs evicted from L0, not in docIndex):
+    1. FindSeqByDocID() in SQLite for each cold ID
+    2. DeleteRecordsBySeq() from SQLite for each found seq
+    (Bleve/L0 already clean — seq was evicted)
+```
+
+**Key invariant**: IDs that were never indexed by the compaction Hook
+(e.g. tail messages, or the fresh boundary/summary inserted by
+`SoftReset(fresh=true)`) are silently ignored — both `docIndex` and SQLite
+`FindSeqByDocID` will return not-found, and no deletion occurs.
 
 ---
 

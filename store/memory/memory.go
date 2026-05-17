@@ -253,3 +253,34 @@ func (s *Store) ListPartsBySession(_ context.Context, sessionID string) (map[str
 	}
 	return result, nil
 }
+
+// DeleteMessagesByIDs removes the specified messages (and their parts) from the
+// session. Idempotent: missing IDs are silently ignored.
+func (s *Store) DeleteMessagesByIDs(_ context.Context, sessionID string, ids []string) error {
+	if len(ids) == 0 {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	toDelete := make(map[string]struct{}, len(ids))
+	for _, id := range ids {
+		toDelete[id] = struct{}{}
+	}
+
+	existing := s.sessionMsgs[sessionID]
+	keep := existing[:0:0]
+	for _, id := range existing {
+		if _, del := toDelete[id]; del {
+			for _, partID := range s.messageParts[id] {
+				delete(s.parts, partID)
+			}
+			delete(s.messageParts, id)
+			delete(s.messages, id)
+		} else {
+			keep = append(keep, id)
+		}
+	}
+	s.sessionMsgs[sessionID] = keep
+	return nil
+}

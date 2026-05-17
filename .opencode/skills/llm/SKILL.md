@@ -700,7 +700,8 @@ Always use `DataAs` instead of bare `p.Data.(T)` assertions. The JSON fallback e
 - `sessionMsgs` and `messageParts` are insertion-order `[]string` slices → `ListMessages`/`ListParts` are O(n).
 - `sessionOrder []string` (added) mirrors the same design for sessions → `ListSessions` is now O(n), no sort needed.
 - `hasPartType(ps []*store.Part, partType string) bool` — internal helper in `session/compaction.go`, used by both `FilterCompacted` (via `context.go`) and `Select()` to identify compaction boundary messages by `PartTypeCompaction`.
-- `DeleteSession(ctx, id)` — removes all parts, messages, and session record in a single write-lock pass. Idempotent (returns nil if session does not exist). Used by `session_reset` tool.
+- `DeleteSession(ctx, id)` — removes all parts, messages, and session record in a single write-lock pass. Idempotent (returns nil if session does not exist). Used by `session_reset` hard mode.
+- `DeleteMessagesByIDs(ctx, sessionID, ids []string)` — removes specific messages (and their parts via cascade) by ID list. Used by `session.SoftReset` to roll back to a compaction save-point. More precise than time-based deletion — immune to `created_at` timestamp collisions.
 - **Foreign-key enforcement**: `CreateMessage` checks that `m.SessionID` exists; `CreatePart` checks that `p.MessageID` exists. Both return an error on violation, matching SQLite FK behaviour. Tests that relied on inserting orphaned records were silently wrong and have been fixed.
 - `Message.Status string` — lifecycle state for assistant messages set by `RunLoopAsync` on cancellation. Zero value (`""` = `MessageStatusNormal`) requires no special handling; `"interrupted"` and `"cancelled"` are handled by `ToModelMessages` and `ToModelMessagesWithOptions`. The `memory.Store` copies structs by value so the new field is automatically persisted with zero-value compatibility.
 
@@ -710,20 +711,33 @@ Always use `DataAs` instead of bare `p.Data.(T)` assertions. The JSON fallback e
 
 ### `session.ResetTool` — `session/reset_tool.go`
 
-`session_reset` is a built-in tool that lets the LLM completely wipe a session's history on explicit user request.
+`session_reset` is a built-in tool that lets the LLM reset a session's history
+on explicit user request. Three modes are available via the `mode` parameter:
 
-**Behaviour:**
-1. Calls the provided `resetFn(ctx)` callback which atomically: deletes all messages/parts via `store.DeleteSession`, recreates the empty session record, and resets the `SessionHistorySource` Bleve index.
-2. Returns a confirmation message to the LLM.
+| mode | behaviour | fallback |
+|------|-----------|---------|
+| `soft` (default) | Roll back to most recent compaction save-point; head messages become visible again | If no boundary: hard reset |
+| `soft-refresh` | Same rollback, but re-inserts a new empty boundary so head stays hidden; LLM gets a clean context while history remains searchable via `knowledge_search` | If no boundary: hard reset |
+| `hard` | Completely wipe all history; session record preserved | — |
 
-**Confirmation requirement:** The tool description explicitly instructs the LLM that it **must** warn the user and obtain confirmation before calling. This is enforced by prompt, not by a `confirmed` parameter.
+**Confirmation requirement:** The tool description explicitly instructs the LLM
+that it **must** warn the user and obtain confirmation before calling.
 
 **Construction:**
 
 ```go
-resetFn := func(ctx context.Context) error {
-    // Hold any server-level lock here to prevent concurrent requests
-    // from interleaving between DeleteSession and CreateSession.
+softFn := func(ctx context.Context, fresh bool) error {
+    // Hold any server-level lock here.
+    mu.Lock()
+    defer mu.Unlock()
+    deletedIDs, err := session.SoftReset(ctx, sessID, store, fresh)
+    if err != nil {
+        return err
+    }
+    historySrc.RollbackTo(ctx, deletedIDs) // clean Bleve/L0/SQLite cache
+    return nil
+}
+hardResetFn := func(ctx context.Context) error {
     mu.Lock()
     defer mu.Unlock()
     if err := store.DeleteSession(ctx, sessID); err != nil {
@@ -732,10 +746,22 @@ resetFn := func(ctx context.Context) error {
     if err := store.CreateSession(ctx, &store.Session{ID: sessID}); err != nil {
         return err
     }
-    return historySrc.Reset() // non-fatal if nil
+    return historySrc.Reset()
 }
 
-resetTool := session.NewResetTool(resetFn)
+resetTool := session.NewResetTool(softFn, hardResetFn)
+```
+
+**`session.SoftReset`** (`session/compaction.go`):
+
+```go
+// Returns the IDs of deleted messages. Pass to historySrc.RollbackTo.
+// fresh=false → head becomes visible (normal rollback)
+// fresh=true  → head re-hidden by a new empty boundary (soft-refresh)
+// Returns ErrNoCompactionBoundary when no compaction has occurred.
+func SoftReset(ctx context.Context, sessionID string, s store.Store, fresh bool) (deletedIDs []string, err error)
+
+var ErrNoCompactionBoundary = fmt.Errorf("soft reset: no compaction boundary found")
 ```
 
 **Wiring** (cache on the session object, not recreated per request):
@@ -743,7 +769,7 @@ resetTool := session.NewResetTool(resetFn)
 ```go
 sess = &chatSession{
     hook:      historySrc.Hook(),
-    resetTool: session.NewResetTool(resetFn), // created once
+    resetTool: session.NewResetTool(softFn, hardResetFn), // created once
 }
 
 // In RunLoop:
@@ -753,7 +779,14 @@ session.RunLoop(ctx, store, session.RunInput{
 })
 ```
 
-**Partial failure note:** If `CreateSession` fails after `DeleteSession` succeeds, the session is absent from the store but still present in the server's in-memory map. Subsequent `RunLoop` calls will fail until server restart or manual recovery. This is low-probability for in-memory stores.
+**Repeated soft resets:** Each `soft` call peels one compaction layer. With N
+compactions, N consecutive `soft` resets restore all history. The (N+1)-th call
+returns `ErrNoCompactionBoundary` and automatically falls back to hard reset.
+
+**Partial failure note:** If `CreateSession` fails after `DeleteSession` succeeds
+(hard reset path), the session is absent from the store but still in the
+server's in-memory map. Subsequent `RunLoop` calls will fail until server
+restart. This is low-probability for in-memory stores.
 
 ---
 

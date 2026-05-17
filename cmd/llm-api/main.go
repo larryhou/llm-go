@@ -475,7 +475,17 @@ func (s *server) handleChat(w http.ResponseWriter, r *http.Request) {
 		// resetFn is called under s.mu to prevent concurrent requests for the
 		// same session from interleaving between DeleteSession and CreateSession.
 		st := s.sessionStore // capture for closure
-		resetFn := func(ctx context.Context) error {
+		softResetFn := func(ctx context.Context, fresh bool) error {
+			s.mu.Lock()
+			defer s.mu.Unlock()
+			deletedIDs, err := session.SoftReset(ctx, sessID, st, fresh)
+			if err != nil {
+				return err
+			}
+			historySrc.RollbackTo(ctx, deletedIDs)
+			return nil
+		}
+		hardResetFn := func(ctx context.Context) error {
 			s.mu.Lock()
 			defer s.mu.Unlock()
 			if err := st.DeleteSession(ctx, sessID); err != nil {
@@ -485,8 +495,6 @@ func (s *server) handleChat(w http.ResponseWriter, r *http.Request) {
 				return fmt.Errorf("recreate session: %w", err)
 			}
 			if err := historySrc.Reset(); err != nil {
-				// Non-fatal: store is clean; index failure leaves index nil
-				// until next successful reset. Log but don't fail.
 				log.Printf("[session_reset] history index reset failed: %v", err)
 			}
 			return nil
@@ -498,7 +506,7 @@ func (s *server) handleChat(w http.ResponseWriter, r *http.Request) {
 			historySrc: historySrc,
 			km:         sessKM,
 			hook:       historySrc.Hook(),
-			resetTool:  session.NewResetTool(resetFn),
+			resetTool:  session.NewResetTool(softResetFn, hardResetFn),
 		}
 		s.sessions[sessID] = sess
 	}
