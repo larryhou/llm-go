@@ -216,10 +216,10 @@ func buildSkillsIndex(skillsDir string) (bleve.Index, int, error) {
 
 func main() {
 	cfg := appConfig{}
-	flag.StringVar(&cfg.provider, "provider", envOr("TIMI_PROVIDER", "openai"), "LLM provider: openai or anthropic")
-	flag.StringVar(&cfg.baseURL, "llm-url", envOr("TIMI_BASE_URL", "http://192.168.3.119:8080/timi-claude/v1"), "LLM base URL")
-	flag.StringVar(&cfg.apiKey, "llm-key", envOr("TIMI_API_KEY", "sk-zzz6FtyLMyuobNNOukwgobP0l1F3TjMO"), "LLM API key")
-	flag.StringVar(&cfg.modelID, "model", envOr("TIMI_MODEL", "claude-sonnet-4.6"), "LLM model ID")
+	flag.StringVar(&cfg.provider, "provider", envOr("LLM_PROVIDER", "openai"), "LLM provider: openai or anthropic")
+	flag.StringVar(&cfg.baseURL, "llm-url", envOr("LLM_BASE_URL", "http://192.168.3.119:8080/timi-claude/v1"), "LLM base URL")
+	flag.StringVar(&cfg.apiKey, "llm-key", envOr("LLM_API_KEY", "sk-zzz6FtyLMyuobNNOukwgobP0l1F3TjMO"), "LLM API key")
+	flag.StringVar(&cfg.modelID, "model", envOr("LLM_MODEL", "claude-sonnet-4.6"), "LLM model ID")
 	flag.IntVar(&cfg.maxSteps, "max-steps", 20, "max agentic steps per turn")
 	flag.IntVar(&cfg.contextLimit, "context-limit", 128000, "context window token limit")
 	flag.StringVar(&cfg.skillsDir, "skills", ".opencode", "skills root directory to index")

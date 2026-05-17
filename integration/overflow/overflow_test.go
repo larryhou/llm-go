@@ -402,15 +402,15 @@ func (c *counterTool) Execute(_ context.Context, input map[string]any) (tool.Res
 func intPtr(n int) *int { return &n }
 
 func resolveEnv() (baseURL, apiKey, modelID string) {
-	baseURL = os.Getenv("TIMI_BASE_URL")
+	baseURL = os.Getenv("LLM_BASE_URL")
 	if baseURL == "" {
 		baseURL = defaultBaseURL
 	}
-	apiKey = os.Getenv("TIMI_API_KEY")
+	apiKey = os.Getenv("LLM_API_KEY")
 	if apiKey == "" {
 		apiKey = defaultAPIKey
 	}
-	modelID = os.Getenv("TIMI_MODEL")
+	modelID = os.Getenv("LLM_MODEL")
 	if modelID == "" {
 		modelID = defaultModel
 	}

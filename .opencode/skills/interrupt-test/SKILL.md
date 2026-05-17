@@ -244,7 +244,7 @@ nohup go run ./cmd/llm-api/ -skills .opencode -addr 127.0.0.1:7700 \
 sleep 6 && curl -s http://127.0.0.1:7700/health
 ```
 
-LLM 连接通过环境变量 `TIMI_PROVIDER` / `TIMI_BASE_URL` / `TIMI_API_KEY` / `TIMI_MODEL` 配置，
+LLM 连接通过环境变量 `LLM_PROVIDER` / `LLM_BASE_URL` / `LLM_API_KEY` / `LLM_MODEL` 配置，
 或读取 `cmd/llm-api/main.go` 中的默认值。
 
 **ABORT if:** `/health` 响应不含 `"status":"ok"`。

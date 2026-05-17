@@ -21,10 +21,10 @@ cmd/control/
 
 ```go
 type config struct {
-    provider     string // -provider     default: "openai"  (env: TIMI_PROVIDER)
-    baseURL      string // -llm-url      default: ""        (env: TIMI_BASE_URL)
-    apiKey       string // -llm-key      default: ""        (env: TIMI_API_KEY)
-    modelID      string // -model        default: "claude-sonnet-4.6" (env: TIMI_MODEL)
+    provider     string // -provider     default: "openai"  (env: LLM_PROVIDER)
+    baseURL      string // -llm-url      default: ""        (env: LLM_BASE_URL)
+    apiKey       string // -llm-key      default: ""        (env: LLM_API_KEY)
+    modelID      string // -model        default: "claude-sonnet-4.6" (env: LLM_MODEL)
     maxSteps     int    // -max-steps    default: 20
     contextLimit int    // -context-limit default: 128000
     skillsDir    string // -skills       default: ".opencode"
@@ -39,7 +39,7 @@ type config struct {
 
 与 llm-api 完全相同的模式：
 - flag.Parse() 先行
-- 环境变量作为 fallback（TIMI_PROVIDER / TIMI_BASE_URL / TIMI_API_KEY / TIMI_MODEL）
+- 环境变量作为 fallback（LLM_PROVIDER / LLM_BASE_URL / LLM_API_KEY / LLM_MODEL）
 
 ### 2. Provider 初始化
 

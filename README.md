@@ -469,9 +469,9 @@ data: {"type":"done","session_id":"sess-1234567890"}
 ### LLM provider (OpenAI-compatible proxy)
 
 ```bash
-export TIMI_BASE_URL="http://your-proxy/v1"
-export TIMI_API_KEY="sk-your-key"
-export TIMI_MODEL="claude-sonnet-4.6"
+export LLM_BASE_URL="http://your-proxy/v1"
+export LLM_API_KEY="sk-your-key"
+export LLM_MODEL="claude-sonnet-4.6"
 ```
 
 ### Config file (`~/.config/llm/llm.json`)
@@ -519,9 +519,9 @@ go test ./llm/... ./config/... ./session/... ./store/... ./tool/... ./knowledge/
 
 ```bash
 export LLM_INTEGRATION=1
-export TIMI_BASE_URL="http://your-llm-proxy/v1"
-export TIMI_API_KEY="sk-your-key"
-export TIMI_MODEL="claude-sonnet-4.6"
+export LLM_BASE_URL="http://your-llm-proxy/v1"
+export LLM_API_KEY="sk-your-key"
+export LLM_MODEL="claude-sonnet-4.6"
 
 # Core integration tests
 go test ./integration/... -v -count=1 -timeout=120s

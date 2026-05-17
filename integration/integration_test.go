@@ -1,6 +1,6 @@
 // Package integration contains end-to-end tests against a real OpenAI-compatible API.
 //
-// Run with the TIMI_API_KEY and TIMI_BASE_URL environment variables set, or
+// Run with the LLM_API_KEY and LLM_BASE_URL environment variables set, or
 // use the predefined defaults which point at the local test proxy.
 //
 //	go test ./integration/ -v -count=1
@@ -40,15 +40,15 @@ func setup(t *testing.T) (llm.Provider, llm.Model) {
 		t.Skip("set LLM_INTEGRATION=1 to run integration tests")
 	}
 
-	baseURL := os.Getenv("TIMI_BASE_URL")
+	baseURL := os.Getenv("LLM_BASE_URL")
 	if baseURL == "" {
 		baseURL = defaultBaseURL
 	}
-	apiKey := os.Getenv("TIMI_API_KEY")
+	apiKey := os.Getenv("LLM_API_KEY")
 	if apiKey == "" {
 		apiKey = defaultAPIKey
 	}
-	modelID := os.Getenv("TIMI_MODEL")
+	modelID := os.Getenv("LLM_MODEL")
 	if modelID == "" {
 		modelID = defaultModel
 	}

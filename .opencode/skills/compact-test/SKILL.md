@@ -43,10 +43,10 @@ Start if not running:
 ```bash
 # LLM connection — resolved in this order:
 #   1. Environment variables (preferred):
-#        TIMI_PROVIDER  — "openai" or "anthropic"  (default: anthropic)
-#        TIMI_BASE_URL  — provider base URL
-#        TIMI_API_KEY   — API key
-#        TIMI_MODEL     — model ID                  (default: claude-sonnet-4.6)
+#        LLM_PROVIDER  — "openai" or "anthropic"  (default: anthropic)
+#        LLM_BASE_URL  — provider base URL
+#        LLM_API_KEY   — API key
+#        LLM_MODEL     — model ID                  (default: claude-sonnet-4.6)
 #   2. Hardcoded defaults in cmd/llm-api/main.go (flag.StringVar lines)
 #   3. If still unresolved (e.g. main.go defaults unavailable), ask the user.
 
