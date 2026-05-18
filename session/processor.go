@@ -321,8 +321,14 @@ func (s *processorState) handleEvent(ctx context.Context, ev llm.Event) (Process
 			},
 		})
 
-		// Check context overflow after each step
-		if llm.IsOverflow(ev.Usage, s.model, s.cfg) {
+		// Check context overflow after each step.
+		// Two signals trigger compaction:
+		//   1. IsOverflow: token count ≥ Usable (predictive, works for all providers)
+		//   2. FinishReasonLength: provider explicitly truncated output because the
+		//      context was exhausted (e.g. OpenAI finish_reason="length"). This
+		//      catches cases where the provider does not accurately report usage
+		//      but still signals truncation via the finish reason.
+		if llm.IsOverflow(ev.Usage, s.model, s.cfg) || ev.FinishReason == llm.FinishReasonLength {
 			s.needsCompaction = true
 			return ProcessCompact, nil
 		}

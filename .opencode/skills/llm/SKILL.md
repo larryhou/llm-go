@@ -166,7 +166,21 @@ flowchart TD
 
 Both Anthropic and OpenAI providers surface HTTP 4xx responses via `stream.Err()` → `classifyError()` → `llm.ClassifyHTTPError()`. That function matches against 19 overflow patterns (e.g. `"prompt is too long"`, `"context_length_exceeded"`, HTTP 413) and sets `Kind = ErrContextOverflow`. The path is confirmed real for hard HTTP rejections before streaming starts.
 
-Note: `ClassifyStreamError` (for in-stream JSON error events) is defined but **not yet called** by either provider. Mid-stream overflow JSON events are therefore not currently classified as `ErrContextOverflow`; they fall through as transport errors. This is a known gap, separate from the fallback implementation above.
+Note: `ClassifyStreamError` (for in-stream JSON error events) is defined but **not yet called** by either provider. Investigation shows:
+
+- **Anthropic**: the SDK converts `{"type":"error",...}` stream events internally to `stream.Err()`, so `classifyError(stream.Err())` already handles them correctly via `ClassifyHTTPError`. No gap.
+- **OpenAI**: returns `finish_reason="length"` when the context is exhausted during streaming. `ClassifyStreamError` is not relevant here; the correct fix is to treat `FinishReasonLength` in `EventStepFinish` as an overflow signal — which is now implemented in `processor.go` (`EventStepFinish` handler checks `ev.FinishReason == llm.FinishReasonLength` in addition to `IsOverflow`).
+
+```mermaid
+flowchart TD
+    StepFinish["EventStepFinish"] --> Check{"IsOverflow(ev.Usage)\nOR\nev.FinishReason == length?"}
+    Check -- Yes --> ProcessCompact["ProcessCompact"]
+    Check -- No --> Continue["ProcessContinue"]
+
+    EventError["EventError"] --> IsCtxOverflow{"IsContextOverflow()?"}
+    IsCtxOverflow -- Yes --> ProcessCompact
+    IsCtxOverflow -- No --> ProcessStop["ProcessStop + error"]
+```
 
 #### Usable limit calculation (`llm/overflow.go`)
 
