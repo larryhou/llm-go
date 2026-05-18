@@ -91,16 +91,36 @@ sequenceDiagram
 
 ### Context Compaction
 
-Compaction is triggered when `IsOverflow()` returns true after a step, or when the provider returns a context-overflow error. It replaces old history with an LLM-generated summary, keeping only the most recent turns verbatim.
+Compaction is triggered by two distinct paths:
+
+- **Path A — Predictive** (`EventStepFinish → IsOverflow`): the LLM completed a step and reported `usage.Input ≥ Usable`. The assistant message has content (text / tool calls). RunLoop runs `Compact()` and stops (`RunResultStop`); the next user message continues from the compacted state.
+- **Path B — Reactive** (`EventError → IsContextOverflow`): the provider rejected the request outright (HTTP 400/413). The assistant message is empty. RunLoop enters the **reactive overflow fallback** (see below) instead of stopping immediately.
 
 ```mermaid
 flowchart TD
     StepFinish["EventStepFinish\nev.Usage.Input"] --> IsOverflow{"IsOverflow(usage, model, cfg)\ninput ≥ Usable limit?"}
     ProviderError["EventError\nIsContextOverflow()"] --> IsOverflow
     IsOverflow -- No --> Continue["ProcessContinue"]
-    IsOverflow -- Yes --> ProcessCompact["ProcessCompact\n→ RunLoop calls Compact()"]
+    IsOverflow -- Yes --> ProcessCompact["ProcessCompact\n→ RunLoop ProcessCompact case"]
 
-    ProcessCompact --> ListMsgs["ListMessages + ListParts\nfor session"]
+    ProcessCompact --> HasParts{"assistantPartsSnapshot\nnot empty?"}
+    HasParts -- Yes --> PathA["Path A: predictive\nCompact() + RunResultStop"]
+    HasParts -- No --> PathB["Path B: reactive\ntoo-long fallback"]
+
+    PathB --> B1["B.1 Compact() — head→summary, tail preserved\nreload msgs/allParts"]
+    B1 --> B2["B.2 Retry LLM with compacted context\npostCompactRetry = true"]
+    B2 --> B2OK{"Success?"}
+    B2OK -- Yes --> Continue2["continue loop normally"]
+    B2OK -- No --> B3["B.3 Tail itself too large\nInspect last message role"]
+
+    B3 --> UserRole{"lastMsg.Role == user?"}
+    UserRole -- Yes --> B31["B.3.1 Write fake assistant notice:\n'Your input is too long...'\nRunResultStop"]
+    UserRole -- No --> B32["B.3.2 Find last completed tool part\nReplace output with placeholder\ntooLongRetries++"]
+    B32 --> Limit{"tooLongRetries ≥ 3?"}
+    Limit -- Yes --> Stop["RunResultStop + error"]
+    Limit -- No --> Retry["continue loop (LLM sees placeholder,\nexpected to change approach)"]
+
+    PathA --> ListMsgs["ListMessages + ListParts\nfor session"]
     ListMsgs --> FilterCompacted["FilterCompacted()\nskip pre-compaction history"]
     FilterCompacted --> Select["Select(msgs, allParts, model, cfg)\nhead / tail split"]
 
@@ -116,6 +136,37 @@ flowchart TD
     SummaryMsg --> NextTurn["Next RunLoop iteration\nFilterCompacted: boundary+summary+tail(spliced)+new\nTail spliced back via TailStartID in CompactionPartData"]
     Tail --> NextTurn
 ```
+
+#### Reactive overflow fallback (`session/prompt.go`)
+
+**Trigger:** `EventError → IsContextOverflow()` — the provider rejected the request because the context was already too large. The assistant message placeholder has no parts.
+
+**Why it differs from predictive overflow:** In the predictive path the LLM completed a step successfully and `IsOverflow` fired on the reported usage. In the reactive path the LLM never responded at all — the request body itself was too large. Simply stopping is unhelpful because the session is now stuck.
+
+**Two state variables** in `runLoopInternal`:
+
+| Variable | Type | Meaning |
+|---|---|---|
+| `postCompactRetry` | `bool` | `true` on the loop iteration immediately after B.1 compact; distinguishes B.2 from a fresh B |
+| `tooLongRetries` | `int` | counts consecutive B.3.2 tool-output replacements; capped at 3 |
+
+**Step-by-step:**
+
+1. **Discard** the empty assistant placeholder (`DeleteMessagesByIDs`, remove from `msgs`/`allParts` cache).
+2. **B.1** Run normal `Compact()` (head→summary, tail preserved). Reload `msgs`/`allParts`.
+3. **B.2** Set `postCompactRetry = true`, `continue` loop → retry the LLM with `[boundary][summary][tail][user_msg]`.
+4. **If B.2 succeeds** → `ProcessContinue`/`ProcessStop` resets `postCompactRetry = false`, `tooLongRetries = 0`, proceeds normally.
+5. **If B.2 also overflows** (`postCompactRetry == true` on the next `ProcessCompact`):
+   - Reset `postCompactRetry = false`.
+   - Inspect `FilterCompacted(msgs, allParts)` last message role:
+     - **`role == user` (B.3.1)**: user's own message fills the context. Write a fake assistant text message: `"Your input is too long for the current context window. Please try shortening your message or breaking it into smaller steps."` → `RunResultStop`.
+     - **`role == tool/assistant` (B.3.2)**: the last completed tool result is the culprit. Replace its `Output` with `"[Tool output was too large for the context window. Please try a different approach: ...]"`, increment `tooLongRetries`, and `continue` loop. If `tooLongRetries ≥ 3` → `RunResultStop` with error.
+
+**Why `EventError → IsContextOverflow` is real (not speculative):**
+
+Both Anthropic and OpenAI providers surface HTTP 4xx responses via `stream.Err()` → `classifyError()` → `llm.ClassifyHTTPError()`. That function matches against 19 overflow patterns (e.g. `"prompt is too long"`, `"context_length_exceeded"`, HTTP 413) and sets `Kind = ErrContextOverflow`. The path is confirmed real for hard HTTP rejections before streaming starts.
+
+Note: `ClassifyStreamError` (for in-stream JSON error events) is defined but **not yet called** by either provider. Mid-stream overflow JSON events are therefore not currently classified as `ErrContextOverflow`; they fall through as transport errors. This is a known gap, separate from the fallback implementation above.
 
 #### Usable limit calculation (`llm/overflow.go`)
 

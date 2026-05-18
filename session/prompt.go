@@ -225,6 +225,18 @@ func runLoopInternal(ctx context.Context, s store.Store, input RunInput, h *RunH
 		}
 	}
 
+	// tooLongRetries counts consecutive EventError→IsContextOverflow fallbacks
+	// where the last tool result was replaced. Resets to 0 on a successful LLM
+	// turn so the counter only tracks consecutive failures. Capped at 3 to
+	// prevent infinite loops when the LLM keeps generating oversized tool calls.
+	tooLongRetries := 0
+
+	// postCompactRetry is true when the current loop iteration is the retry
+	// immediately after the too-long fallback compact (Step B.2). A second
+	// overflow on this iteration means the tail itself is too large and triggers
+	// the deeper fallback (B.3).
+	postCompactRetry := false
+
 	step := 0
 	for {
 		isLastStep := input.MaxSteps > 0 && step >= input.MaxSteps
@@ -326,6 +338,10 @@ func runLoopInternal(ctx context.Context, s store.Store, input RunInput, h *RunH
 		if assistantParts, listErr := s.ListParts(ctx, assistantMsgID); listErr == nil {
 			allParts[assistantMsgID] = assistantParts
 		}
+		// Snapshot the parts now so ProcessCompact can tell whether overflow was
+		// predictive (EventStepFinish — parts exist) or reactive (EventError —
+		// parts are nil/empty because the LLM never responded).
+		assistantPartsSnapshot := allParts[assistantMsgID]
 
 		// Refresh the assistant message itself to pick up token counts written
 		// by finaliseAssistantMessage.
@@ -365,10 +381,157 @@ func runLoopInternal(ctx context.Context, s store.Store, input RunInput, h *RunH
 			return RunResultStop, nil
 
 		case ProcessCompact:
-			log.Printf("[session] compact triggered: input=%d", lastInputTokens)
-			// Run compaction, then reload the full message cache because
-			// compaction restructures history (inserts boundary + summary).
-			_, err := compactor.Compact(ctx, input.SessionID, ProcessInput{
+			// Distinguish between two overflow paths:
+			//
+			//  A) EventStepFinish → IsOverflow (predictive): the LLM completed
+			//     a step and reported usage ≥ Usable. The assistant message has
+			//     parts (text and/or tool calls). Run normal Compact() and stop.
+			//
+			//  B) EventError → IsContextOverflow (reactive): the provider
+			//     rejected the request outright. The assistant message is empty
+			//     (no parts). This means the context as-built was already too
+			//     large. Run the fallback flow.
+			//
+			//  B.2) postCompactRetry==true: we already ran Compact() in B.1 and
+			//     the retry also overflowed — the tail itself is too large.
+			//     Handle the deeper fallback (B.3).
+
+			// Discard the assistant placeholder. For path A (predictive) it has
+			// parts but Compact() will re-read from the store anyway. For paths
+			// B/B.3 it is empty. Removing it prevents a dangling empty message
+			// from appearing in the next FilterCompacted call.
+			_ = s.DeleteMessagesByIDs(ctx, input.SessionID, []string{assistantMsgID})
+			msgs = msgs[:len(msgs)-1]
+			delete(allParts, assistantMsgID)
+
+			if postCompactRetry {
+				// B.3: post-compact retry also overflowed — tail is too large.
+				postCompactRetry = false
+				log.Printf("[session] too-long: post-compact retry also overflowed, inspecting tail")
+
+				filtered2 := FilterCompacted(msgs, allParts)
+				if len(filtered2) == 0 {
+					h.closeStoreDone()
+					return RunResultStop, fmt.Errorf("runloop: context too long and no messages to inspect")
+				}
+
+				lastMsg := filtered2[len(filtered2)-1]
+
+				if lastMsg.Role == store.RoleUser {
+					// B.3.1: user's own message fills the context — inform user.
+					log.Printf("[session] too-long: user input too large, injecting notice")
+					noticeMsg := &store.Message{
+						ID:        newID(),
+						SessionID: input.SessionID,
+						Role:      store.RoleAssistant,
+						Model:     input.Model.ProviderID + "/" + input.Model.ID,
+						CreatedAt: time.Now(),
+						UpdatedAt: time.Now(),
+					}
+					if createErr := s.CreateMessage(ctx, noticeMsg); createErr == nil {
+						_ = s.CreatePart(ctx, &store.Part{
+							ID:        newID(),
+							MessageID: noticeMsg.ID,
+							SessionID: input.SessionID,
+							Type:      store.PartTypeText,
+							CreatedAt: time.Now(),
+							UpdatedAt: time.Now(),
+							Data: &store.TextPartData{
+								Text:      "Your input is too long for the current context window. Please try shortening your message or breaking it into smaller steps.",
+								TimeStart: time.Now().UnixMilli(),
+								TimeEnd:   time.Now().UnixMilli(),
+							},
+						})
+					}
+					h.closeStoreDone()
+					return RunResultStop, nil
+				}
+
+				// B.3.2: last message is a tool result — find and replace it.
+				var toolAssistantMsgID string
+				var lastToolPart *store.Part
+				for i := len(filtered2) - 1; i >= 0; i-- {
+					m := filtered2[i]
+					if m.Role != store.RoleAssistant {
+						continue
+					}
+					ps := allParts[m.ID]
+					for j := len(ps) - 1; j >= 0; j-- {
+						p := ps[j]
+						if p.Type != store.PartTypeTool {
+							continue
+						}
+						d, ok := store.DataAs[*store.ToolPartData](p)
+						if !ok || d.Status != store.ToolStatusCompleted {
+							continue
+						}
+						toolAssistantMsgID = m.ID
+						lastToolPart = p
+						break
+					}
+					if lastToolPart != nil {
+						break
+					}
+				}
+
+				if lastToolPart == nil {
+					h.closeStoreDone()
+					return RunResultStop, fmt.Errorf("runloop: context too long but no completed tool result found")
+				}
+
+				if tooLongRetries >= 3 {
+					log.Printf("[session] too-long: tool retry limit reached (%d)", tooLongRetries)
+					h.closeStoreDone()
+					return RunResultStop, fmt.Errorf("runloop: context too long after %d tool-output replacements", tooLongRetries)
+				}
+
+				tooLongRetries++
+				log.Printf("[session] too-long: replacing tool output in msg %q (retry %d/3)", toolAssistantMsgID, tooLongRetries)
+				d, _ := store.DataAs[*store.ToolPartData](lastToolPart)
+				d.Output = "[Tool output was too large for the context window. Please try a different approach: use more specific parameters, request a smaller result, or use a different tool.]"
+				lastToolPart.Data = d
+				if updateErr := s.UpdatePart(ctx, lastToolPart); updateErr != nil {
+					log.Printf("[session] too-long: update tool part failed: %v", updateErr)
+					h.closeStoreDone()
+					return RunResultStop, fmt.Errorf("runloop: update tool part: %w", updateErr)
+				}
+				if refreshed, listErr := s.ListParts(ctx, toolAssistantMsgID); listErr == nil {
+					allParts[toolAssistantMsgID] = refreshed
+				}
+				// Retry without re-running compact (compact was already done in B.1).
+				continue
+			}
+
+			if assistantPartsSnapshot != nil {
+				// Path A: predictive overflow (EventStepFinish). Normal compact + stop.
+				log.Printf("[session] compact triggered (predictive): input=%d", lastInputTokens)
+				_, err := compactor.Compact(ctx, input.SessionID, ProcessInput{
+					SessionID:       input.SessionID,
+					Model:           input.Model,
+					Provider:        input.Provider,
+					SummaryProvider: input.SummaryProvider,
+					Config:          input.Config,
+					OnCompact:       input.OnCompact,
+				})
+				if err != nil {
+					log.Printf("[session] compact failed: %v", err)
+					return RunResultStop, fmt.Errorf("runloop: compaction failed: %w", err)
+				}
+				log.Printf("[session] compact done")
+				// Compaction is a save-point: the current turn is complete.
+				// The tail (preserved verbatim in context) already contains the
+				// tool results from the step that triggered overflow. Continuing
+				// the loop here would send a request with the summary assistant
+				// message as the last message — no new user turn — which causes
+				// proxies and the Anthropic API to return an empty response
+				// (usage=0). Stop and let the next user message continue naturally.
+				h.closeStoreDone()
+				return RunResultStop, nil
+			}
+
+			// Path B: reactive overflow (EventError). Run compact then retry.
+			log.Printf("[session] too-long: reactive overflow, compacting before retry")
+			_, compactErr := compactor.Compact(ctx, input.SessionID, ProcessInput{
 				SessionID:       input.SessionID,
 				Model:           input.Model,
 				Provider:        input.Provider,
@@ -376,22 +539,28 @@ func runLoopInternal(ctx context.Context, s store.Store, input RunInput, h *RunH
 				Config:          input.Config,
 				OnCompact:       input.OnCompact,
 			})
-			if err != nil {
-				log.Printf("[session] compact failed: %v", err)
-				return RunResultStop, fmt.Errorf("runloop: compaction failed: %w", err)
+			if compactErr != nil {
+				log.Printf("[session] too-long compact failed: %v", compactErr)
+				return RunResultStop, fmt.Errorf("runloop: too-long compaction failed: %w", compactErr)
 			}
-			log.Printf("[session] compact done")
-			// Compaction is a save-point: the current turn is complete.
-			// The tail (preserved verbatim in context) already contains the
-			// tool results from the step that triggered overflow. Continuing
-			// the loop here would send a request with the summary assistant
-			// message as the last message — no new user turn — which causes
-			// proxies and the Anthropic API to return an empty response
-			// (usage=0). Stop and let the next user message continue naturally.
-			h.closeStoreDone()
-			return RunResultStop, nil
+
+			// Reload message cache after compaction (history was restructured).
+			msgs, allParts, err = loadMessages(ctx, s, input.SessionID)
+			if err != nil {
+				return RunResultStop, fmt.Errorf("runloop: reload after too-long compact: %w", err)
+			}
+
+			// Mark that the next iteration is a post-compact retry so that if it
+			// also overflows we know to enter B.3 instead of looping back to B.1.
+			postCompactRetry = true
+			log.Printf("[session] too-long: retrying after compact")
+			continue
 
 		case ProcessContinue:
+			// Successful LLM turn — reset the too-long retry counter and flag.
+			tooLongRetries = 0
+			postCompactRetry = false
+
 			// Last step always terminates — the LLM has been asked to summarise.
 			if isLastStep {
 				h.closeStoreDone()
