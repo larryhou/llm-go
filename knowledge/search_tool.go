@@ -17,9 +17,10 @@ type searchTool struct{ mgr *Manager }
 func (t *searchTool) Name() string { return "knowledge_search" }
 
 func (t *searchTool) Description() string {
-	return "Search for information across configured knowledge sources. " +
-		"Returns a ranked list of titles and short snippets. " +
-		"Use knowledge_fetch with a result's ref_id to retrieve the full content of a specific item."
+	return "检索知识库，涵盖个人记忆（memory）、个人待办（todo）、团队SOP经验（sop）以及压缩后的会话历史（history）等来源。" +
+		"返回摘要列表，每条结果包含 ref_id、来源（source）和内容摘要。" +
+		"需要完整内容时，用结果中的 ref_id 调用 knowledge_fetch。" +
+		"**必须主动调用的场景**：回答涉及用户个人背景的问题前；用户询问待办清单时；回答技术/工具/流程类问题前。"
 }
 
 func (t *searchTool) InputSchema() map[string]any {
