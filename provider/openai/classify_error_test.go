@@ -4,6 +4,7 @@ package openai
 // Tests live in package openai (not openai_test) because the function is unexported.
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -56,6 +57,10 @@ func TestIsRetryableTransportError(t *testing.T) {
 
 		// Wrapped io.EOF should also be retryable.
 		{"wrapped io.EOF", fmt.Errorf("stream: %w", io.EOF), true},
+
+		// *json.SyntaxError "unexpected end of JSON input" from SSE mid-frame drop.
+		{"json.SyntaxError unexpected end", &json.SyntaxError{}, true},
+		{"wrapped json.SyntaxError", fmt.Errorf("decode: %w", &json.SyntaxError{}), true},
 	}
 
 	for _, tc := range cases {

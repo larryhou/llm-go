@@ -4,6 +4,7 @@ package anthropic
 // Tests live in package anthropic (not anthropic_test) because the function is unexported.
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -41,6 +42,8 @@ func TestIsRetryableTransportError_Anthropic(t *testing.T) {
 		{"net.OpError op=dial", makeOpErrAnthropic("dial", errors.New("connection refused")), false},
 		{"generic error", errors.New("some error"), false},
 		{"wrapped io.EOF", fmt.Errorf("stream: %w", io.EOF), true},
+		{"json.SyntaxError unexpected end", &json.SyntaxError{}, true},
+		{"wrapped json.SyntaxError", fmt.Errorf("decode: %w", &json.SyntaxError{}), true},
 	}
 
 	for _, tc := range cases {

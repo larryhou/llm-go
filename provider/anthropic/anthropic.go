@@ -442,6 +442,13 @@ func isRetryableTransportError(err error) bool {
 	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
 		return true
 	}
+	// *json.SyntaxError with "unexpected end of JSON input" is produced by the
+	// SSE stream decoder when the connection is dropped mid-frame. It is
+	// semantically equivalent to io.ErrUnexpectedEOF and should be retried.
+	var jsonSyn *json.SyntaxError
+	if errors.As(err, &jsonSyn) {
+		return true
+	}
 	var opErr *net.OpError
 	if errors.As(err, &opErr) {
 		// Check OpError before generic net.Error so that Op field takes

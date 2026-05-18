@@ -103,7 +103,22 @@ func (p *Provider) Stream(ctx context.Context, req llm.Request) (<-chan llm.Even
 		return nil, err
 	}
 
-	stream := p.client.Chat.Completions.NewStreaming(ctx, params)
+	// Some OpenAI-compatible proxies emit extra blank lines between SSE events,
+	// producing sequences like \n\n\n instead of the standard \n\n. The openai-go
+	// SSE decoder dispatches an event on every blank line, so the extra blank line
+	// results in an empty-data event that json.Unmarshal rejects with
+	// "unexpected end of JSON input". The sseNormalizer middleware collapses any
+	// run of 3+ consecutive newlines down to \n\n before the SDK sees them.
+	normMiddleware := option.WithMiddleware(func(r *http.Request, next option.MiddlewareNext) (*http.Response, error) {
+		resp, err := next(r)
+		if err != nil || resp == nil {
+			return resp, err
+		}
+		resp.Body = &sseNormReadCloser{rc: resp.Body}
+		return resp, nil
+	})
+
+	stream := p.client.Chat.Completions.NewStreaming(ctx, params, normMiddleware)
 	ch := make(chan llm.Event, 32)
 	go func() {
 		defer close(ch)
@@ -111,6 +126,61 @@ func (p *Provider) Stream(ctx context.Context, req llm.Request) (<-chan llm.Even
 	}()
 	return ch, nil
 }
+
+// sseNormReadCloser wraps an io.ReadCloser and collapses runs of 3+ consecutive
+// '\n' bytes down to '\n\n', fixing proxies that emit extra blank lines between
+// SSE events. It operates byte-by-byte on the raw stream so it is agnostic to
+// chunk boundaries in the underlying TCP stream.
+type sseNormReadCloser struct {
+	rc      io.ReadCloser
+	nlCount int // consecutive '\n' bytes seen so far
+	pending []byte
+}
+
+func (s *sseNormReadCloser) Read(p []byte) (int, error) {
+	// If we have bytes pending from a previous call, drain them first.
+	if len(s.pending) > 0 {
+		n := copy(p, s.pending)
+		s.pending = s.pending[n:]
+		return n, nil
+	}
+
+	tmp := make([]byte, len(p))
+	n, err := s.rc.Read(tmp)
+	if n == 0 {
+		return 0, err
+	}
+
+	out := p[:0]
+	for _, b := range tmp[:n] {
+		if b == '\n' {
+			s.nlCount++
+			if s.nlCount <= 2 {
+				out = append(out, b)
+			}
+			// 3rd+ consecutive '\n': drop it (collapse to \n\n)
+		} else {
+			s.nlCount = 0
+			out = append(out, b)
+		}
+	}
+
+	written := len(out)
+	if written == 0 && err == nil {
+		// All bytes were dropped (rare: entire chunk was extra newlines).
+		// Return 1 recursive call to avoid returning (0, nil) to the caller.
+		return s.Read(p)
+	}
+	// If out grew larger than p (impossible here since we only shrink), guard anyway.
+	if written > len(p) {
+		s.pending = append(s.pending, out[len(p):]...)
+		written = len(p)
+	}
+	copy(p, out[:written])
+	return written, err
+}
+
+func (s *sseNormReadCloser) Close() error { return s.rc.Close() }
 
 func buildParams(req llm.Request) (openai.ChatCompletionNewParams, error) {
 	params := openai.ChatCompletionNewParams{
@@ -495,6 +565,13 @@ func isRetryableTransportError(err error) bool {
 	}
 	// io.EOF and io.ErrUnexpectedEOF typically indicate connection reset by peer.
 	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+		return true
+	}
+	// *json.SyntaxError with "unexpected end of JSON input" is produced by the
+	// SSE stream decoder when the connection is dropped mid-frame. It is
+	// semantically equivalent to io.ErrUnexpectedEOF and should be retried.
+	var jsonSyn *json.SyntaxError
+	if errors.As(err, &jsonSyn) {
 		return true
 	}
 	// Check OpError before net.Error: *net.OpError implements net.Error, so
