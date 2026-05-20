@@ -1,23 +1,159 @@
 ---
 name: control
-description: Work with cmd/control — an interactive REPL coding assistant built on llm-go session.RunLoopAsync with builtin file tools and in-memory Bleve skill index
+description: Work with cmd/control — an interactive REPL coding assistant built on agent.Client, and the agent package that provides the ready-to-run Client
 ---
 
-# cmd/control
+# cmd/control + agent package
 
-`cmd/control` is an interactive terminal REPL **and web UI** that runs a persistent LLM
-session in the current directory. It registers the six builtin file tools and optionally
-a knowledge index of skill documentation, then enters either a terminal read-evaluate-print
-loop or starts an HTTP server (when `-web` is set), both backed by `session.RunLoopAsync`.
+`cmd/control` is an interactive terminal REPL **and web UI** coding assistant.
+It is built on top of `agent.Client`, which provides all the wiring a coding
+session needs out of the box. `main.go` is now thin: flag parsing, store
+selection, optional debug recording, and the REPL loop.
 
 Files:
-- `cmd/control/main.go` — CLI flags, REPL loop, `hookProvider`, tool setup
-- `cmd/control/web.go` — HTTP server, `/chat` SSE endpoint, `/context` endpoint
+- `agent/agent.go` — `agent.Client`, `Config`, `RunOptions`, `hookProvider`, `OpenSQLiteStore`
+- `cmd/control/main.go` — CLI flags, REPL loop, `toolPath` display helper
+- `cmd/control/web.go` — HTTP server, `/chat` SSE endpoint, `/cancel`, `/context`
 - `cmd/control/ui.go` — Embedded single-page web UI (`uiHTML` constant)
 
 ---
 
-## Architecture
+## `agent` package
+
+### What `agent.New()` wires by default
+
+| Component | Default behaviour | Opt-out |
+|-----------|-------------------|---------|
+| Provider | registry (env / llm.json) | `Config.Provider` |
+| Store | `memory.New()` | `Config.Store` |
+| SessionID | `"agent-"+sha256(WorkDir)[:8]` | `Config.SessionID` |
+| Builtin file tools | glob, grep, read, write, edit, bash (scoped to WorkDir) | `NoBuiltinTools: true` |
+| SessionHistorySource | always; SQLite L2 if store is PersistStore | — |
+| Knowledge manager | history source (priority 0) + skills Bleve index (priority 1) | `NoSkillsIndex: true` |
+| Skills Bleve index | walks `<WorkDir>/.opencode` for `*.md` | `SkillsDir: "-"` or `NoSkillsIndex` |
+| session_reset tool | soft + hard reset | `NoResetTool: true` |
+| System prompt | coding-assistant preamble + knowledge-first instructions | `ExtraSystem` to append |
+
+Extension points: `ExtraTools`, `ExtraSources`, `ExtraSystem`.
+
+### Config fields
+
+```go
+type Config struct {
+    // Provider credentials (fall back to LLM_PROVIDER/LLM_BASE_URL/LLM_API_KEY/LLM_MODEL)
+    ProviderID string
+    BaseURL    string
+    APIKey     string
+    ModelID    string
+    Provider   llm.Provider  // inject pre-built provider
+
+    // Model limits
+    MaxSteps     int  // default 20
+    ContextLimit int  // default 128000
+
+    // Session
+    SessionID string       // default sha256(WorkDir)[:8]
+    Store     store.Store  // default memory.New()
+    WorkDir   string       // default os.Getwd()
+
+    // Skills
+    SkillsDir string  // default "<WorkDir>/.opencode"; "-" to skip
+
+    // Extension
+    ExtraTools   []tool.Tool
+    ExtraSources []knowledge.Source
+    ExtraSystem  []string
+
+    // Opt-outs
+    NoBuiltinTools bool
+    NoResetTool    bool
+    NoSkillsIndex  bool
+}
+```
+
+### Client exported fields
+
+```go
+type Client struct {
+    Store      store.Store               // session store
+    SessionID  string                    // stable session ID
+    Model      llm.Model                 // LLM model
+    Provider   llm.Provider              // raw provider; replaceable before first RunAsync
+    HistorySrc *store.SessionHistorySource  // exposed for RollbackTo / direct access
+}
+```
+
+### Client methods
+
+```go
+// Blocking — returns nil on success, context.Canceled on cancel.
+func (c *Client) Run(ctx, userMsg, opts RunOptions, on func(llm.Event)) error
+
+// Non-blocking — returns *session.RunHandle immediately.
+func (c *Client) RunAsync(ctx, userMsg, opts RunOptions, on func(llm.Event)) *session.RunHandle
+
+// Channel — returns <-chan llm.Event closed when turn finishes.
+func (c *Client) RunChan(ctx, userMsg, opts RunOptions) <-chan llm.Event
+
+// Returns a shallow copy of the default RunOptions (Tools/ExtraSystem are copied).
+func (c *Client) DefaultRunOptions() RunOptions
+```
+
+### RunOptions
+
+```go
+type RunOptions struct {
+    Tools       []tool.Tool
+    ExtraSystem []string
+    OnCompact   store.CompactionHook
+    WaitFor     <-chan struct{}  // pass prev.StoreDone to pipeline turns
+}
+```
+
+Zero value means "use all client defaults". `mergeOpts` fills nil fields from
+`Client.opts` before passing to `session.RunLoopAsync`.
+
+### hookProvider — event fan-out
+
+`RunAsync` wraps the provider in a `hookProvider` when `on != nil`. It fans
+events to two destinations:
+
+1. **`ch`** (buf 64) — delivered to the session loop; never dropped.
+2. **`obsCh`** (buf 128) → `onEvent` — best-effort; dropped when `obsCh` is full.
+
+**Per-`Stream`-call lifecycle** (critical): `observerDone` is allocated inside
+`Stream`, not as a struct field. This is necessary because the session loop calls
+`Stream` once per agentic step, so a multi-tool-call turn invokes `Stream` N
+times on the same `hookProvider`. A shared channel would be closed by step 1
+and panic on `close` in step 2+.
+
+**Ordering guarantee**: `ch` is closed only *after* `<-observerDone`, so when
+`h.Done` fires (which requires `ch` to be fully drained by the session loop),
+`onEvent` is guaranteed to never be called again. It is safe for the caller to
+`close(evCh)` immediately after `<-h.Done`.
+
+```
+inner → fan goroutine ──► ch (session loop, never dropped)
+                      ──► obsCh (non-blocking) → observer goroutine → onEvent
+                                                      ↓ close(observerDone)
+                            close(obsCh) → <-observerDone → close(ch)
+```
+
+### OpenSQLiteStore
+
+```go
+// agent.Store embeds store.Store + Close() error.
+func OpenSQLiteStore(path string) (agent.Store, error)
+```
+
+Returns `agent.Store` (not bare `store.Store`) so callers can `defer st.Close()`
+without a type assertion.
+
+---
+
+## cmd/control
+
+### Architecture
 
 ```mermaid
 flowchart TD
@@ -25,325 +161,179 @@ flowchart TD
     scanner["bufio.Scanner"]
     quit["quit / EOF (Ctrl-D)"]
     cancel["Ctrl-C → h.Cancel()"]
-    async["session.RunLoopAsync(ctx, store, RunInput)"]
-    hookprov["hookProvider.Stream()\ntee goroutine"]
+    agentClient["agent.Client.RunAsync()"]
+    hookprov["hookProvider.Stream()\nobsCh fan-out"]
     printer["printer goroutine\nstdout / stderr"]
     processor["session.Processor"]
-    builtin["builtin tools\nglob · grep · read · write · edit · bash"]
-    knowledge["knowledge tools\nknowledge_search · knowledge_fetch\n(optional)"]
+    tools["builtin + knowledge + reset tools\n(wired by agent.New)"]
 
     stdin --> scanner
     scanner -->|"exit/quit/EOF"| quit
-    scanner --> async
-    async --> hookprov
-    hookprov -->|evCh| printer
-    hookprov -->|inner ch| processor
-    async --> builtin
-    async --> knowledge
-    cancel -->|"SIGINT"| async
+    scanner --> agentClient
+    agentClient --> hookprov
+    hookprov -->|evCh (best-effort)| printer
+    hookprov -->|ch (reliable)| processor
+    agentClient --> tools
+    cancel -->|"SIGINT"| agentClient
 ```
 
-### hookProvider — event tee
+### Per-turn lifecycle (REPL)
 
-`RunLoopAsync` drives the LLM via `session.Processor`, which consumes events
-from `Provider.Stream()`. To print streaming output concurrently, `hookProvider`
-wraps the real provider and calls `onEvent` for every event before forwarding it.
-
-```go
-type hookProvider struct {
-    inner   llm.Provider
-    onEvent func(llm.Event)
-}
-```
-
-The REPL builds `hookProvider` once at startup; `onEvent` sends into `evCh`:
-
-```go
-evCh := make(chan llm.Event, 128)
-prov := &hookProvider{
-    inner:   innerProv,
-    onEvent: func(ev llm.Event) { evCh <- ev },
-}
-```
-
-`evCh` is reset to a new channel after each turn (`evCh = make(...)`). Because
-the closure captures the `evCh` **variable** (not its value), each new channel
-is automatically used by the existing `hookProvider` without any re-assignment
-of `prov`.
-
-### Per-turn lifecycle (REPL mode)
+A **fresh** `evCh` and `onEvent` closure are created at the top of each loop
+iteration. This prevents stale references from a previous turn's goroutines from
+sending into a closed channel.
 
 ```mermaid
 sequenceDiagram
     participant REPL
     participant printer as printer goroutine
     participant Handle as RunHandle
-    participant hookProv as hookProvider
+    participant hook as hookProvider
 
+    REPL->>REPL: evCh := make(..., 128); onEvent := func...
     REPL->>printer: go func() { for ev := range evCh }
-    REPL->>Handle: RunLoopAsync(...) → h
-    Handle->>hookProv: Stream(ctx, req)
-    hookProv-->>printer: onEvent(ev) → evCh ← ev
-    hookProv-->>Handle: inner ch ← ev
-    Note over REPL: select { h.Done | intSig (Ctrl-C) }
-    alt Ctrl-C pressed
-        REPL->>Handle: h.Cancel()
-        REPL->>Handle: <-h.Done
-    else turn finishes normally
+    REPL->>Handle: client.RunAsync(ctx, line, RunOptions{}, onEvent) → h
+    Handle->>hook: Stream(ctx, req)  [called once per agentic step]
+    hook-->>printer: obsCh → onEvent(ev) → evCh ← ev
+    hook-->>Handle: ch ← ev  [reliable]
+    Note over REPL: select { h.Done | intSig }
+    alt Ctrl-C
+        REPL->>Handle: h.Cancel(); <-h.Done
+    else normal finish
         Handle-->>REPL: h.Done closed
     end
-    REPL->>printer: close(evCh)
-    REPL->>REPL: <-done (drain printer)
-    REPL->>REPL: evCh = make(...)
+    REPL->>printer: close(evCh)  [safe: h.Done guarantees onEvent won't fire again]
+    REPL->>REPL: <-done
 ```
 
-### User cancellation (Ctrl-C)
-
-SIGINT is handled **per-turn**, not process-wide:
-
-- `signal.NotifyContext` listens for `SIGTERM` only (process exit).
-- A separate `intSig := make(chan os.Signal, 1)` with `signal.Notify(intSig, syscall.SIGINT)`
-  is used inside the REPL loop.
-- On Ctrl-C: `h.Cancel()` is called, `[cancelled]` is printed, the REPL returns
-  to the `> ` prompt. The process keeps running.
-- `context.Canceled` errors from a cancelled turn are silenced (not printed as errors).
-
-### Skills index
-
-On startup, `buildSkillsIndex(skillsDir)` recursively walks all `*.md` files
-under the skills directory and builds an **in-memory Bleve index** with four
-fields:
-
-| Field | Type | Content |
-|-------|------|---------|
-| `title` | text | `name:` from YAML frontmatter, or filename stem |
-| `content` | text | document body (after frontmatter) |
-| `skill` | keyword | first path segment relative to skillsDir |
-| `path` | keyword | absolute file path |
-
-If the skills directory does not exist, a warning is printed and the
-knowledge tools are simply not registered — the REPL still works without them.
-
----
-
-## CLI Flags
+### CLI Flags
 
 | Flag | Env | Default | Description |
 |------|-----|---------|-------------|
 | `-provider` | `LLM_PROVIDER` | `openai` | LLM provider: `openai` or `anthropic` |
-| `-llm-url` | `LLM_BASE_URL` | see `cmd/control/main.go` | Base URL (openai needs `/v1`; anthropic must NOT end with `/v1`) |
-| `-llm-key` | `LLM_API_KEY` | see `cmd/control/main.go` | API key |
+| `-llm-url` | `LLM_BASE_URL` | hardcoded proxy | Base URL |
+| `-llm-key` | `LLM_API_KEY` | hardcoded key | API key |
 | `-model` | `LLM_MODEL` | `claude-sonnet-4.6` | Model ID |
 | `-max-steps` | — | `20` | Max agentic steps per turn |
 | `-context-limit` | — | `128000` | Context window token limit |
-| `-skills` | — | `.opencode` | Skills root directory to index |
-| `-web` | — | `false` | Start web UI instead of terminal REPL |
-| `-debug` | — | `false` | Record all Stream() calls to `debug-<ts>.ndjson` (ndjson, one line per call) |
+| `-skills` | — | `.opencode` | Skills root dir (relative to cwd) |
+| `-store` | — | `sqlite:memory.db` | Store DSN: `"memory"` or `"sqlite:<path>"` |
+| `-web` | — | `false` | Start web UI |
+| `-debug` | — | `false` | Wrap provider with RecordProvider → `debug-<ts>.ndjson` |
 
-Priority: CLI flag > env var > hardcoded default (only in `flag.StringVar`).
-
-### Anthropic base URL
-
-`anthropic-sdk-go` auto-appends `/v1/messages`. When `-provider anthropic` is
-used, control strips a trailing `/v1` from the resolved URL before passing it
-to the provider:
-
-```go
-baseURL := strings.TrimSuffix(cfg.baseURL, "/v1")
-```
-
-So `-llm-url http://host/claude/v1` and `-llm-url http://host/claude` both work.
-
----
-
-## `-debug` recording
-
-When `-debug` is set, `innerProv` is wrapped in a `llm.RecordProvider` **before**
-`hookProvider`. This transparently records every `Stream()` call (request +
-filtered events including real token usage) to `debug-<ts>.ndjson`.
+### `-debug` recording
 
 ```
-innerProv  →  RecordProvider  →  hookProvider  →  session.RunLoopAsync
+real provider → RecordProvider (client.Provider = rec) → hookProvider → session loop
 ```
 
-One ndjson file captures all turns for the entire session. The file can be
-replayed with `cmd/replay` to reproduce compaction behaviour offline.
-
-```go
-if cfg.debug {
-    path := fmt.Sprintf("debug-%d.ndjson", time.Now().UnixMilli())
-    rec, _ := llm.NewRecordProvider(innerProv, path)
-    defer rec.Close()
-    innerProv = rec
-}
-```
-
----
-
-## Registered Tools
-
-### Builtin file tools (always registered)
-
-| Tool name | Struct | Description |
-|-----------|--------|-------------|
-| `glob` | `builtin.GlobTool` | Pattern file search |
-| `grep` | `builtin.GrepTool` | Regex content search |
-| `read` | `builtin.ReadTool` | Read file or directory |
-| `write` | `builtin.WriteTool` | Write file |
-| `edit` | `builtin.EditTool` | Exact string replace in file |
-| `bash` | `builtin.ShellTool` | Execute shell commands |
-
-All tools are initialized with `WorkDir: cwd` and **reused for the entire
-session** (important for `EditTool` which holds a per-file mutex map).
-
-### Knowledge tools (registered when skills dir exists)
-
-| Tool name | Description |
-|-----------|-------------|
-| `knowledge_search` | Full-text search returning snippets + RefIDs |
-| `knowledge_fetch` | Fetch full content of a document by RefID |
-
-Source ID: `"skills"` → RefIDs have the form `skills:subdir/SKILL.md`.
+`client.Provider` is replaced after `agent.New()` but before the first
+`RunAsync` call. `defer rec.Close()` flushes the ndjson file on exit.
 
 ---
 
 ## Web Server Mode (`-web`)
 
-When `-web` is set, control starts an HTTP server on a random local port instead of
-the terminal REPL. The port is printed on startup.
+HTTP server on a random local port. `web.go` uses `client.DefaultRunOptions()`
++ sets `WaitFor: prev.StoreDone` for atomic cancel-and-start.
 
 ### Endpoints
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
-| `/` | GET | Embedded single-page UI (`ui.go`) |
-| `/chat` | POST | SSE endpoint — accepts `{"message":"..."}`, streams events |
-| `/cancel` | POST | Cancel the in-flight turn; returns 204 |
-| `/context` | GET | Returns current session context window as JSON |
+| `/` | GET | Embedded single-page UI |
+| `/chat` | POST | SSE — `{"message":"..."}` → event stream |
+| `/cancel` | POST | Cancel in-flight turn; 204 |
+| `/context` | GET | Session context window as JSON |
 
-### `/chat` implementation
+### `/chat` flow
 
-`handleChat` in `web.go` uses `RunLoopAsync` + immediate cancel + `WaitFor`:
+1. Decode `{"message":"..."}`, set SSE headers, call `w.WriteHeader(200)`.
+2. Under `s.mu`: `prev.Cancel()`, build `opts = DefaultRunOptions(); opts.WaitFor = prev.StoreDone`, call `client.RunAsync(ctx, msg, opts, onEvent)`, assign `s.activeHandle`.
+3. `<-h.Done`; send `cancelled` / `done` SSE event.
 
-1. Build a per-request `hookProvider{inner: app.prov, onEvent: SSE forwarder}`
-2. Under `s.mu`: call `prev.Cancel()`, capture `prev.StoreDone` as `waitFor`, call
-   `RunLoopAsync(..., WaitFor: waitFor)`, assign `s.activeHandle = h` — all atomic
-3. SSE stream is established immediately; new turn goroutine runs right away
-4. Inside `runLoopInternal`: wait on `WaitFor` before writing user message or
-   calling `loadMessages` — ensures store consistency without blocking the handler
-5. `<-h.Done`; send `cancelled` or `done` SSE event
-
-`appState.prov` is `llm.Provider` (plain interface, not `*hookProvider`). The
-SSE-forwarding hook is created fresh per request inside `handleChat`.
-
-### `/chat` SSE event types
+### SSE event types
 
 | `type` | Fields | Description |
 |--------|--------|-------------|
-| `text` | `delta` | Streaming text delta from LLM |
-| `tool_call` | `tool`, `input` | Tool invoked (display path) |
-| `usage` | `input`, `output`, `total` | Token counts after each step |
-| `error` | `error` | Error message (not sent for `context.Canceled`) |
-| `cancelled` | — | Turn was cancelled by user |
-| `done` | — | Turn complete (always sent last) |
-
-### Cancellation (web mode)
-
-| Trigger | Mechanism |
-|---------|-----------|
-| ESC key | `document.addEventListener('keydown')` — fires `cancelTurn()` → POST `/cancel` |
-| New message while turn active | `handleChat` calls `prev.Cancel()` then immediately starts new turn with `WaitFor: prev.StoreDone` |
-
-Send button is **always enabled** — sending a new message while a turn is active
-immediately cancels the previous turn and starts a new one. The new turn waits
-internally on `prev.StoreDone` before writing history, so the SSE stream is
-established without any HTTP-level blocking.
-
-ESC provides a pure-cancel path (POST `/cancel`) when the user wants to stop
-without sending anything new.
-
-`/cancel` calls `activeHandle.Cancel()` and returns `204`. The running
-`handleChat` goroutine receives `context.Canceled` from `<-h.Done`, sends
-a `cancelled` SSE event, then sends `done`. The UI shows `⊘ cancelled` below
-the partial response.
-
-### `/context` response
-
-```json
-{
-  "session_id": "...",
-  "messages": 12,
-  "total_chars": 45000,
-  "context": [
-    {
-      "role": "user",
-      "total_chars": 120,
-      "content": [
-        { "type": "text", "chars": 120, "preview": "first 2000 chars..." }
-      ]
-    }
-  ]
-}
-```
-
-Each content part's `preview` is capped at 2000 chars. The web UI renders parts
-as collapsible rows (▶/▼) with internal scrolling (max-height 300px).
+| `text` | `delta` | Streaming text delta |
+| `tool_call` | `tool`, `input` | Tool invoked |
+| `usage` | `input`, `output`, `total` | Token counts (per step) |
+| `error` | `error` | Error (not sent for `context.Canceled`) |
+| `cancelled` | — | Turn cancelled |
+| `done` | — | Always last |
 
 ---
 
 ## Session Persistence
 
-A single `store/memory.Store` and a single `sessionID` are used for the entire
-REPL lifetime. Every user turn appends to the same session, so the LLM has full
-conversation history across turns (subject to context compaction).
-
-```go
-sessionID = "control-<unix-nano>"
-```
+`SessionID` is derived from `sha256(WorkDir)[:8]` with prefix `"agent-"` so the
+same directory always resumes the same session across restarts (when SQLite store
+is used). `SessionHistorySource` provides L0/L1/L2 caching with SQLite as the
+durable backend.
 
 ---
 
 ## System Prompt
 
-`DisableProviderPrompt` is **not set** (defaults to false), so the embedded
-per-provider prompt is always included. `ExtraSystem` appends:
+Built by `agent.New()`:
 
 ```
-You are an interactive coding assistant running in directory: <cwd>
+You are an interactive coding assistant running in directory: <WorkDir>
 Tool usage priority:
-1. Always call knowledge_search first to look up relevant documentation, architecture, and design guides.
-2. If the search results are insufficient or no relevant knowledge is found, then use file tools (glob, grep, read, write, edit, bash) to explore the codebase directly.
-Never skip the knowledge lookup step when answering questions about the codebase.
-Always work within <cwd> unless explicitly instructed otherwise.
+1. Always call knowledge_search first ...
+2. If results insufficient, use file tools ...
+Never skip the knowledge lookup step ...
+Always work within <WorkDir> unless explicitly instructed otherwise.
+```
+
+Append additional instructions via `Config.ExtraSystem`.
+
+---
+
+## Minimal Usage
+
+```go
+// Zero-config: reads LLM_* env vars, uses cwd, memory store.
+client, err := agent.New(agent.Config{})
+
+// SQLite persistence + custom skills dir.
+st, _ := agent.OpenSQLiteStore("session.db")
+defer st.Close()
+client, err := agent.New(agent.Config{
+    Store:     st,
+    SkillsDir: "/path/to/skills",
+})
+
+// Inject extra tools.
+client, err := agent.New(agent.Config{
+    ExtraTools: []tool.Tool{myTool},
+})
+
+// Blocking run with event callback.
+err = client.Run(ctx, "Explain this codebase", agent.RunOptions{}, func(ev llm.Event) {
+    if ev.Type == llm.EventTextDelta { fmt.Print(ev.Text) }
+})
+
+// Non-blocking with Ctrl-C support.
+h := client.RunAsync(ctx, line, agent.RunOptions{}, onEvent)
+select {
+case <-h.Done:
+case <-intSig:
+    h.Cancel(); <-h.Done
+}
 ```
 
 ---
 
-## Running
+## Running cmd/control
 
 ```bash
-# with defaults (openai, local endpoint)
-go run ./cmd/control
-
-# explicit flags — values read from LLM_* env vars if not specified
-go run ./cmd/control \
-    -provider anthropic \
-    -llm-url  $LLM_BASE_URL \
-    -llm-key  $LLM_API_KEY \
-    -model    claude-sonnet-4.6 \
-    -skills   .opencode
-
-# with debug recording
-go run ./cmd/control -debug
-
-# via env vars
-LLM_PROVIDER=openai LLM_API_KEY=sk-... go run ./cmd/control
-```
-
-Build:
-
-```bash
-go build ./cmd/control/...
+go run ./cmd/control                          # reads LLM_* env vars
+go run ./cmd/control -provider anthropic      # anthropic provider
+go run ./cmd/control -debug                   # record to debug-<ts>.ndjson
+go run ./cmd/control -web                     # web UI on random port
+go run ./cmd/control -store sqlite:session.db # SQLite persistence
 ```
 
 ---
@@ -352,12 +342,12 @@ go build ./cmd/control/...
 
 | File | Purpose |
 |------|---------|
-| `cmd/control/main.go` | CLI flags, REPL loop, `hookProvider`, Ctrl-C cancellation, tool/knowledge setup |
-| `cmd/control/web.go` | HTTP server, `/chat` SSE (RunLoopAsync + cancel-prev-turn), `/context` |
-| `cmd/control/ui.go` | Embedded single-page web UI (`uiHTML` const) |
-| `tool/builtin/` | Six builtin file tools |
-| `knowledge/source/bleve/bleve.go` | BleveSource used for skills index |
-| `store/memory/memory.go` | In-memory session store |
+| `agent/agent.go` | `Client`, `Config`, `RunOptions`, `hookProvider`, `OpenSQLiteStore` |
+| `cmd/control/main.go` | CLI flags, REPL loop, `toolPath` helper |
+| `cmd/control/web.go` | HTTP server, SSE `/chat`, `/cancel`, `/context` |
+| `cmd/control/ui.go` | Embedded single-page web UI |
+| `tool/builtin/` | Six builtin file tools (wired by agent.New) |
+| `knowledge/source/bleve/` | BleveSource for skills index |
+| `store/session_history.go` | `SessionHistorySource` — L0/L1/L2 knowledge cache |
 | `session/prompt.go` | `RunLoop`, `RunLoopAsync`, `RunHandle`, `RunInput` |
-| `llm/record_provider.go` | `RecordProvider` — transparent recording wrapper (`-debug`) |
-| `llm/replay_provider.go` | `ReplayProvider` — used by `cmd/replay` to replay recordings |
+| `llm/record_provider.go` | `RecordProvider` for `-debug` recording |

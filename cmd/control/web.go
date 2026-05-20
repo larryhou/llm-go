@@ -8,78 +8,50 @@ import (
 	"net/http"
 	"sync"
 
-	"github.com/larryhou/llm-go/config"
+	"github.com/larryhou/llm-go/agent"
 	"github.com/larryhou/llm-go/llm"
 	"github.com/larryhou/llm-go/session"
 	"github.com/larryhou/llm-go/store"
-	"github.com/larryhou/llm-go/tool"
 )
 
-// ── web server ────────────────────────────────────────────────────────────────
-
 type webServer struct {
-	app          *appState
-	mu           sync.Mutex // guards activeHandle
+	client       *agent.Client
+	mu           sync.Mutex
 	activeHandle *session.RunHandle
-	sessStore    store.Store
-	sessID       string
 }
 
-// appState holds shared state initialised once in main.
-type appState struct {
-	cwd            string
-	tools          []tool.Tool
-	extraSystem    []string
-	model          llm.Model
-	prov           llm.Provider // RecordProvider(real) in -debug, real otherwise
-	cfg            *config.Info
-	maxSteps       int
-	compactionHook store.CompactionHook
-	sessStore      store.Store
-	sessID         string
-}
-
-// ── web server ────────────────────────────────────────────────────────────────
-
-func runWebServer(app *appState) error {
+func runWebServer(client *agent.Client) error {
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		return fmt.Errorf("listen: %w", err)
 	}
-	addr := ln.Addr().(*net.TCPAddr)
-	url := fmt.Sprintf("http://127.0.0.1:%d", addr.Port)
+	url := fmt.Sprintf("http://127.0.0.1:%d", ln.Addr().(*net.TCPAddr).Port)
+	fmt.Printf("Web UI: %s\n\n", url)
 
-	srv := &webServer{app: app, sessStore: app.sessStore, sessID: app.sessID}
+	srv := &webServer{client: client}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", srv.handleUI)
 	mux.HandleFunc("/chat", srv.handleChat)
 	mux.HandleFunc("/cancel", srv.handleCancel)
 	mux.HandleFunc("/context", srv.handleContext)
-
-	fmt.Printf("Web UI: %s\n\n", url)
 	return http.Serve(ln, mux)
 }
-
-// ── / — serve embedded UI ─────────────────────────────────────────────────────
 
 func (s *webServer) handleUI(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Write([]byte(uiHTML))
 }
 
-// ── /chat — SSE endpoint ──────────────────────────────────────────────────────
-
 func (s *webServer) handleChat(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "POST required", http.StatusMethodNotAllowed)
 		return
 	}
-
 	var req struct {
 		Message string `json:"message"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "invalid JSON", http.StatusBadRequest)
+		http.Error(w, "invalid JSON: "+err.Error(), http.StatusBadRequest)
 		return
 	}
 	if req.Message == "" {
@@ -87,92 +59,57 @@ func (s *webServer) handleChat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// SSE headers
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
 	w.Header().Set("Access-Control-Allow-Origin", "*")
-	flusher, canFlush := w.(http.Flusher)
-	if !canFlush {
+	flusher, ok := w.(http.Flusher)
+	if !ok {
 		http.Error(w, "streaming not supported", http.StatusInternalServerError)
 		return
 	}
 	w.WriteHeader(http.StatusOK)
 
-	// sseMu serialises all writes to w. http.ResponseWriter is not
-	// goroutine-safe; concurrent tool-execution goroutines can call sendEvent
-	// simultaneously, which corrupts chunked-encoding framing.
 	var sseMu sync.Mutex
-	sendEvent := func(payload any) {
-		b, _ := json.Marshal(payload)
+	send := func(v any) {
+		b, _ := json.Marshal(v)
 		sseMu.Lock()
 		fmt.Fprintf(w, "data: %s\n\n", b)
 		flusher.Flush()
 		sseMu.Unlock()
 	}
 
-	// Wrap provider to forward events to SSE.
-	turnProv := &hookProvider{
-		inner: s.app.prov,
-		onEvent: func(ev llm.Event) {
-			switch ev.Type {
-			case llm.EventTextDelta:
-				if ev.Text != "" {
-					sendEvent(map[string]any{"type": "text", "delta": ev.Text})
-				}
-			case llm.EventToolCall:
-				sendEvent(map[string]any{
-					"type":  "tool_call",
-					"tool":  ev.ToolName,
-					"input": toolPath(ev.ToolName, ev.Input),
-				})
-			case llm.EventStepFinish:
-				u := ev.Usage
-				sendEvent(map[string]any{
-					"type":   "usage",
-					"input":  u.Input,
-					"output": u.Output,
-					"total":  u.Effective(),
-				})
-			case llm.EventError:
-				sendEvent(map[string]any{"type": "error", "error": fmt.Sprintf("%v", ev.Err)})
+	onEvent := func(ev llm.Event) {
+		switch ev.Type {
+		case llm.EventTextDelta:
+			if ev.Text != "" {
+				send(map[string]any{"type": "text", "delta": ev.Text})
 			}
-		},
+		case llm.EventToolCall:
+			send(map[string]any{"type": "tool_call", "tool": ev.ToolName, "input": toolPath(ev.ToolName, ev.Input)})
+		case llm.EventStepFinish:
+			u := ev.Usage
+			send(map[string]any{"type": "usage", "input": u.Input, "output": u.Output, "total": u.Effective()})
+		case llm.EventError:
+			send(map[string]any{"type": "error", "error": fmt.Sprintf("%v", ev.Err)})
+		}
 	}
 
-	// Detach from the HTTP request context so that RunLoop is not cancelled
-	// when the SSE client disconnects mid-stream.
 	ctx := context.WithoutCancel(r.Context())
 
-	// Cancel the previous turn and register the new handle atomically under
-	// s.mu. Holding the lock across Cancel+RunLoopAsync+activeHandle assignment
-	// ensures a third concurrent request cannot observe a stale prev and race
-	// to also register itself against the same old StoreDone.
 	s.mu.Lock()
 	prev := s.activeHandle
 	if prev != nil {
 		prev.Cancel()
 	}
-	var waitFor <-chan struct{}
+	opts := s.client.DefaultRunOptions()
 	if prev != nil {
-		waitFor = prev.StoreDone
+		opts.WaitFor = prev.StoreDone
 	}
-	h := session.RunLoopAsync(ctx, s.sessStore, session.RunInput{
-		SessionID:   s.sessID,
-		UserMsg:     req.Message,
-		Model:       s.app.model,
-		Provider:    turnProv,
-		Tools:       s.app.tools,
-		ExtraSystem: s.app.extraSystem,
-		MaxSteps:    s.app.maxSteps,
-		Config:      s.app.cfg,
-		WaitFor:     waitFor,
-		OnCompact:   s.app.compactionHook,
-	})
+	h := s.client.RunAsync(ctx, req.Message, opts, onEvent)
 	s.activeHandle = h
 	s.mu.Unlock()
 
-	// Wait for the async turn to finish.
 	<-h.Done
 
 	s.mu.Lock()
@@ -181,78 +118,64 @@ func (s *webServer) handleChat(w http.ResponseWriter, r *http.Request) {
 	}
 	s.mu.Unlock()
 
-	runErrStr := ""
 	if h.Err != nil && h.Err != context.Canceled {
-		runErrStr = h.Err.Error()
-		sendEvent(map[string]any{"type": "error", "error": runErrStr})
+		send(map[string]any{"type": "error", "error": h.Err.Error()})
 	} else if h.Err == context.Canceled {
-		sendEvent(map[string]any{"type": "cancelled"})
+		send(map[string]any{"type": "cancelled"})
 	}
-	_ = runErrStr
-	sendEvent(map[string]any{"type": "done"})
+	send(map[string]any{"type": "done"})
 }
-
-// ── /cancel — cancel the in-flight turn ──────────────────────────────────────
 
 func (s *webServer) handleCancel(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 	s.mu.Lock()
 	h := s.activeHandle
 	s.mu.Unlock()
-	if h == nil {
-		w.WriteHeader(http.StatusNoContent)
-		return
+	if h != nil {
+		h.Cancel()
 	}
-	h.Cancel()
 	w.WriteHeader(http.StatusNoContent)
 }
-
-// ── /context — inspect current session context window ────────────────────────
 
 func (s *webServer) handleContext(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 
 	ctx := r.Context()
-
-	msgs, err := s.sessStore.ListMessages(ctx, s.sessID)
+	msgs, err := s.client.Store.ListMessages(ctx, s.client.SessionID)
 	if err != nil {
-		http.Error(w, fmt.Sprintf(`{"error":%q}`, err.Error()), http.StatusInternalServerError)
+		http.Error(w, fmt.Sprintf(`{"error":%q}`, err), http.StatusInternalServerError)
 		return
 	}
-
 	allParts := make(map[string][]*store.Part, len(msgs))
 	for _, m := range msgs {
-		ps, err := s.sessStore.ListParts(ctx, m.ID)
-		if err != nil {
-			continue
+		if ps, err := s.client.Store.ListParts(ctx, m.ID); err == nil {
+			allParts[m.ID] = ps
 		}
-		allParts[m.ID] = ps
 	}
-
 	filtered := session.FilterCompacted(msgs, allParts)
 	modelMsgs, err := session.ToModelMessages(filtered, allParts)
 	if err != nil {
-		http.Error(w, fmt.Sprintf(`{"error":%q}`, err.Error()), http.StatusInternalServerError)
+		http.Error(w, fmt.Sprintf(`{"error":%q}`, err), http.StatusInternalServerError)
 		return
 	}
 
-	type contentItem struct {
+	type part struct {
 		Type    string `json:"type"`
 		Preview string `json:"preview,omitempty"`
 		Chars   int    `json:"chars"`
 	}
-	type msgView struct {
-		Role    string        `json:"role"`
-		Content []contentItem `json:"content"`
-		Total   int           `json:"total_chars"`
+	type msg struct {
+		Role    string `json:"role"`
+		Content []part `json:"content"`
+		Total   int    `json:"total_chars"`
 	}
 
 	const previewLen = 2000
-	views := make([]msgView, 0, len(modelMsgs))
+	views := make([]msg, 0, len(modelMsgs))
 	totalChars := 0
 	for _, m := range modelMsgs {
-		mv := msgView{Role: m.Role}
+		mv := msg{Role: m.Role}
 		for _, p := range m.Content {
 			var text string
 			switch p.Type {
@@ -260,7 +183,7 @@ func (s *webServer) handleContext(w http.ResponseWriter, r *http.Request) {
 				text = p.Text
 			case "tool-call":
 				b, _ := json.Marshal(p.Input)
-				text = fmt.Sprintf("[tool-call %s] %s", p.ToolName, string(b))
+				text = fmt.Sprintf("[tool-call %s] %s", p.ToolName, b)
 			case "tool-result":
 				if p.Result != nil {
 					text = fmt.Sprintf("[tool-result %s] %v", p.ToolName, p.Result.Value)
@@ -274,7 +197,7 @@ func (s *webServer) handleContext(w http.ResponseWriter, r *http.Request) {
 			if len(preview) > previewLen {
 				preview = preview[:previewLen] + "…"
 			}
-			ci := contentItem{Type: p.Type, Chars: len(text)}
+			ci := part{Type: p.Type, Chars: len(text)}
 			if preview != "" {
 				ci.Preview = preview
 			}
@@ -285,13 +208,11 @@ func (s *webServer) handleContext(w http.ResponseWriter, r *http.Request) {
 		views = append(views, mv)
 	}
 
-	resp := map[string]any{
-		"session_id":   s.sessID,
-		"messages":     len(modelMsgs),
-		"total_chars":  totalChars,
-		"context":      views,
-	}
-	b, _ := json.MarshalIndent(resp, "", "  ")
+	b, _ := json.MarshalIndent(map[string]any{
+		"session_id":  s.client.SessionID,
+		"messages":    len(modelMsgs),
+		"total_chars": totalChars,
+		"context":     views,
+	}, "", "  ")
 	_, _ = w.Write(b)
 }
-

@@ -1,66 +1,30 @@
-// Command control is an interactive REPL coding assistant that uses the
-// llm-go session loop, builtin file tools, and an in-memory Bleve index of
-// skill documentation for knowledge lookup.
+// Command control is an interactive REPL coding assistant built on agent.Client.
 //
 // REPL mode (default):
 //
-//	go run ./cmd/control -provider openai -llm-key sk-...
+//	go run ./cmd/control
 //
 // Web mode:
 //
 //	go run ./cmd/control -web
-//	# opens browser automatically; port is chosen dynamically
 package main
 
 import (
 	"bufio"
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"flag"
 	"fmt"
 	"os"
 	"os/signal"
-	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
 
-	bleve "github.com/blevesearch/bleve/v2"
-
-	"github.com/larryhou/llm-go/auth"
-	llmconfig "github.com/larryhou/llm-go/config"
-	"github.com/larryhou/llm-go/knowledge"
-	blevesource "github.com/larryhou/llm-go/knowledge/source/bleve"
+	"github.com/larryhou/llm-go/agent"
 	"github.com/larryhou/llm-go/llm"
-	providerPkg "github.com/larryhou/llm-go/provider"
-	anthropicProv "github.com/larryhou/llm-go/provider/anthropic"
-	openaiProv "github.com/larryhou/llm-go/provider/openai"
 	"github.com/larryhou/llm-go/session"
-	"github.com/larryhou/llm-go/store"
-	"github.com/larryhou/llm-go/store/memory"
-	sqlitestore "github.com/larryhou/llm-go/store/sqlite"
 	"github.com/larryhou/llm-go/tool"
-	"github.com/larryhou/llm-go/tool/builtin"
 )
-
-// ── config ────────────────────────────────────────────────────────────────────
-
-type appConfig struct {
-	provider     string
-	baseURL      string
-	apiKey       string
-	modelID      string
-	maxSteps     int
-	contextLimit int
-	skillsDir    string
-	storeDSN     string
-	web          bool
-	debug        bool
-}
-
-// timeNano returns current unix nanoseconds; shared with web.go.
-func timeNano() int64 { return time.Now().UnixNano() }
 
 func envOr(key, fallback string) string {
 	if v := os.Getenv(key); v != "" {
@@ -69,35 +33,10 @@ func envOr(key, fallback string) string {
 	return fallback
 }
 
-// ── provider wrapper — calls onEvent for every streamed event ────────────────
+// timeNano is used by web.go.
+func timeNano() int64 { return time.Now().UnixNano() }
 
-type hookProvider struct {
-	inner   llm.Provider
-	onEvent func(llm.Event)
-}
-
-func (p *hookProvider) ID() string { return p.inner.ID() }
-
-func (p *hookProvider) Stream(ctx context.Context, req llm.Request) (<-chan llm.Event, error) {
-	inner, err := p.inner.Stream(ctx, req)
-	if err != nil {
-		return nil, err
-	}
-	ch := make(chan llm.Event, 64)
-	go func() {
-		defer close(ch)
-		for ev := range inner {
-			p.onEvent(ev)
-			ch <- ev
-		}
-	}()
-	return ch, nil
-}
-
-// ── index helpers (ported from llm-api) ─────────────────────────────────
-
-// toolPath extracts a display path suffix from tool input arguments.
-// Returns a string like " path/to/file" for file tools, or "" for others.
+// toolPath extracts a display suffix from tool input for REPL/SSE output.
 func toolPath(name string, input any) string {
 	m, ok := input.(map[string]any)
 	if !ok {
@@ -105,7 +44,6 @@ func toolPath(name string, input any) string {
 	}
 	switch name {
 	case "glob", "grep":
-		// show "pattern  [in path]"
 		pattern, _ := m["pattern"].(string)
 		path, _ := m["path"].(string)
 		if pattern == "" {
@@ -127,396 +65,88 @@ func toolPath(name string, input any) string {
 	return ""
 }
 
-func newSkillsIndex() (bleve.Index, error) {
-	mapping := bleve.NewIndexMapping()
-
-	text := bleve.NewTextFieldMapping()
-	text.Store = true
-	text.Index = true
-
-	kw := bleve.NewKeywordFieldMapping()
-	kw.Store = true
-	kw.Index = true
-
-	dm := bleve.NewDocumentMapping()
-	dm.AddFieldMappingsAt("title", text)
-	dm.AddFieldMappingsAt("content", text)
-	dm.AddFieldMappingsAt("skill", kw)
-	dm.AddFieldMappingsAt("path", kw)
-	mapping.AddDocumentMapping("_default", dm)
-	return bleve.NewMemOnly(mapping)
-}
-
-func parseFrontmatter(src string) (name, body string) {
-	src = strings.TrimPrefix(src, "\xef\xbb\xbf")
-	if !strings.HasPrefix(src, "---") {
-		return "", src
-	}
-	rest := src[3:]
-	idx := strings.Index(rest, "\n---")
-	if idx < 0 {
-		return "", src
-	}
-	body = strings.TrimPrefix(rest[idx+4:], "\n")
-	scanner := bufio.NewScanner(strings.NewReader(rest[:idx]))
-	for scanner.Scan() {
-		if after, ok := strings.CutPrefix(scanner.Text(), "name:"); ok {
-			name = strings.TrimSpace(after)
-			break
-		}
-	}
-	return name, body
-}
-
-func buildSkillsIndex(skillsDir string) (bleve.Index, int, error) {
-	idx, err := newSkillsIndex()
-	if err != nil {
-		return nil, 0, fmt.Errorf("create memory index: %w", err)
-	}
-
-	batch := idx.NewBatch()
-	count := 0
-	err = filepath.WalkDir(skillsDir, func(path string, de os.DirEntry, err error) error {
-		if err != nil || de.IsDir() || !strings.EqualFold(filepath.Ext(path), ".md") {
-			return err
-		}
-		rel, _ := filepath.Rel(skillsDir, path)
-		skill := strings.SplitN(rel, string(filepath.Separator), 2)[0]
-
-		raw, readErr := os.ReadFile(path)
-		if readErr != nil {
-			return fmt.Errorf("read %s: %w", path, readErr)
-		}
-		title, body := parseFrontmatter(string(raw))
-		if title == "" {
-			title = strings.TrimSuffix(filepath.Base(path), filepath.Ext(path))
-		}
-
-		if batchErr := batch.Index(rel, map[string]any{
-			"title":   title,
-			"content": body,
-			"skill":   skill,
-			"path":    path,
-		}); batchErr != nil {
-			return batchErr
-		}
-		count++
-		return nil
-	})
-	if err != nil {
-		return nil, 0, err
-	}
-	if err := idx.Batch(batch); err != nil {
-		return nil, 0, fmt.Errorf("flush batch: %w", err)
-	}
-	return idx, count, nil
-}
-
-// ── main ──────────────────────────────────────────────────────────────────────
-
 func main() {
-	cfg := appConfig{}
-	flag.StringVar(&cfg.provider, "provider", envOr("LLM_PROVIDER", "openai"), "LLM provider: openai or anthropic")
-	flag.StringVar(&cfg.baseURL, "llm-url", envOr("LLM_BASE_URL", "http://192.168.3.119:8080/timi-claude/v1"), "LLM base URL")
-	flag.StringVar(&cfg.apiKey, "llm-key", envOr("LLM_API_KEY", "sk-zzz6FtyLMyuobNNOukwgobP0l1F3TjMO"), "LLM API key")
-	flag.StringVar(&cfg.modelID, "model", envOr("LLM_MODEL", "claude-sonnet-4.6"), "LLM model ID")
-	flag.IntVar(&cfg.maxSteps, "max-steps", 20, "max agentic steps per turn")
-	flag.IntVar(&cfg.contextLimit, "context-limit", 128000, "context window token limit")
-	flag.StringVar(&cfg.skillsDir, "skills", ".opencode", "skills root directory to index")
-	flag.StringVar(&cfg.storeDSN, "store", "sqlite:memory.db", "store DSN: \"memory\" or \"sqlite:<path>\"")
-	flag.BoolVar(&cfg.web, "web", false, "start web UI instead of REPL (port chosen automatically)")
-	flag.BoolVar(&cfg.debug, "debug", false, "record each turn to <session-id>/chat-<ts>.json")
+	var (
+		providerID   = flag.String("provider", envOr("LLM_PROVIDER", "openai"), "LLM provider")
+		baseURL      = flag.String("llm-url", envOr("LLM_BASE_URL", "http://192.168.3.119:8080/timi-claude/v1"), "LLM base URL")
+		apiKey       = flag.String("llm-key", envOr("LLM_API_KEY", "sk-zzz6FtyLMyuobNNOukwgobP0l1F3TjMO"), "LLM API key")
+		modelID      = flag.String("model", envOr("LLM_MODEL", "claude-sonnet-4.6"), "model ID")
+		maxSteps     = flag.Int("max-steps", 20, "max agentic steps per turn")
+		contextLimit = flag.Int("context-limit", 128000, "context window token limit")
+		skillsDir    = flag.String("skills", ".opencode", "skills root directory")
+		storeDSN     = flag.String("store", "sqlite:memory.db", "store DSN: \"memory\" or \"sqlite:<path>\"")
+		web          = flag.Bool("web", false, "start web UI instead of REPL")
+		debug        = flag.Bool("debug", false, "record turns to debug-<ts>.ndjson")
+	)
 	flag.Parse()
 
-	// ── provider ──────────────────────────────────────────────────────────────
-
-	// Build provider registry with factories for all supported providers.
-	registry := providerPkg.NewRegistry()
-	registry.RegisterFactory(anthropicProv.ProviderID, anthropicProv.Factory)
-	registry.RegisterFactory(openaiProv.ProviderID, openaiProv.Factory)
-
-	// Also support the "timi" alias (OpenAI-compatible) used in legacy flags.
-	registry.RegisterFactory("timi", func(provCfg *llmconfig.ProviderInfo, a *auth.Store) (llm.Provider, error) {
-		return openaiProv.NewFromConfig("timi", nil, provCfg, a)
-	})
-
-	// Build per-provider config from CLI flags so legacy flags still work
-	// when llm.json has no matching provider section.
-	fileCfg, _ := llmconfig.Load()
-	authStore, _ := auth.Load()
-
-	// Merge: CLI flags override file config.
-	provCfgMap := map[string]*llmconfig.ProviderInfo{}
-	if fileCfg != nil {
-		for k, v := range fileCfg.Provider {
-			provCfgMap[k] = v
-		}
-	}
-	// If CLI flags differ from file config, build an override entry.
-	if cfg.apiKey != "" || cfg.baseURL != "" {
-		cliProvID := cfg.provider
-		if cliProvID == "openai" {
-			cliProvID = "timi" // legacy: openai flag means timi proxy
-		}
-		existing := provCfgMap[cliProvID]
-		override := &llmconfig.ProviderInfo{}
-		if existing != nil {
-			*override = *existing
-		}
-		if override.Options == nil {
-			override.Options = &llmconfig.ProviderOptions{}
-		}
-		if cfg.apiKey != "" {
-			override.Options.APIKey = cfg.apiKey
-		}
-		if cfg.baseURL != "" {
-			if cfg.provider == "anthropic" {
-				// anthropic-sdk-go auto-appends /v1/messages; strip /v1 suffix.
-				override.API = strings.TrimSuffix(cfg.baseURL, "/v1")
-			} else {
-				override.API = cfg.baseURL
-			}
-		}
-		provCfgMap[cliProvID] = override
+	// ── agent ─────────────────────────────────────────────────────────────────
+	agentCfg := agent.Config{
+		ProviderID:   *providerID,
+		BaseURL:      *baseURL,
+		APIKey:       *apiKey,
+		ModelID:      *modelID,
+		MaxSteps:     *maxSteps,
+		ContextLimit: *contextLimit,
+		SkillsDir:    *skillsDir,
 	}
 
-	providerID := cfg.provider
-	if providerID == "openai" {
-		providerID = "timi"
-	} else if providerID == "anthropic" {
-		providerID = anthropicProv.ProviderID
-	}
-
-	innerProv, err := registry.BuildProvider(providerID, provCfgMap[providerID], authStore)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "build provider: %v\n", err)
-		os.Exit(1)
-	}
-
-	// In -debug mode, wrap with RecordProvider before anything else.
-	// One ndjson file captures all Stream() calls for the entire session.
-	if cfg.debug {
-		path := fmt.Sprintf("debug-%d.ndjson", time.Now().UnixMilli())
-		rec, err := llm.NewRecordProvider(innerProv, path)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "debug: %v\n", err)
-			os.Exit(1)
-		}
-		defer rec.Close()
-		innerProv = rec
-		fmt.Printf("Debug recording: %s\n", path)
-	}
-
-	// REPL event channel — printer goroutine reads from it while RunLoop runs.
-	evCh := make(chan llm.Event, 128)
-	prov := &hookProvider{
-		inner: innerProv,
-		onEvent: func(ev llm.Event) {
-			evCh <- ev
-		},
-	}
-
-	// ── builtin tools ─────────────────────────────────────────────────────────
-
-	cwd, err := os.Getwd()
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "getwd: %v\n", err)
-		os.Exit(1)
-	}
-
-	tools := []tool.Tool{
-		&builtin.GlobTool{WorkDir: cwd},
-		&builtin.GrepTool{WorkDir: cwd},
-		&builtin.ReadTool{WorkDir: cwd},
-		&builtin.WriteTool{WorkDir: cwd},
-		&builtin.EditTool{WorkDir: cwd},
-		&builtin.ShellTool{WorkDir: cwd},
-	}
-
-	// ── session store ─────────────────────────────────────────────────────────
-
-	var sessionStore store.Store
 	switch {
-	case cfg.storeDSN == "" || cfg.storeDSN == "memory":
-		sessionStore = memory.New()
+	case *storeDSN == "" || *storeDSN == "memory":
+		// leave nil → memory.New()
 	default:
-		path, ok := strings.CutPrefix(cfg.storeDSN, "sqlite:")
+		path, ok := strings.CutPrefix(*storeDSN, "sqlite:")
 		if !ok {
-			fmt.Fprintf(os.Stderr, "unknown store DSN %q — use \"memory\" or \"sqlite:<path>\"\n", cfg.storeDSN)
+			fmt.Fprintf(os.Stderr, "unknown store DSN %q\n", *storeDSN)
 			os.Exit(1)
 		}
-		st, err := sqlitestore.Open(path)
+		st, err := agent.OpenSQLiteStore(path)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "open sqlite store: %v\n", err)
 			os.Exit(1)
 		}
 		defer st.Close()
-		sessionStore = st
+		agentCfg.Store = st
 	}
 
-	// ── skills index + knowledge tools ───────────────────────────────────────
-
-	// sessionID is derived from the working directory so that the same
-	// directory always resumes the same session across process restarts.
-	h := sha256.Sum256([]byte(cwd))
-	sessionID := "control-" + hex.EncodeToString(h[:8])
-
-	skillsCount := 0
-	skillsAbsDir := cfg.skillsDir
-	if !filepath.IsAbs(skillsAbsDir) {
-		skillsAbsDir = filepath.Join(cwd, skillsAbsDir)
+	client, err := agent.New(agentCfg)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "agent init: %v\n", err)
+		os.Exit(1)
 	}
 
-	// compactionHook and historySrc are set when SessionHistorySource is created.
-	var compactionHook store.CompactionHook
-	var historySrc *store.SessionHistorySource
-
-	if _, statErr := os.Stat(skillsAbsDir); os.IsNotExist(statErr) {
-		fmt.Fprintf(os.Stderr, "[warn] skills directory not found: %s, skipping knowledge index\n", skillsAbsDir)
-	} else {
-		idx, n, idxErr := buildSkillsIndex(skillsAbsDir)
-		if idxErr != nil {
-			fmt.Fprintf(os.Stderr, "[warn] failed to build skills index: %v, skipping knowledge index\n", idxErr)
-		} else {
-			skillsCount = n
-
-			// If the store implements store.PersistStore, wire it as the
-			// L2 backend so compacted history survives process restarts.
-			var ps store.PersistStore
-			if p, ok := sessionStore.(store.PersistStore); ok {
-				ps = p
-			}
-			var histErr error
-			historySrc, histErr = store.NewSessionHistorySource(sessionID, store.DefaultMaxCompactions, store.DefaultMaxIndexedSeqs, ps)
-			if histErr != nil {
-				fmt.Fprintf(os.Stderr, "[warn] failed to create session history source: %v\n", histErr)
-			} else {
-				compactionHook = historySrc.Hook()
-			}
-
-			km := knowledge.NewManager(knowledge.ManagerConfig{
-				SourceTimeout:       10 * time.Second,
-				MaxResults:          5,
-				SnippetMaxChars:     400,
-				ContentMaxChars:     8000,
-				AllowPartialFailure: true,
-			})
-			// Skills index: priority 1 (lower priority than history).
-			km.Register(blevesource.New(idx, "skills", 1, &blevesource.Config{
-				TitleField:   "title",
-				ContentField: "content",
-			}))
-			if historySrc != nil {
-				km.Register(historySrc)
-			}
-			tools = append(tools, km.Tools()...)
-		}
-	}
-	// ctx is cancelled on SIGTERM only. SIGINT (Ctrl-C) is handled per-turn
-	// by intSig below so that the user can cancel a running turn without
-	// exiting the whole process.
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM)
-	defer stop()
-	tool.StartCleanup(ctx)
-	if _, err := sessionStore.GetSession(ctx, sessionID); err != nil {
-		if err := sessionStore.CreateSession(ctx, &store.Session{
-			ID:    sessionID,
-			Model: cfg.provider + "/" + cfg.modelID,
-		}); err != nil {
-			fmt.Fprintf(os.Stderr, "create session: %v\n", err)
+	// ── optional debug recording ──────────────────────────────────────────────
+	var debugFile string
+	if *debug {
+		debugFile = fmt.Sprintf("debug-%d.ndjson", time.Now().UnixMilli())
+		rec, recErr := llm.NewRecordProvider(client.Provider, debugFile)
+		if recErr != nil {
+			fmt.Fprintf(os.Stderr, "debug recording: %v\n", recErr)
 			os.Exit(1)
 		}
-	}
-
-	// session_reset: control is single-session, no server-level lock needed.
-	// historySrc may be nil if the skills directory was not found.
-	tools = append(tools, session.NewResetTool(
-		func(resetCtx context.Context, fresh bool) error {
-			deletedIDs, err := session.SoftReset(resetCtx, sessionID, sessionStore, fresh)
-			if err != nil {
-				return err
-			}
-			if historySrc != nil {
-				historySrc.RollbackTo(resetCtx, deletedIDs)
-			}
-			return nil
-		},
-		func(resetCtx context.Context) error {
-			if err := sessionStore.DeleteSession(resetCtx, sessionID); err != nil {
-				return err
-			}
-			if err := sessionStore.CreateSession(resetCtx, &store.Session{
-				ID:    sessionID,
-				Model: cfg.provider + "/" + cfg.modelID,
-			}); err != nil {
-				return err
-			}
-			if historySrc != nil {
-				if err := historySrc.Reset(); err != nil {
-					fmt.Fprintf(os.Stderr, "[warn] session history index reset failed: %v\n", err)
-				}
-			}
-			return nil
-		},
-	))
-
-	// ── system prompt ─────────────────────────────────────────────────────────
-
-	extraSystem := []string{fmt.Sprintf(
-		"You are an interactive coding assistant running in directory: %s\n"+
-			"Tool usage priority:\n"+
-			"1. Always call knowledge_search first to look up relevant documentation, architecture, and design guides.\n"+
-			"2. If the search results are insufficient or no relevant knowledge is found, then use file tools (glob, grep, read, write, edit, bash) to explore the codebase directly.\n"+
-			"Never skip the knowledge lookup step when answering questions about the codebase.\n"+
-			"Always work within %s unless explicitly instructed otherwise.",
-		cwd, cwd,
-	)}
-
-	model := llm.Model{
-		ID:         cfg.modelID,
-		ProviderID: providerID,
-		APIID:      cfg.modelID,
-		Limit: llm.ModelLimit{
-			Context: cfg.contextLimit,
-			Output:  8192,
-		},
-	}
-
-	// ── default session config (prune enabled) ────────────────────────────────
-
-	pruneEnabled := true
-	sessionCfg := &llmconfig.Info{
-		Compaction: &llmconfig.CompactionConfig{
-			Prune: &pruneEnabled,
-		},
+		defer rec.Close()
+		client.Provider = rec
 	}
 
 	// ── startup banner ────────────────────────────────────────────────────────
-
+	cwd, err := os.Getwd()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "getwd: %v\n", err)
+		os.Exit(1)
+	}
 	fmt.Println("Control — interactive coding assistant")
 	fmt.Printf("Working directory: %s\n", cwd)
-	if skillsCount > 0 {
-		fmt.Printf("Skills indexed: %d documents from %s\n", skillsCount, skillsAbsDir)
-	} else {
-		fmt.Println("Skills indexed: none")
+	if debugFile != "" {
+		fmt.Printf("Debug recording: %s\n", debugFile)
 	}
 
-	// ── web mode ──────────────────────────────────────────────────────────────
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM)
+	defer stop()
+	tool.StartCleanup(ctx)
 
-	if cfg.web {
-		app := &appState{
-			cwd:            cwd,
-			tools:          tools,
-			extraSystem:    extraSystem,
-			model:          model,
-			prov:           innerProv,
-			cfg:            sessionCfg,
-			maxSteps:       cfg.maxSteps,
-			compactionHook: compactionHook,
-			sessStore:      sessionStore,
-			sessID:         sessionID,
-		}
-		if err := runWebServer(app); err != nil {
+	// ── web mode ──────────────────────────────────────────────────────────────
+	if *web {
+		if err := runWebServer(client); err != nil {
 			fmt.Fprintf(os.Stderr, "web server: %v\n", err)
 			os.Exit(1)
 		}
@@ -527,24 +157,20 @@ func main() {
 	fmt.Println()
 
 	// ── REPL loop ─────────────────────────────────────────────────────────────
-
-	// intSig receives SIGINT (Ctrl-C). Buffered so the signal is not dropped
-	// if we are between turns (not blocking on the channel yet).
 	intSig := make(chan os.Signal, 1)
 	signal.Notify(intSig, syscall.SIGINT)
 	defer signal.Stop(intSig)
 
 	var activeHandle *session.RunHandle
 
-	scanner := bufio.NewScanner(os.Stdin)
+	sc := bufio.NewScanner(os.Stdin)
 	for {
 		fmt.Print("> ")
-		if !scanner.Scan() {
-			// EOF / Ctrl-D
+		if !sc.Scan() {
 			fmt.Println()
 			break
 		}
-		line := strings.TrimSpace(scanner.Text())
+		line := strings.TrimSpace(sc.Text())
 		if line == "" {
 			continue
 		}
@@ -552,8 +178,12 @@ func main() {
 			break
 		}
 
-		// Start printer goroutine before RunLoopAsync so we consume evCh
-		// while the turn (and its provider goroutines) are running.
+		// Create a fresh channel and closure each turn so that a late-arriving
+		// event from the completed provider goroutine never sends to a closed
+		// channel (which would panic).
+		evCh := make(chan llm.Event, 128)
+		onEvent := func(ev llm.Event) { evCh <- ev }
+
 		done := make(chan struct{})
 		go func() {
 			defer close(done)
@@ -563,8 +193,6 @@ func main() {
 					fmt.Print(ev.Text)
 				case llm.EventToolCall:
 					fmt.Printf("\n[tool: %s%s]\n", ev.ToolName, toolPath(ev.ToolName, ev.Input))
-				case llm.EventStepFinish:
-					// nothing — newline will come with EventRequestFinish
 				case llm.EventRequestFinish:
 					u := ev.Usage
 					fmt.Printf("\n[in:%d out:%d total:%d]\n", u.Input, u.Output, u.Effective())
@@ -574,20 +202,9 @@ func main() {
 			}
 		}()
 
-		h := session.RunLoopAsync(ctx, sessionStore, session.RunInput{
-			SessionID:   sessionID,
-			UserMsg:     line,
-			Model:       model,
-			Provider:    prov,
-			Tools:       tools,
-			ExtraSystem: extraSystem,
-			MaxSteps:    cfg.maxSteps,
-			Config:      sessionCfg,
-			OnCompact:   compactionHook,
-		})
+		h := client.RunAsync(ctx, line, agent.RunOptions{}, onEvent)
 		activeHandle = h
 
-		// Wait for the turn to finish or for the user to press Ctrl-C.
 	wait:
 		for {
 			select {
@@ -602,19 +219,14 @@ func main() {
 		}
 		activeHandle = nil
 
-		// Signal printer to drain and exit.
 		close(evCh)
 		<-done
-		// Reset channel for next turn (closure captures evCh variable, not value).
-		evCh = make(chan llm.Event, 128)
 
 		if h.Err != nil && h.Err != context.Canceled {
 			fmt.Fprintf(os.Stderr, "[error] %v\n", h.Err)
 		}
 	}
 
-	// If the user exits while a turn is still running (shouldn't normally
-	// happen since the scanner blocks, but guard anyway).
 	if activeHandle != nil {
 		activeHandle.Cancel()
 		<-activeHandle.Done
