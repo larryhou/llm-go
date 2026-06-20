@@ -14,38 +14,36 @@ import (
 
 // SummaryTemplate is the prompt used to generate compaction summaries.
 // Aligned with packages/opencode/src/session/compaction.ts SUMMARY_TEMPLATE.
-const SummaryTemplate = `Please provide a thorough, structured summary of our conversation so far.
-The summary will be used to restore context when the conversation history is too long.
+const SummaryTemplate = `Summarise the conversation history above into a compact context block.
+The goal is to keep the assistant focused on the current task — omit anything that is no longer
+directly relevant, and do not let historical detail distract from what needs to happen next.
+
+Rules:
+- Be concise. Prefer short phrases over full sentences.
+- Omit completed subtasks whose details are no longer needed.
+- Do NOT reproduce raw tool outputs, file contents, or command results verbatim.
+  Describe outcomes in one line ("file X created", "test Y passed", etc.).
+- Drop any context that would shift focus away from the active task.
 
 Format your response in Markdown with these sections:
 
-## Goal
-What the user is trying to accomplish.
+## Current Task
+What the user is actively working on right now. One or two sentences maximum.
 
-## Constraints
-Any constraints, preferences, or requirements mentioned.
+## Key Constraints
+Hard requirements or preferences that must be respected going forward. Omit if none.
 
-## Progress
-### Done
-What has been completed.
+## In Progress
+The specific step currently being worked on, and any immediate blockers.
 
-### In Progress
-What is currently being worked on.
-
-### Blocked
-Any blockers or issues encountered.
-
-## Key Decisions
-Important decisions made and their rationale.
+## Completed (relevant only)
+Only completed steps whose outcomes are still needed to continue. Skip the rest.
 
 ## Next Steps
 The immediate next actions to take.
 
-## Critical Context
-Any other context that would be essential to continue the work.
-
 ## Relevant Files
-List of files that have been created, modified, or are important to the task.`
+Only files that will likely be touched in the next steps.`
 
 // Compaction constants, aligned with packages/opencode/src/session/compaction.ts.
 // PruneMinimum and PruneProtect are defined in llm package; use llm.PruneMinimum / llm.PruneProtect.
@@ -307,13 +305,44 @@ func (c *Compactor) Compact(ctx context.Context, sessionID string, input Process
 		return "", fmt.Errorf("compaction: nothing to summarise")
 	}
 
-	// Build model messages for the head (with stripped media + truncated tool output)
+	// Build model messages for the head (with stripped media + truncated tool output).
+	// StripSummaryPair removes the previous boundary+summary pair from the head —
+	// the summary text is injected into the system prompt below instead.
+	// StripToolResults replaces tool result content with a placeholder so the
+	// summary LLM focuses on the semantic conversation rather than raw outputs.
 	headMsgs, err := ToModelMessagesWithOptions(sel.Head, allParts, ToModelOptions{
-		StripMedia:          true,
-		ToolOutputMaxChars:  llm.ToolOutputMaxCharsCompaction,
+		StripMedia:         true,
+		ToolOutputMaxChars: llm.ToolOutputMaxCharsCompaction,
+		StripToolResults:   true,
+		StripSummaryPair:   true,
 	})
 	if err != nil {
 		return "", fmt.Errorf("compaction: build head messages: %w", err)
+	}
+
+	// If a previous compaction round exists, extract its summary text and inject
+	// it into the system prompt so the summary LLM can update it incrementally
+	// rather than re-summarising it from scratch.
+	summarySystem := []string{"You are a helpful assistant that summarises conversation history concisely and accurately."}
+	for _, m := range sel.Head {
+		if !m.Summary {
+			continue
+		}
+		var sb strings.Builder
+		for _, p := range allParts[m.ID] {
+			if p.Type == store.PartTypeText {
+				if d, ok := store.DataAs[*store.TextPartData](p); ok {
+					sb.WriteString(d.Text)
+				}
+			}
+		}
+		if text := strings.TrimSpace(sb.String()); text != "" {
+			summarySystem = append(summarySystem,
+				"Below is the summary from the previous compaction round. "+
+					"Use it as a reference, but feel free to drop sections that are no longer relevant to the current task. "+
+					"The new summary should be more focused, not a superset of the old one:\n\n"+text)
+		}
+		break
 	}
 
 	now := time.Now()
@@ -366,7 +395,7 @@ func (c *Compactor) Compact(ctx context.Context, sessionID string, input Process
 	summaryInput := ProcessInput{
 		SessionID: sessionID,
 		Model:     summaryModel,
-		System:    []string{"You are a helpful assistant that summarises conversation history concisely and accurately."},
+		System:    summarySystem,
 		Messages:  append(headMsgs, llm.NewUserMessage(SummaryTemplate)),
 		Tools:     nil,
 		Provider:  summaryProvider,
@@ -535,6 +564,8 @@ func buildRecentContextExcerpt(msgs []*store.Message, allParts map[string][]*sto
 type ToModelOptions struct {
 	StripMedia         bool
 	ToolOutputMaxChars int
+	StripToolResults   bool // compact path: replace tool result content with a placeholder
+	StripSummaryPair   bool // compact path: skip the previous round's boundary+summary message pair
 }
 
 // ToModelMessagesWithOptions is like ToModelMessages but with compaction options.
@@ -548,6 +579,11 @@ func ToModelMessagesWithOptions(msgs []*store.Message, parts map[string][]*store
 		ps := parts[m.ID]
 		switch m.Role {
 		case store.RoleUser:
+			// StripSummaryPair: skip the previous compaction boundary user message —
+			// the previous summary text is injected into the system prompt instead.
+			if opts.StripSummaryPair && hasPartType(ps, store.PartTypeCompaction) {
+				continue
+			}
 			userParts := buildUserParts(ps, opts)
 			if len(userParts) == 0 {
 				continue
@@ -562,6 +598,11 @@ func ToModelMessagesWithOptions(msgs []*store.Message, parts map[string][]*store
 			out = append(out, llm.Message{Role: llm.RoleUser, Content: userParts})
 
 		case store.RoleAssistant:
+			// StripSummaryPair: skip the previous round's summary assistant message —
+			// its text is injected into the system prompt by Compact() instead.
+			if opts.StripSummaryPair && m.Summary {
+				continue
+			}
 			// Cancelled: no content; skip entirely (consecutive-user guard above handles gap).
 			if m.Status == store.MessageStatusCancelled {
 				continue
@@ -632,7 +673,9 @@ func buildAssistantPartsWithOpts(m *store.Message, ps []*store.Part, opts ToMode
 			assistantParts = append(assistantParts, llm.NewToolCallPart(d.CallID, d.Tool, inputMap))
 
 			output := d.Output
-			if d.Compacted > 0 {
+			if opts.StripToolResults {
+				output = "[tool result omitted]"
+			} else if d.Compacted > 0 {
 				output = "[Old tool result content cleared]"
 			} else if opts.ToolOutputMaxChars > 0 && len(output) > opts.ToolOutputMaxChars {
 				output = output[:opts.ToolOutputMaxChars] + fmt.Sprintf("\n...[truncated to %d chars]", opts.ToolOutputMaxChars)

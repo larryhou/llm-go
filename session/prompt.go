@@ -503,7 +503,9 @@ func runLoopInternal(ctx context.Context, s store.Store, input RunInput, h *RunH
 			}
 
 			if assistantPartsSnapshot != nil {
-				// Path A: predictive overflow (EventStepFinish). Normal compact + stop.
+				// Path A: predictive overflow (EventStepFinish). Compact then continue
+				// with a synthetic user message so the LLM resumes the current task
+				// transparently without waiting for the next real user message.
 				log.Printf("[session] compact triggered (predictive): input=%d", lastInputTokens)
 				_, err := compactor.Compact(ctx, input.SessionID, ProcessInput{
 					SessionID:       input.SessionID,
@@ -517,16 +519,44 @@ func runLoopInternal(ctx context.Context, s store.Store, input RunInput, h *RunH
 					log.Printf("[session] compact failed: %v", err)
 					return RunResultStop, fmt.Errorf("runloop: compaction failed: %w", err)
 				}
-				log.Printf("[session] compact done")
-				// Compaction is a save-point: the current turn is complete.
-				// The tail (preserved verbatim in context) already contains the
-				// tool results from the step that triggered overflow. Continuing
-				// the loop here would send a request with the summary assistant
-				// message as the last message — no new user turn — which causes
-				// proxies and the Anthropic API to return an empty response
-				// (usage=0). Stop and let the next user message continue naturally.
-				h.closeStoreDone()
-				return RunResultStop, nil
+				log.Printf("[session] compact done (predictive), injecting resume message")
+
+				// Write a synthetic user message so the next loop iteration has a
+				// valid user turn to send to the LLM. Without this the last message
+				// in the context would be the summary assistant message, which causes
+				// Anthropic/proxy to return an empty response (usage=0).
+				resumeMsgID := newID()
+				resumeNow := time.Now()
+				if createErr := s.CreateMessage(ctx, &store.Message{
+					ID:        resumeMsgID,
+					SessionID: input.SessionID,
+					Role:      store.RoleUser,
+					CreatedAt: resumeNow,
+					UpdatedAt: resumeNow,
+				}); createErr != nil {
+					log.Printf("[session] compact resume: failed to create synthetic user message: %v", createErr)
+				} else {
+					_ = s.CreatePart(ctx, &store.Part{
+						ID:        newID(),
+						MessageID: resumeMsgID,
+						SessionID: input.SessionID,
+						Type:      store.PartTypeText,
+						CreatedAt: resumeNow,
+						UpdatedAt: resumeNow,
+						Data: &store.TextPartData{
+							Text:      PromptPostCompact,
+							TimeStart: resumeNow.UnixMilli(),
+							TimeEnd:   resumeNow.UnixMilli(),
+						},
+					})
+				}
+
+				// Reload message cache after compaction + synthetic message.
+				msgs, allParts, err = loadMessages(ctx, s, input.SessionID)
+				if err != nil {
+					return RunResultStop, fmt.Errorf("runloop: reload after predictive compact: %w", err)
+				}
+				continue
 			}
 
 			// Path B: reactive overflow (EventError). Run compact then retry.
@@ -550,10 +580,48 @@ func runLoopInternal(ctx context.Context, s store.Store, input RunInput, h *RunH
 				return RunResultStop, fmt.Errorf("runloop: reload after too-long compact: %w", err)
 			}
 
+			// Inject a synthetic user message explaining why the request failed so
+			// the LLM can adjust its approach (e.g. use more targeted tool parameters
+			// or break the task into smaller steps) instead of retrying blindly.
+			notifyNow := time.Now()
+			notifyMsgID := newID()
+			if createErr := s.CreateMessage(ctx, &store.Message{
+				ID:        notifyMsgID,
+				SessionID: input.SessionID,
+				Role:      store.RoleUser,
+				CreatedAt: notifyNow,
+				UpdatedAt: notifyNow,
+			}); createErr != nil {
+				log.Printf("[session] too-long: failed to create context-too-large notice: %v", createErr)
+			} else {
+				_ = s.CreatePart(ctx, &store.Part{
+					ID:        newID(),
+					MessageID: notifyMsgID,
+					SessionID: input.SessionID,
+					Type:      store.PartTypeText,
+					CreatedAt: notifyNow,
+					UpdatedAt: notifyNow,
+					Data: &store.TextPartData{
+						Text:      PromptContextTooLarge,
+						TimeStart: notifyNow.UnixMilli(),
+						TimeEnd:   notifyNow.UnixMilli(),
+					},
+				})
+				// Add to in-memory cache so the next FilterCompacted sees it.
+				msgs = append(msgs, &store.Message{
+					ID:        notifyMsgID,
+					SessionID: input.SessionID,
+					Role:      store.RoleUser,
+					CreatedAt: notifyNow,
+					UpdatedAt: notifyNow,
+				})
+				allParts[notifyMsgID] = nil
+			}
+
 			// Mark that the next iteration is a post-compact retry so that if it
 			// also overflows we know to enter B.3 instead of looping back to B.1.
 			postCompactRetry = true
-			log.Printf("[session] too-long: retrying after compact")
+			log.Printf("[session] too-long: retrying after compact with context-too-large notice")
 			continue
 
 		case ProcessContinue:

@@ -39,6 +39,19 @@ var PromptMaxSteps string
 //go:embed knowledge-recall.txt
 var PromptKnowledgeRecall string
 
+// PromptPostCompact is injected as a synthetic user message after a predictive
+// (Path A) compaction so the loop can continue without waiting for a real user
+// message. It instructs the LLM to resume the current task transparently.
+const PromptPostCompact = "Context was compacted. Please continue with the current task."
+
+// PromptContextTooLarge is injected as a synthetic user message after a
+// reactive (Path B) compaction when the request was rejected because the
+// context was too large. It tells the LLM the likely cause (oversized tool
+// result) so it can adjust its approach rather than retrying blindly.
+const PromptContextTooLarge = "The previous request was rejected because the context was too large. " +
+	"This is most likely caused by a tool result that was too large. " +
+	"Please adjust your approach: use more targeted parameters, request smaller results, or break the task into smaller steps."
+
 // SystemPromptForModel returns the appropriate system prompt for a given model.
 // Aligned with packages/opencode/src/session/system.ts provider().
 //
