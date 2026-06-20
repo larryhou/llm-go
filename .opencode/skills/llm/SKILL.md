@@ -93,8 +93,8 @@ sequenceDiagram
 
 Compaction is triggered by two distinct paths:
 
-- **Path A — Predictive** (`EventStepFinish → IsOverflow`): the LLM completed a step and reported `usage.Input ≥ Usable`. The assistant message has content (text / tool calls). RunLoop runs `Compact()` and stops (`RunResultStop`); the next user message continues from the compacted state.
-- **Path B — Reactive** (`EventError → IsContextOverflow`): the provider rejected the request outright (HTTP 400/413). The assistant message is empty. RunLoop enters the **reactive overflow fallback** (see below) instead of stopping immediately.
+- **Path A — Predictive** (`EventStepFinish → IsOverflow`): the LLM completed a step and reported `usage.Input ≥ Usable`. The assistant message has content (text / tool calls). RunLoop runs `Compact()`, then injects a synthetic user message (`PromptPostCompact`) and continues the loop so the LLM resumes the current task transparently — no `RunResultStop`.
+- **Path B — Reactive** (`EventError → IsContextOverflow`): the provider rejected the request outright (HTTP 400/413). The assistant message is empty. RunLoop runs `Compact()`, injects a synthetic user message (`PromptContextTooLarge`) explaining the cause, then retries. See **reactive overflow fallback** below.
 
 ```mermaid
 flowchart TD
@@ -104,10 +104,10 @@ flowchart TD
     IsOverflow -- Yes --> ProcessCompact["ProcessCompact\n→ RunLoop ProcessCompact case"]
 
     ProcessCompact --> HasParts{"assistantPartsSnapshot\nnot empty?"}
-    HasParts -- Yes --> PathA["Path A: predictive\nCompact() + RunResultStop"]
+    HasParts -- Yes --> PathA["Path A: predictive\nCompact() + inject PromptPostCompact\n+ continue loop"]
     HasParts -- No --> PathB["Path B: reactive\ntoo-long fallback"]
 
-    PathB --> B1["B.1 Compact() — head→summary, tail preserved\nreload msgs/allParts"]
+    PathB --> B1["B.1 Compact() — head→summary, tail preserved\nreload msgs/allParts\ninject PromptContextTooLarge user msg"]
     B1 --> B2["B.2 Retry LLM with compacted context\npostCompactRetry = true"]
     B2 --> B2OK{"Success?"}
     B2OK -- Yes --> Continue2["continue loop normally"]
@@ -126,9 +126,9 @@ flowchart TD
 
     Select --> NothingToSummarise{"Head empty?\n(msgs itself empty)"}
     NothingToSummarise -- Yes --> CompactFail["Compact() returns error\nRunLoop returns error"]
-    NothingToSummarise -- No --> BuildHead["Build head messages\nstripMedia=true\ntoolOutputMaxChars=2000"]
+    NothingToSummarise -- No --> BuildHead["Build head messages\nStripMedia=true, StripToolResults=true\nStripSummaryPair=true\ntoolOutputMaxChars=2000"]
 
-    BuildHead --> SummaryLLM["LLM call (summaryModel)\ncontext=200000, output=8192\nSummaryTemplate prompt"]
+    BuildHead --> SummaryLLM["LLM call (summaryModel)\ncontext=200000, output=8192\nSummaryTemplate prompt\n+ prev summary injected into system (if exists)"]
     SummaryLLM --> SummaryMsg["store.Message\nsummary=true"]
 
     Select --> Tail["Tail messages (TailStartID != '')\n~25% of Usable\nmin 2000 / max 8000 tokens\n≥ 1 user turn always kept\nOR empty tail when all msgs summarised"]
@@ -153,8 +153,8 @@ flowchart TD
 **Step-by-step:**
 
 1. **Discard** the empty assistant placeholder (`DeleteMessagesByIDs`, remove from `msgs`/`allParts` cache).
-2. **B.1** Run normal `Compact()` (head→summary, tail preserved). Reload `msgs`/`allParts`.
-3. **B.2** Set `postCompactRetry = true`, `continue` loop → retry the LLM with `[boundary][summary][tail][user_msg]`.
+2. **B.1** Run normal `Compact()` (head→summary, tail preserved). Reload `msgs`/`allParts`. Inject a synthetic user message (`PromptContextTooLarge`) so the LLM knows the request was rejected due to context size and can adjust its approach.
+3. **B.2** Set `postCompactRetry = true`, `continue` loop → retry the LLM with `[boundary][summary][tail][user_msg][context-too-large notice]`.
 4. **If B.2 succeeds** → `ProcessContinue`/`ProcessStop` resets `postCompactRetry = false`, `tooLongRetries = 0`, proceeds normally.
 5. **If B.2 also overflows** (`postCompactRetry == true` on the next `ProcessCompact`):
    - Reset `postCompactRetry = false`.
@@ -299,22 +299,62 @@ Excerpt format (rendered by `buildRecentContextExcerpt`):
 
 After writing the part, `Compact()` calls `store.GetMessage` + `store.UpdateMessage` to set `boundary.Tokens.Input = len(excerpt)/4` — preventing `estimateTurnTokens` from under-counting the boundary message on the next compaction round (fallback is 500 for user messages, 300 for others).
 
-#### `buildUserParts` and `StripMedia` (`session/context.go`)
+#### `buildUserParts`, `StripMedia`, and compaction-specific options (`session/context.go`, `session/compaction.go`)
 
-`buildUserParts` now accepts a `ToModelOptions` parameter:
+`buildUserParts` accepts a `ToModelOptions` parameter:
 
 ```go
 func buildUserParts(ps []*store.Part, opts ToModelOptions) []llm.ContentPart
 ```
 
-When `opts.StripMedia = true` (used in the summary generation path), `PartTypeRecentContext` parts are skipped. This prevents the previous round's verbatim excerpt from being fed into the summary LLM on subsequent compactions, where it would add token cost and semantic noise.
+`ToModelOptions` controls how messages are rendered when building the head for the summary LLM:
+
+```go
+type ToModelOptions struct {
+    StripMedia         bool // strip PartTypeRecentContext and PartTypeReasoning
+    ToolOutputMaxChars int  // truncate tool output to N chars
+    StripToolResults   bool // replace tool result content with "[tool result omitted]"
+    StripSummaryPair   bool // skip previous boundary+summary message pair
+}
+```
+
+| Option | Effect |
+|--------|--------|
+| `StripMedia` | Skips `PartTypeRecentContext` in user messages and `PartTypeReasoning` in assistant messages |
+| `ToolOutputMaxChars` | Truncates tool output to N chars + `"...[truncated to N chars]"` suffix |
+| `StripToolResults` | Replaces tool result content with `"[tool result omitted]"` — summary LLM only sees which tools were called, not their raw output |
+| `StripSummaryPair` | Skips the previous compaction boundary user message (rendered as `"What did we do so far?"`) and the `Summary=true` assistant message — the prior summary text is injected into the system prompt instead |
+
+All four options are set to `true` / non-zero when building the head for the summary LLM call in `Compact()`:
+
+```go
+headMsgs, err := ToModelMessagesWithOptions(sel.Head, allParts, ToModelOptions{
+    StripMedia:         true,
+    ToolOutputMaxChars: llm.ToolOutputMaxCharsCompaction,
+    StripToolResults:   true,
+    StripSummaryPair:   true,
+})
+```
+
+**Previous summary injection into system prompt:**
+
+When `StripSummaryPair=true` removes the prior summary from the head, `Compact()` extracts its text and appends it to `summarySystem` with an instruction to update rather than accumulate:
+
+```go
+summarySystem = append(summarySystem,
+    "Below is the summary from the previous compaction round. "+
+    "Use it as a reference, but feel free to drop sections that are no longer relevant "+
+    "to the current task. The new summary should be more focused, not a superset of the old one:\n\n"+text)
+```
+
+This ensures multi-round compaction converges toward a focused current-task summary rather than growing with every round.
 
 | Call site | opts passed |
 |-----------|-------------|
-| `ToModelMessages` (normal RunLoop path) | `ToModelOptions{}` — excerpt rendered |
-| `ToModelMessagesWithOptions` (summary generation) | caller's opts — `StripMedia:true` strips excerpt |
+| `ToModelMessages` (normal RunLoop path) | `ToModelOptions{}` — all options false/zero |
+| `ToModelMessagesWithOptions` (summary generation) | `StripMedia:true, ToolOutputMaxChars:2000, StripToolResults:true, StripSummaryPair:true` |
 
-**Post-compaction context seen by LLM:**
+**Post-compaction context seen by LLM (normal RunLoop path):**
 ```
 [boundary user msg]
   "What did we do so far?"
@@ -322,7 +362,7 @@ When `opts.StripMedia = true` (used in the summary generation path), `PartTypeRe
   以下是压缩前最近的对话原文：
   **[用户]** <verbatim user turn N-1>  ← last turn of head (RecentHead excerpt)
   **[助手]** - 调用工具: X → ...
-[summary assistant msg: high-level summary]
+[summary assistant msg: focused current-task summary]
 [tail turn B verbatim]    ← spliced back by FilterCompacted via TailStartID
 [tail turn C verbatim]    ← spliced back by FilterCompacted via TailStartID
 [new messages after compaction...]
@@ -342,12 +382,13 @@ new messages (rowid M+3...)
 out = [boundary, summary, tail..., post-boundary new msgs]
 ```
 
-**Summary LLM input (StripMedia strips the excerpt):**
+**Summary LLM input (StripSummaryPair + StripToolResults + StripMedia applied):**
 ```
-[boundary msg] "What did we do so far?"   ← excerpt stripped
-[previous summary] ...
-[head turn A] ...
-[head turn B] ...
+SYSTEM: "You are a helpful assistant..."
+SYSTEM: "Below is the summary from the previous compaction round..." (round ≥ 2 only)
+
+[head turn A]  ← boundary+summary stripped; tool results → "[tool result omitted]"
+[head turn B]
 [SummaryTemplate prompt]
 ```
 
@@ -405,6 +446,17 @@ if isLastStep {
 `session.PromptMaxSteps` is exported from `session/system.go` (embedded from `session/max-steps.txt`).
 
 **Why user message, not assistant prefill:** opencode's TypeScript implementation uses an assistant prefill here, but Anthropic's Messages API does not support assistant prefill in the standard route — it silently returns an empty response (`usage=0`, no text). Using a user message achieves the same effect and works across all providers. This was diagnosed via ndjson replay: the offending step showed `step-finish(stop, usage=0)` with no `text-delta`, and the request had `role=assistant` as the last message.
+
+#### Post-compact synthetic user messages (`session/system.go`)
+
+Two constants are injected as synthetic user messages after compaction to keep the loop running without a real user turn:
+
+| Constant | Injected when | Text |
+|----------|--------------|------|
+| `PromptPostCompact` | Path A (predictive) — after `Compact()` succeeds | `"Context was compacted. Please continue with the current task."` |
+| `PromptContextTooLarge` | Path B (reactive) — after `Compact()` before retry | `"The previous request was rejected because the context was too large. This is most likely caused by a tool result that was too large. Please adjust your approach: use more targeted parameters, request smaller results, or break the task into smaller steps."` |
+
+Both messages are written to the store as real `RoleUser` messages and included in the next `ToModelMessages` call. `PromptPostCompact` gives the LLM a valid user turn to respond to after Path A compaction (without it, the last message would be the summary assistant message, causing Anthropic/proxy to return an empty response). `PromptContextTooLarge` informs the LLM of the root cause so it can adjust its approach instead of retrying blindly.
 
 ---
 
