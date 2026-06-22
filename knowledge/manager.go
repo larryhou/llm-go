@@ -161,19 +161,18 @@ func (m *Manager) fetch(ctx context.Context, q Query) ([]Result, error) {
 				return m.truncateContent(results), nil
 			}
 		}
+		// sourceID prefix present but no registered source matched —
+		// return a clear error instead of silently falling back to an
+		// unrelated source, which would produce a confusing result.
+		return nil, fmt.Errorf("knowledge: source %q not available for ref_id %q", sourceID, q.Input)
 	}
 
-	// Fallback: first accepting source.
-	// Strip sourceID prefix if present but unmatched so Accepts receives clean input.
-	fallbackQ := q
-	if hasPfx {
-		fallbackQ.Input = internalKey
-	}
+	// Fallback: first accepting source (only reached when no "sourceID:" prefix).
 	for _, s := range sources {
-		if !s.Accepts(fallbackQ) {
+		if !s.Accepts(q) {
 			continue
 		}
-		results, err := m.callSource(ctx, s, fallbackQ, false)
+		results, err := m.callSource(ctx, s, q, false)
 		if err != nil {
 			return nil, err
 		}
