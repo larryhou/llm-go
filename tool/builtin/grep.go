@@ -14,8 +14,9 @@ import (
 )
 
 const (
-	grepMaxResults  = 100
-	grepMaxLineLen  = 2000
+	grepMaxResults = 50
+	grepMaxBytes   = 20 * 1024 // 20 KB hard cap on total output (~5000 tokens)
+	grepMaxLineLen = 2000
 )
 
 // GrepTool searches file contents using regular expressions via ripgrep.
@@ -144,6 +145,22 @@ func (t *GrepTool) Execute(ctx context.Context, input map[string]any) (tool.Resu
 		final = matches[:grepMaxResults]
 	}
 
+	// Also enforce a byte cap: drop trailing matches that would push the
+	// rendered output over grepMaxBytes.
+	bytesCapped := false
+	if !truncated {
+		totalBytes := 0
+		for i, m := range final {
+			totalBytes += len(m.file) + len(m.text) + 20 // approx per-line overhead
+			if totalBytes > grepMaxBytes {
+				final = final[:i]
+				truncated = true
+				bytesCapped = true
+				break
+			}
+		}
+	}
+
 	// Fetch mtime per unique file.
 	mtimes := make(map[string]int64)
 	var mtimeMu sync.Mutex
@@ -198,10 +215,17 @@ func (t *GrepTool) Execute(ctx context.Context, input map[string]any) (tool.Resu
 
 	if truncated {
 		lines = append(lines, "")
-		lines = append(lines, fmt.Sprintf(
-			"(Results truncated: showing %d of %d matches (%d hidden). Consider using a more specific path or pattern.)",
-			grepMaxResults, total, total-grepMaxResults,
-		))
+		if bytesCapped {
+			lines = append(lines, fmt.Sprintf(
+				"(Results truncated: output exceeded %d KB limit (showing %d of %d matches). Consider using a more specific path or pattern.)",
+				grepMaxBytes/1024, len(final), total,
+			))
+		} else {
+			lines = append(lines, fmt.Sprintf(
+				"(Results truncated: showing %d of %d matches (%d hidden). Consider using a more specific path or pattern.)",
+				grepMaxResults, total, total-grepMaxResults,
+			))
+		}
 	}
 
 	return tool.Result{

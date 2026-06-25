@@ -15,8 +15,8 @@ import (
 
 const (
 	shellDefaultTimeout = 120 * time.Second
-	shellMaxBytes       = 100 * 1024 // 100 KB tail buffer
-	shellMaxLines       = 2000
+	shellMaxBytes       = 20 * 1024 // 20 KB tail buffer (~5000 tokens)
+	shellMaxLines       = 500
 )
 
 // ShellTool executes shell commands (bash on Unix/macOS, cmd/powershell on Windows).

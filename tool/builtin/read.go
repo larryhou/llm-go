@@ -16,10 +16,10 @@ import (
 )
 
 const (
-	readDefaultLimit  = 2000      // lines
-	readMaxBytes      = 50 * 1024 // 50 KB hard cap per call
+	readDefaultLimit  = 500       // lines
+	readMaxBytes      = 20 * 1024 // 20 KB hard cap per call (~5000 tokens)
 	readMaxLineLen    = 2000      // chars per line before truncation
-	readMaxBytesLabel = "50 KB"
+	readMaxBytesLabel = "20 KB"
 )
 
 var readMaxLineSuffix = fmt.Sprintf("... (line truncated to %d chars)", readMaxLineLen)

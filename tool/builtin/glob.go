@@ -15,7 +15,7 @@ import (
 	"github.com/larryhou/llm-go/tool"
 )
 
-const globLimit = 100
+const globLimit = 50
 
 // GlobTool finds files matching a glob pattern, sorted by modification time.
 // Aligned with packages/opencode/src/tool/glob.ts.
@@ -82,22 +82,19 @@ func (t *GlobTool) Execute(ctx context.Context, input map[string]any) (tool.Resu
 		return tool.Result{}, tool.Fail(fmt.Sprintf("glob path must be a directory: %s", searchPath))
 	}
 
-	// Collect up to limit+1 paths so we can detect truncation.
+	// Collect all matching paths (no early cap) so we can write the full list
+	// to a file when truncation is needed.
 	var rawPaths []string
 	if rgPath, err2 := exec.LookPath("rg"); err2 == nil {
-		rawPaths, err = runRgGlob(ctx, rgPath, searchPath, pattern, globLimit+1)
+		rawPaths, err = runRgGlob(ctx, rgPath, searchPath, pattern, 0)
 	} else {
-		rawPaths, err = walkGlob(searchPath, pattern, globLimit+1)
+		rawPaths, err = walkGlob(searchPath, pattern, 0)
 	}
 	if err != nil {
 		return tool.Result{}, tool.Fail(fmt.Sprintf("glob failed: %v", err))
 	}
 
-	truncated := false
-	if len(rawPaths) > globLimit {
-		rawPaths = rawPaths[:globLimit]
-		truncated = true
-	}
+	truncated := len(rawPaths) > globLimit
 
 	// Enrich with mtime and sort by most-recently-modified (descending).
 	type entry struct {
@@ -131,32 +128,44 @@ func (t *GlobTool) Execute(ctx context.Context, input map[string]any) (tool.Resu
 
 	// Build output — mirrors opencode glob.ts output assembly.
 	var lines []string
+	displayed := entries
+	var outputPath string
 	if len(entries) == 0 {
 		lines = append(lines, "No files found")
+	} else if truncated {
+		// Write full path list to a temp file; return only the first globLimit
+		// entries plus a hint so the LLM can explore via read/grep.
+		var sb strings.Builder
+		for _, e := range entries {
+			sb.WriteString(e.path)
+			sb.WriteByte('\n')
+		}
+		outputPath = tool.WriteTruncFile("glob", sb.String())
+		displayed = entries[:globLimit]
+		for _, e := range displayed {
+			lines = append(lines, e.path)
+		}
+		lines = append(lines, "")
+		lines = append(lines, tool.BuildTruncHint(outputPath, len(entries), sb.Len()))
 	} else {
 		for _, e := range entries {
 			lines = append(lines, e.path)
 		}
-		if truncated {
-			lines = append(lines, "")
-			lines = append(lines, fmt.Sprintf(
-				"(Results are truncated: showing first %d results. Consider using a more specific path or pattern.)",
-				globLimit,
-			))
-		}
 	}
 
 	return tool.Result{
-		Output: strings.Join(lines, "\n"),
+		Output:     strings.Join(lines, "\n"),
+		Truncated:  truncated,
+		OutputPath: outputPath,
 		Metadata: map[string]any{
-			"count":     len(entries),
+			"count":     len(displayed),
 			"truncated": truncated,
 		},
 	}, nil
 }
 
 // runRgGlob uses ripgrep's file-listing mode to match glob patterns.
-// Collects at most maxResults paths.
+// If maxResults <= 0, all matching paths are collected.
 func runRgGlob(ctx context.Context, rgPath, dir, pattern string, maxResults int) ([]string, error) {
 	cmd := exec.CommandContext(ctx, rgPath, "--files", "--glob", pattern, dir)
 	out, err := cmd.Output()
@@ -171,7 +180,7 @@ func runRgGlob(ctx context.Context, rgPath, dir, pattern string, maxResults int)
 	for _, line := range strings.Split(strings.TrimRight(string(out), "\n"), "\n") {
 		if line != "" {
 			paths = append(paths, line)
-			if len(paths) >= maxResults {
+			if maxResults > 0 && len(paths) >= maxResults {
 				break
 			}
 		}
@@ -180,6 +189,7 @@ func runRgGlob(ctx context.Context, rgPath, dir, pattern string, maxResults int)
 }
 
 // walkGlob is a pure-Go fallback when ripgrep is not available.
+// If maxResults <= 0, all matching paths are collected.
 func walkGlob(root, pattern string, maxResults int) ([]string, error) {
 	var paths []string
 	err := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
@@ -199,7 +209,7 @@ func walkGlob(root, pattern string, maxResults int) ([]string, error) {
 		}
 		if matched {
 			paths = append(paths, path)
-			if len(paths) >= maxResults {
+			if maxResults > 0 && len(paths) >= maxResults {
 				return filepath.SkipAll
 			}
 		}

@@ -101,19 +101,23 @@ func (d *DelegateTool) Name() string { return "delegate_task" }
 
 // Description explains to the LLM when and how to use this tool.
 func (d *DelegateTool) Description() string {
-	return `Delegate a complex, multi-step task to a dedicated sub-agent that runs in its own isolated session.
+	return `Delegate a self-contained task to a dedicated sub-agent running in its own isolated session.
 
-Use this tool when:
-- A task requires many sequential tool calls (research, data gathering, multi-file analysis)
-- You want to keep the current conversation context clean and focused
-- The task has a clear, self-contained goal with a definite conclusion
+STRONGLY RECOMMENDED whenever a task is:
+- Independent — it does not need back-and-forth with the current conversation to proceed
+- Uncertain in scope — you are not sure how many steps, files, or tool calls it will take
 
-The sub-agent has access to all the same tools as you (except delegate_task itself).
-It will autonomously execute the task and return a concise summary of its findings.
-You do NOT see the sub-agent's intermediate steps — only the final conclusion.
+When in doubt, delegate. It is always safer to delegate a task that turns out to be
+simple than to attempt a complex task inline and pollute the current context.
 
-Prefer a specific, actionable goal description. Include any relevant context the
-sub-agent needs to complete the task without further questions.`
+Do NOT delegate when:
+- The task requires information that only exists in the current conversation context
+- The task is a single, obviously bounded action (one tool call)
+
+The sub-agent has access to all the same tools (except delegate_task itself).
+It runs autonomously and returns a concise summary — you will NOT see its intermediate steps.
+
+Provide a specific goal and include all context the sub-agent needs to work independently.`
 }
 
 // InputSchema defines the JSON schema for the tool's input parameters.

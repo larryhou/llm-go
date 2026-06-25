@@ -11,8 +11,8 @@ import (
 
 // Truncate constants, aligned with packages/opencode/src/tool/truncate.ts.
 const (
-	DefaultMaxLines = 2000
-	DefaultMaxBytes = 50 * 1024 // 51,200 bytes
+	DefaultMaxLines = 500
+	DefaultMaxBytes = 20 * 1024 // 20,480 bytes (~5000 tokens, ~4% of 128K context)
 	TruncationDir   = "" // placeholder; actual temp dir is set in truncDir via init()
 	RetentionDays   = 7
 )
