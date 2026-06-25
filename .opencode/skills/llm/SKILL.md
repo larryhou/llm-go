@@ -502,17 +502,19 @@ After `Prune()`, when `ToModelMessages()` builds the next request, any part with
 
 instead of the original output. The tool call itself (name + input) is preserved in the assistant message — only the result content is replaced.
 
-#### Prune vs Compact comparison
+#### Prune vs Compact vs OmitConsumedTools comparison
 
-| | Prune | Compact |
-|---|---|---|
-| Trigger | manual / future strategy | `IsOverflow()` or provider overflow error |
-| Currently called | yes, synchronous in `RunLoopAsync` goroutine (10s timeout) | yes, via `RunLoop` → `Compactor.Compact()` |
-| Message count | unchanged | large reduction (head → 1 summary message) |
-| History structure | intact | head replaced by summary + compaction boundary |
-| input token drop | small (tool outputs only) | large |
-| LLM call required | no | yes (summary generation) |
-| Crosses summary boundary | no (stops at summary) | creates new summary |
+| | Prune | Compact | OmitConsumedTools |
+|---|---|---|---|
+| Trigger | manual / future strategy | `IsOverflow()` or provider overflow error | per-turn, opt-in via `RunInput.OmitConsumedTools` |
+| Currently called | yes, synchronous in `RunLoopAsync` goroutine (10s timeout) | yes, via `RunLoop` → `Compactor.Compact()` | yes, when `OmitConsumedTools == true` |
+| Message count | unchanged | large reduction (head → 1 summary message) | unchanged |
+| History structure | intact | head replaced by summary + compaction boundary | intact |
+| input token drop | small (tool outputs only) | large | medium (all consumed tool outputs) |
+| LLM call required | no | yes (summary generation) | no |
+| Crosses summary boundary | no (stops at summary) | creates new summary | no |
+| Marker field | `ToolPartData.Compacted` | creates new boundary message | `ToolPartData.Omitted` |
+| Placeholder text | `[Old tool result content cleared]` | — | `[Tool result omitted]` |
 
 ---
 
@@ -782,6 +784,23 @@ stateDiagram-v2
     running --> error : session aborted (Interrupted=true)
     completed --> [*]
     error --> [*]
+```
+
+`ToolPartData` fields relevant to context management:
+
+| Field | Type | Meaning |
+|---|---|---|
+| `Compacted` | `int64` | Unix ms when output was pruned by `Prune()`; 0 = keep. Renders as `[Old tool result content cleared]` |
+| `Omitted` | `int64` | Unix ms when output was omitted after LLM consumed it (OmitConsumedTools); 0 = keep. Renders as `[Tool result omitted]` |
+| `Interrupted` | `bool` | Tool goroutine was cancelled mid-run; unrelated to context pruning |
+
+Priority chain in `buildToolResult` / `buildAssistantPartsWithOpts`:
+```
+StripToolResults (compaction head)  → "[Tool result omitted]"
+Omitted > 0                         → "[Tool result omitted]"
+Compacted > 0                       → "[Old tool result content cleared]"
+ToolOutputMaxChars exceeded         → output[:N] + "...[truncated to N chars]"
+(default)                           → d.Output verbatim
 ```
 
 ### Anthropic extended thinking — signature lifecycle
@@ -1175,6 +1194,38 @@ session.RunLoop(ctx, s, session.RunInput{
     ...
 })
 ```
+
+### OmitConsumedTools — per-turn tool result eviction
+
+`RunInput.OmitConsumedTools bool` (default `false`) reduces context size by replacing each completed tool result with `"[Tool result omitted]"` after the LLM has consumed it.
+
+**Two eviction triggers inside `runLoopInternal`:**
+
+1. **Start-of-run sweep** (`omitHistoricalToolResults`): called once after `loadMessages`, before the first loop iteration. Iterates all historical assistant messages and omits completed tool results from every message **except the most recent non-summary assistant message** (whose tool results may not yet have been seen by a subsequent LLM step).
+
+2. **Per-step eviction** (`omitConsumedToolResults`): called after each `Process()` returns successfully, targeting `previousAssistantMsgID` (the step that just had its results consumed). `previousAssistantMsgID` is reset to `""` inside `ProcessCompact` to avoid operating on a deleted message.
+
+Both call the shared helper `omitPartsInMessage`, which skips parts that are already `Omitted > 0` or `Compacted > 0`.
+
+**Enabling via `agent.Client`:**
+
+```go
+client, _ := agent.New(agent.Config{
+    OmitConsumedTools: true,
+    // ... other fields ...
+})
+```
+
+**Enabling via direct `RunInput`:**
+
+```go
+session.RunLoop(ctx, s, session.RunInput{
+    OmitConsumedTools: true,
+    // ... other fields ...
+})
+```
+
+**Interaction with compaction:** `OmitConsumedTools` and `Prune` are independent. Both can be enabled simultaneously. `Prune` operates on `Compacted`; `OmitConsumedTools` operates on `Omitted`. The `StripToolResults` compaction option (summary LLM head) takes precedence over both in `buildAssistantPartsWithOpts`.
 
 ### Full agentic loop with tools and persistence
 

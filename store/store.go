@@ -173,8 +173,9 @@ type ToolPartData struct {
 	Metadata  map[string]any
 	TimeStart int64
 	TimeEnd   int64
-	Compacted int64  // unix ms when output was pruned; 0 = not pruned
-	Interrupted bool // true if tool was running when session aborted
+	Compacted   int64 // unix ms when output was pruned; 0 = not pruned
+	Omitted     int64 // unix ms when output was omitted after LLM consumed it; 0 = keep
+	Interrupted bool  // true if tool was running when session aborted
 }
 
 // StepFinishData holds data for a step-finish part.

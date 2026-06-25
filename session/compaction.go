@@ -543,7 +543,9 @@ func buildRecentContextExcerpt(msgs []*store.Message, allParts map[string][]*sto
 						wroteLabel = true
 					}
 					output := d.Output
-					if d.Compacted > 0 {
+					if d.Omitted > 0 {
+						output = "[已省略]"
+					} else if d.Compacted > 0 {
 						output = "[已清除]"
 					} else {
 						output = truncateRunes(output, maxToolRunes)
@@ -674,7 +676,9 @@ func buildAssistantPartsWithOpts(m *store.Message, ps []*store.Part, opts ToMode
 
 			output := d.Output
 			if opts.StripToolResults {
-				output = "[tool result omitted]"
+				output = "[Tool result omitted]"
+			} else if d.Omitted > 0 {
+				output = "[Tool result omitted]"
 			} else if d.Compacted > 0 {
 				output = "[Old tool result content cleared]"
 			} else if opts.ToolOutputMaxChars > 0 && len(output) > opts.ToolOutputMaxChars {

@@ -321,7 +321,10 @@ func buildToolResult(d *store.ToolPartData) *llm.ToolResult {
 	switch d.Status {
 	case store.ToolStatusCompleted:
 		output := d.Output
-		if d.Compacted > 0 {
+		if d.Omitted > 0 {
+			// Output was omitted after the LLM consumed it
+			output = "[Tool result omitted]"
+		} else if d.Compacted > 0 {
 			// Output was pruned to save context space
 			output = "[Old tool result content cleared]"
 		}

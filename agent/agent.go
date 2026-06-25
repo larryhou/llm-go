@@ -106,6 +106,11 @@ type Config struct {
 	NoResetTool bool
 	// NoSkillsIndex disables Bleve skills index even if SkillsDir exists.
 	NoSkillsIndex bool
+
+	// OmitConsumedTools replaces each completed tool result with a placeholder
+	// in subsequent LLM context after the LLM has consumed it, reducing context
+	// size for long agentic sessions with many tool calls. Default false.
+	OmitConsumedTools bool
 }
 
 // RunOptions carries the per-turn parameters passed to RunAsync / Run / RunChan.
@@ -141,6 +146,7 @@ type Client struct {
 	opts     RunOptions // pre-built default run options
 	cfg      *llmconfig.Info
 	maxSteps int
+	omitConsumedTools bool
 }
 
 // New constructs a Client with sensible defaults. See Config for what each
@@ -346,8 +352,9 @@ func New(cfg Config) (*Client, error) {
 			ExtraSystem: extraSystem,
 			OnCompact:   historySrc.Hook(),
 		},
-		cfg:      sessionCfg,
-		maxSteps: maxSteps,
+		cfg:               sessionCfg,
+		maxSteps:          maxSteps,
+		omitConsumedTools: cfg.OmitConsumedTools,
 	}, nil
 }
 
@@ -435,16 +442,17 @@ func (c *Client) RunAsync(ctx context.Context, userMsg string, opts RunOptions, 
 		prov = newHookProvider(c.Provider, on)
 	}
 	return session.RunLoopAsync(ctx, c.Store, session.RunInput{
-		SessionID:   c.SessionID,
-		UserMsg:     userMsg,
-		Model:       c.Model,
-		Provider:    prov,
-		Tools:       merged.Tools,
-		ExtraSystem: merged.ExtraSystem,
-		MaxSteps:    c.maxSteps,
-		Config:      c.cfg,
-		OnCompact:   merged.OnCompact,
-		WaitFor:     merged.WaitFor,
+		SessionID:         c.SessionID,
+		UserMsg:           userMsg,
+		Model:             c.Model,
+		Provider:          prov,
+		Tools:             merged.Tools,
+		ExtraSystem:       merged.ExtraSystem,
+		MaxSteps:          c.maxSteps,
+		Config:            c.cfg,
+		OnCompact:         merged.OnCompact,
+		WaitFor:           merged.WaitFor,
+		OmitConsumedTools: c.omitConsumedTools,
 	})
 }
 

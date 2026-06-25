@@ -72,6 +72,13 @@ type RunInput struct {
 	// but only reads history after the previous turn's store writes are done.
 	// Nil means no waiting (default behaviour, fully backward-compatible).
 	WaitFor <-chan struct{}
+
+	// OmitConsumedTools, when true, replaces each completed tool result with
+	// "[Tool result omitted]" in subsequent LLM context after the LLM has
+	// consumed it (i.e. after the following LLM step completes successfully).
+	// This reduces context size for long agentic sessions with many tool calls.
+	// Default false — tool results are kept verbatim.
+	OmitConsumedTools bool
 }
 
 // RunHandle is returned by RunLoopAsync. It allows the caller to cancel the
@@ -107,7 +114,7 @@ type RunHandle struct {
 	cancel    context.CancelFunc
 	once      sync.Once
 	storeDone chan struct{} // closed by runLoopInternal to signal store consistency
-	storeOnce sync.Once    // ensures storeDone is closed exactly once
+	storeOnce sync.Once     // ensures storeDone is closed exactly once
 }
 
 // closeStoreDone signals that the store is in a consistent state.
@@ -225,6 +232,14 @@ func runLoopInternal(ctx context.Context, s store.Store, input RunInput, h *RunH
 		}
 	}
 
+	// When OmitConsumedTools is enabled, omit tool results from all historical
+	// assistant messages except the most recent one before the loop starts.
+	// The most recent assistant message's tool results may not yet have been
+	// consumed by a subsequent LLM call, so they are left intact.
+	if input.OmitConsumedTools {
+		omitHistoricalToolResults(ctx, s, msgs, allParts)
+	}
+
 	// tooLongRetries counts consecutive EventError→IsContextOverflow fallbacks
 	// where the last tool result was replaced. Resets to 0 on a successful LLM
 	// turn so the counter only tracks consecutive failures. Capped at 3 to
@@ -236,6 +251,11 @@ func runLoopInternal(ctx context.Context, s store.Store, input RunInput, h *RunH
 	// overflow on this iteration means the tail itself is too large and triggers
 	// the deeper fallback (B.3).
 	postCompactRetry := false
+
+	// previousAssistantMsgID tracks the assistant message from the prior loop
+	// iteration. When OmitConsumedTools is true, its completed tool results are
+	// omitted once the current LLM step has successfully consumed them.
+	previousAssistantMsgID := ""
 
 	step := 0
 	for {
@@ -357,6 +377,14 @@ func runLoopInternal(ctx context.Context, s store.Store, input RunInput, h *RunH
 			}
 		}
 
+		// When OmitConsumedTools is enabled, omit the tool results from the
+		// previous step now that the current LLM step has successfully consumed
+		// them. This keeps context lean without losing the tool call record.
+		if input.OmitConsumedTools && previousAssistantMsgID != "" {
+			omitConsumedToolResults(ctx, s, previousAssistantMsgID, allParts)
+		}
+		previousAssistantMsgID = assistantMsgID
+
 		switch result {
 		case ProcessStop:
 			// Signal store consistency before Prune so that a new turn waiting
@@ -403,6 +431,9 @@ func runLoopInternal(ctx context.Context, s store.Store, input RunInput, h *RunH
 			_ = s.DeleteMessagesByIDs(ctx, input.SessionID, []string{assistantMsgID})
 			msgs = msgs[:len(msgs)-1]
 			delete(allParts, assistantMsgID)
+			// The deleted message is no longer valid as a previous-step reference;
+			// clear it so omitConsumedToolResults is not called with a stale ID.
+			previousAssistantMsgID = ""
 
 			if postCompactRetry {
 				// B.3: post-compact retry also overflowed — tail is too large.
@@ -671,7 +702,7 @@ func buildSystem(input RunInput) []string {
 		if base := SystemPromptForModel(input.Model); base != "" {
 			parts = append(parts, base)
 		}
-	// else: DisableProviderPrompt=true, AgentPrompt="" → no base prompt at all
+		// else: DisableProviderPrompt=true, AgentPrompt="" → no base prompt at all
 	}
 
 	// Always append caller-supplied extra instructions
@@ -751,3 +782,62 @@ func markAssistantCancelled(s store.Store, assistantMsgID string) {
 	}
 }
 
+// omitConsumedToolResults marks completed tool results in msgID as omitted.
+// Called after the following LLM step has successfully consumed the tool results,
+// so they no longer need to occupy context space.
+// Parts that are already omitted or compacted are skipped.
+func omitConsumedToolResults(ctx context.Context, s store.Store, msgID string, allParts map[string][]*store.Part) {
+	omitPartsInMessage(ctx, s, msgID, allParts, time.Now().UnixMilli())
+}
+
+// omitHistoricalToolResults omits completed tool results from all historical
+// assistant messages except the most recent non-summary one. Called once at the
+// start of a run loop when OmitConsumedTools is enabled, so that tool results
+// carried over from previous sessions do not occupy context space.
+//
+// The most recent assistant message is skipped: its tool results may not yet
+// have been seen by a subsequent LLM step, so they must be preserved.
+func omitHistoricalToolResults(ctx context.Context, s store.Store, msgs []*store.Message, allParts map[string][]*store.Part) {
+	// Find the ID of the most recent non-summary assistant message.
+	latestAssistantID := ""
+	for i := len(msgs) - 1; i >= 0; i-- {
+		m := msgs[i]
+		if m.Role == store.RoleAssistant && !m.Summary {
+			latestAssistantID = m.ID
+			break
+		}
+	}
+
+	now := time.Now().UnixMilli()
+	for _, m := range msgs {
+		if m.Role != store.RoleAssistant || m.Summary {
+			continue
+		}
+		if m.ID == latestAssistantID {
+			continue // preserve the most recent assistant message
+		}
+		omitPartsInMessage(ctx, s, m.ID, allParts, now)
+	}
+}
+
+// omitPartsInMessage sets Omitted on every eligible completed tool part in msgID.
+// Shared by omitHistoricalToolResults and omitConsumedToolResults.
+func omitPartsInMessage(ctx context.Context, s store.Store, msgID string, allParts map[string][]*store.Part, now int64) {
+	for _, p := range allParts[msgID] {
+		if p.Type != store.PartTypeTool {
+			continue
+		}
+		d, ok := store.DataAs[*store.ToolPartData](p)
+		if !ok || d.Status != store.ToolStatusCompleted {
+			continue
+		}
+		if d.Omitted > 0 || d.Compacted > 0 {
+			continue
+		}
+		d.Omitted = now
+		p.Data = d
+		if err := s.UpdatePart(ctx, p); err != nil {
+			log.Printf("[session] omit tool result %s: %v", p.ID, err)
+		}
+	}
+}
