@@ -7,7 +7,6 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
-	"unicode/utf8"
 )
 
 // Truncate constants, aligned with packages/opencode/src/tool/truncate.ts.
@@ -66,16 +65,12 @@ func StartCleanup(ctx context.Context) {
 func Truncate(toolName, text string, opts *TruncateOptions) TruncateResult {
 	maxLines := DefaultMaxLines
 	maxBytes := DefaultMaxBytes
-	direction := "head"
 	if opts != nil {
 		if opts.MaxLines > 0 {
 			maxLines = opts.MaxLines
 		}
 		if opts.MaxBytes > 0 {
 			maxBytes = opts.MaxBytes
-		}
-		if opts.Direction != "" {
-			direction = opts.Direction
 		}
 	}
 
@@ -86,47 +81,10 @@ func Truncate(toolName, text string, opts *TruncateOptions) TruncateResult {
 		return TruncateResult{Content: text, Truncated: false}
 	}
 
-	// Build preview respecting direction
-	var preview []string
-	previewBytes := 0
-	if direction == "head" {
-		for _, line := range lines {
-			lineBytes := utf8.RuneCountInString(line) + 1 // +1 for \n
-			if len(preview) >= maxLines || previewBytes+lineBytes > maxBytes {
-				break
-			}
-			preview = append(preview, line)
-			previewBytes += lineBytes
-		}
-	} else { // tail
-		for i := len(lines) - 1; i >= 0; i-- {
-			line := lines[i]
-			lineBytes := utf8.RuneCountInString(line) + 1
-			if len(preview) >= maxLines || previewBytes+lineBytes > maxBytes {
-				break
-			}
-			preview = append([]string{line}, preview...)
-			previewBytes += lineBytes
-		}
-	}
-
-	// Write full content to temp file
+	// Write full content to temp file; return only the path hint — no preview.
 	outputPath := writeTruncationFile(toolName, text)
 
-	removedLines := len(lines) - len(preview)
-	removedBytes := byteLen - previewBytes
-
-	hint := buildHint(outputPath)
-	var content string
-	if direction == "head" {
-		content = strings.Join(preview, "\n")
-		if removedBytes > 0 {
-			content += fmt.Sprintf("\n\n...%d lines / %d bytes truncated...\n\n%s", removedLines, removedBytes, hint)
-		}
-	} else {
-		content = fmt.Sprintf("...%d lines / %d bytes truncated...\n\n%s\n\n", removedLines, removedBytes, hint)
-		content += strings.Join(preview, "\n")
-	}
+	content := buildHint(outputPath, len(lines), byteLen)
 
 	return TruncateResult{
 		Content:    content,
@@ -135,11 +93,47 @@ func Truncate(toolName, text string, opts *TruncateOptions) TruncateResult {
 	}
 }
 
-func buildHint(outputPath string) string {
+func buildHint(outputPath string, lines, bytes int) string {
+	return BuildTruncHint(outputPath, lines, bytes)
+}
+
+// BuildTruncHint returns the message shown to the LLM when tool output is too
+// large. It includes the line count, raw byte count, actual file size on disk,
+// and the full path so the LLM can explore the content with read/grep tools.
+// Exported so sub-packages (e.g. tool/builtin) can reuse the same format.
+func BuildTruncHint(outputPath string, lines, bytes int) string {
+	size := fmt.Sprintf("%d lines / %d bytes", lines, bytes)
 	if outputPath == "" {
-		return "Output was truncated. Use Read with offset/limit or Grep to access specific sections."
+		return fmt.Sprintf("Output is too large (%s) and could not be saved to a file. Use more targeted parameters to reduce the output size.", size)
 	}
-	return fmt.Sprintf("Full output saved to: %s\nUse Read (with offset/limit) or Grep to search the full content.", outputPath)
+	// Report the actual file size so the LLM knows what it is dealing with.
+	fileSize := ""
+	if fi, err := os.Stat(outputPath); err == nil {
+		fileSize = fmt.Sprintf(", file size: %s", formatBytes(fi.Size()))
+	}
+	return fmt.Sprintf(
+		"Output is too large (%s%s). Full content written to: %s\nUse the read tool (with offset/limit) or grep tool to explore the content.",
+		size, fileSize, outputPath,
+	)
+}
+
+// formatBytes returns a human-readable byte size string (e.g. "1.2 MB").
+func formatBytes(n int64) string {
+	const (
+		KB = 1024
+		MB = 1024 * KB
+		GB = 1024 * MB
+	)
+	switch {
+	case n >= GB:
+		return fmt.Sprintf("%.1f GB", float64(n)/GB)
+	case n >= MB:
+		return fmt.Sprintf("%.1f MB", float64(n)/MB)
+	case n >= KB:
+		return fmt.Sprintf("%.1f KB", float64(n)/KB)
+	default:
+		return fmt.Sprintf("%d B", n)
+	}
 }
 
 // WriteTruncFile writes content to a temp truncation file and returns the path.

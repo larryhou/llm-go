@@ -173,6 +173,11 @@ type ToolPartData struct {
 	Metadata  map[string]any
 	TimeStart int64
 	TimeEnd   int64
+	// OutputPath is the path to the full output file when the tool output was
+	// truncated at the tool layer (e.g. shell output > 100 KB). When non-empty,
+	// buildToolResult injects a read-hint so the LLM can explore the full output
+	// via the read/grep tools rather than working with a silent truncation.
+	OutputPath  string
 	Compacted   int64 // unix ms when output was pruned; 0 = not pruned
 	Omitted     int64 // unix ms when output was omitted after LLM consumed it; 0 = keep
 	Interrupted bool  // true if tool was running when session aborted

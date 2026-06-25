@@ -162,7 +162,8 @@ func (t *ShellTool) Execute(ctx context.Context, input map[string]any) (tool.Res
 	var outputPath string
 	if truncated && rawOutput != "" {
 		outputPath = writeTruncationFile("bash", rawOutput)
-		output = "...output truncated...\n\nFull output saved to: " + outputPath + "\n\n" + output
+		lineCount := strings.Count(rawOutput, "\n") + 1
+		output = tool.BuildTruncHint(outputPath, lineCount, len(rawOutput))
 	}
 
 	return tool.Result{

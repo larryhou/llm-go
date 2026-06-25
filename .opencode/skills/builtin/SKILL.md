@@ -322,30 +322,27 @@ API / plugin compatibility even when a different shell is used at runtime.
 
 **Output truncation**
 
-Output is tail-biased (last N lines / M bytes are kept), mirroring
-`shell.ts tail()`:
+When output exceeds the limits, the full content is written to a temp file
+under `$TMPDIR/opencode-tool-output/` and the tool result is replaced with a
+single hint message — **no preview is retained**. The LLM is expected to use
+the `read` or `grep` tools to explore the file.
 
-- Max **2,000 lines** retained.
-- Max **100 KB** retained.
-- Full output written to a temp file when truncated; path shown in output.
-
+Hint message format:
 ```
-...output truncated...
-
-Full output saved to: /tmp/opencode-tool-output/bash-<ts>.txt
-
-<last lines of output>
-
-<shell_metadata>
-shell tool terminated command after exceeding timeout ...
-</shell_metadata>
+Output is too large (N lines / M bytes, file size: X.X KB). Full content written to: /tmp/opencode-tool-output/bash-<ts>.txt
+Use the read tool (with offset/limit) or grep tool to explore the content.
 ```
+
+- Max **2,000 lines** before triggering truncation.
+- Max **100 KB** before triggering truncation.
+- `result.OutputPath` is set to the temp file path so the session layer can
+  surface the path in context even after compaction (`ToolPartData.OutputPath`).
 
 When output is empty: `(no output)`.
 
 **`<shell_metadata>` block**
 
-Appended when timeout or abort occurs:
+Appended (to the hint message when truncated, or to the output when not) on timeout or abort:
 
 ```
 <shell_metadata>
@@ -379,8 +376,42 @@ shell tool terminated command after exceeding timeout 5000 ms. ...
 | `read` | Byte cap per call | 50 KB |
 | `read` | Max line length | 2,000 chars |
 | `shell` | Default timeout | 120,000 ms |
-| `shell` | Output tail (lines) | 2,000 |
-| `shell` | Output tail (bytes) | 100 KB |
+| `shell` | Truncation trigger (lines) | 2,000 |
+| `shell` | Truncation trigger (bytes) | 100 KB |
+
+---
+
+## Output truncation — `tool.Truncate`
+
+All tools that produce large text outputs should use `tool.Truncate` from the
+`tool` package. When the content exceeds `DefaultMaxLines` (2,000) or
+`DefaultMaxBytes` (50 KB), the full content is written to a temp file and the
+tool result is replaced with a hint message. **No preview is kept.**
+
+```
+Output is too large (N lines / M bytes, file size: X.X KB). Full content written to: /tmp/opencode-tool-output/<tool>-<ts>.txt
+Use the read tool (with offset/limit) or grep tool to explore the content.
+```
+
+The `TruncateResult.OutputPath` must be forwarded in `tool.Result.OutputPath`
+so the session layer (`ToolPartData.OutputPath`) can preserve the path in LLM
+context even after compaction.
+
+```go
+tr := tool.Truncate(t.Name(), output, nil)
+return tool.Result{
+    Output:     tr.Content,
+    Truncated:  tr.Truncated,
+    OutputPath: tr.OutputPath, // must propagate
+}, nil
+```
+
+`tool.BuildTruncHint(outputPath, lines, bytes)` is the exported helper that
+generates the hint string. Sub-packages (e.g. `tool/builtin`) use it directly
+when they manage their own file writing (e.g. `ShellTool`).
+
+Temp files are cleaned up automatically after `RetentionDays` (7 days) by the
+`tool.StartCleanup(ctx)` goroutine — call once at process startup.
 
 ---
 

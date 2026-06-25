@@ -600,15 +600,16 @@ func (s *processorState) updateToolCompleted(ctx context.Context, partID, toolNa
 		start = existing.TimeStart
 	}
 	p.Data = &store.ToolPartData{
-		Tool:      toolName,
-		CallID:    callID,
-		Status:    store.ToolStatusCompleted,
-		Input:     input,
-		Output:    result.Output,
-		Title:     result.Title,
-		Metadata:  result.Metadata,
-		TimeStart: start,
-		TimeEnd:   nowMS(),
+		Tool:       toolName,
+		CallID:     callID,
+		Status:     store.ToolStatusCompleted,
+		Input:      input,
+		Output:     result.Output,
+		Title:      result.Title,
+		Metadata:   result.Metadata,
+		OutputPath: result.OutputPath,
+		TimeStart:  start,
+		TimeEnd:    nowMS(),
 	}
 	return s.store.UpdatePart(ctx, p)
 }

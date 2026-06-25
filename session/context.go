@@ -317,17 +317,23 @@ func buildAssistantParts(m *store.Message, ps []*store.Part) ([]llm.ContentPart,
 
 // buildToolResult converts a ToolPartData into a ToolResult for the LLM context.
 // Aligned with message-v2.ts tool part conversion logic.
+//
+// When the tool output was truncated at the tool layer (d.OutputPath != ""),
+// a structured read-hint is appended so the LLM can explore the full output
+// via read/grep tools. This replaces the previous silent truncation behaviour
+// where the LLM had no way to recover the missing content.
 func buildToolResult(d *store.ToolPartData) *llm.ToolResult {
 	switch d.Status {
 	case store.ToolStatusCompleted:
 		output := d.Output
 		if d.Omitted > 0 {
-			// Output was omitted after the LLM consumed it
 			output = "[Tool result omitted]"
 		} else if d.Compacted > 0 {
-			// Output was pruned to save context space
 			output = "[Old tool result content cleared]"
 		}
+		// When d.OutputPath != "", d.Output already contains the BuildTruncHint
+		// message (file path + size + line count) written by the tool layer.
+		// No further transformation is needed here.
 		return llm.NewTextResult(output)
 
 	case store.ToolStatusError:

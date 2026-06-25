@@ -682,7 +682,18 @@ func buildAssistantPartsWithOpts(m *store.Message, ps []*store.Part, opts ToMode
 			} else if d.Compacted > 0 {
 				output = "[Old tool result content cleared]"
 			} else if opts.ToolOutputMaxChars > 0 && len(output) > opts.ToolOutputMaxChars {
-				output = output[:opts.ToolOutputMaxChars] + fmt.Sprintf("\n...[truncated to %d chars]", opts.ToolOutputMaxChars)
+				truncated := output[:opts.ToolOutputMaxChars]
+				if d.OutputPath != "" {
+					// Preserve the file path so the LLM can still explore the
+					// full content via read/grep tools after compaction.
+					truncated += fmt.Sprintf(
+						"\n...[truncated to %d chars. Full output at: %s — use read/grep tools to explore]",
+						opts.ToolOutputMaxChars, d.OutputPath,
+					)
+				} else {
+					truncated += fmt.Sprintf("\n...[truncated to %d chars]", opts.ToolOutputMaxChars)
+				}
+				output = truncated
 			}
 
 			var result *llm.ToolResult

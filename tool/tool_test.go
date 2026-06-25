@@ -36,13 +36,12 @@ func TestTruncate_byLineCount_head(t *testing.T) {
 	if !r.Truncated {
 		t.Fatal("should be truncated")
 	}
-	// Preview contains first 3 lines
-	lines := strings.SplitN(r.Content, "\n", 4)
-	if len(lines) < 3 {
-		t.Fatalf("expected at least 3 lines in preview, got %d", len(lines))
+	// New behaviour: no preview, only a hint message pointing to the file.
+	if !strings.Contains(r.Content, "too large") {
+		t.Error("truncated content should contain 'too large' hint")
 	}
-	if !strings.Contains(r.Content, "truncated") {
-		t.Error("truncated content should contain truncation hint")
+	if !strings.Contains(r.Content, "10 lines") {
+		t.Errorf("truncated content should contain line count, got: %q", r.Content)
 	}
 	if r.OutputPath == "" {
 		t.Error("truncated content should have OutputPath set")
@@ -60,8 +59,12 @@ func TestTruncate_byLineCount_tail(t *testing.T) {
 	if !r.Truncated {
 		t.Fatal("should be truncated")
 	}
-	if !strings.Contains(r.Content, "truncated") {
-		t.Error("should contain truncation hint")
+	// New behaviour: no preview, only a hint message pointing to the file.
+	if !strings.Contains(r.Content, "too large") {
+		t.Errorf("should contain 'too large' hint, got: %q", r.Content)
+	}
+	if r.OutputPath == "" {
+		t.Error("truncated content should have OutputPath set")
 	}
 }
 
