@@ -985,23 +985,44 @@ Parent session
 | `goal` | string | ✓ | Clear task description; sub-agent uses this as its user message |
 | `context` | string | — | Background from the parent session the sub-agent needs |
 
-#### SSE events — `sub_session_id` tagging
+#### SSE events — sub-session visibility
 
-Sub-session streaming events are forwarded to the SSE client so the user can
-see progress, but they carry an extra `sub_session_id` field so clients can
-distinguish them from parent session events:
+Sub-session progress is visible to the SSE client **only via `tool_result`
+events** emitted by the `sseToolWrapper` that wraps each tool in `wrappedBase`.
+The sub-session's LLM streaming events (text deltas, tool_call fragments) are
+**not** forwarded — that granularity is too fine and would leak internal LLM
+noise to the client.
+
+`sseProviderFactory` returns `innerProv` (the plain, unwrapped provider) so the
+sub-session's `Stream()` goroutine never writes to the SSE response:
+
+```go
+sseProviderFactory := func(subSessionID string) llm.Provider {
+    return innerProv // no SSE middleware; LLM deltas stay internal
+}
+```
+
+The client sees exactly:
 
 ```json
-// parent session event (no sub_session_id)
-{"type": "text", "delta": "I'll research this now..."}
+// parent session events
+{"type": "text", "delta": "I'll delegate this task..."}
+{"type": "tool_call", "tool": "delegate_task", "input": {...}}
 
-// sub-session events (tagged)
-{"type": "tool_call", "tool": "bash", "input": {...}, "sub_session_id": "abc123"}
-{"type": "tool_result", "tool": "bash", "output": "...", "sub_session_id": "abc123"}
+// sub-session tool results only (via sseToolWrapper, no LLM deltas)
+{"type": "tool_result", "tool": "knowledge_search", "output": "..."}
+{"type": "tool_result", "tool": "knowledge_fetch",  "output": "..."}
 
-// delegate_task result back in parent (normal tool_result, no sub_session_id)
+// delegate_task final result back in parent
 {"type": "tool_result", "tool": "delegate_task", "output": "## Conclusion\n..."}
+{"type": "done", "session_id": "sess-xxx"}
 ```
+
+**Why not LLM deltas:** A multi-step sub-session can produce dozens of streaming
+text chunks per step across up to 100 steps. Forwarding all of them gives the
+client hundreds of fine-grained events with no semantic structure. `tool_result`
+events are coarse-grained (one per tool call), carry the actual findings, and
+are sufficient to show progress.
 
 #### OmitConsumedTools in sub-sessions
 
@@ -1107,7 +1128,7 @@ delegateTool := session.NewDelegateTool(
     sessID,             // parentSessionID
     s.sessionStore,     // shared store — sub-sessions use different SessionID
     wrappedBase,        // sub-session tool set; does NOT include delegate_task
-    sseProviderFactory, // func(subSessionID string) llm.Provider
+    sseProviderFactory, // func(subSessionID string) llm.Provider — returns innerProv (no SSE middleware)
     summaryProv,        // plain innerProv — no SSE middleware
     model,              // resolved model
     sessionCfg,         // resolved per-request config

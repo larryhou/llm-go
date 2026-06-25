@@ -606,16 +606,15 @@ func (s *server) handleChat(w http.ResponseWriter, r *http.Request) {
 	// sub-session receives the SAME filtered + SSE-wrapped tools the parent
 	// uses (minus delegate_task itself, filtered internally by Execute) so
 	// req.Tools restrictions and tool_result event emission both carry over.
+	//
+	// The sub-session provider is the plain innerProv (no SSE middleware).
+	// We deliberately do NOT forward LLM streaming deltas (text, tool_call
+	// fragments) from the sub-session to the SSE client — that granularity
+	// is too fine and leaks internal LLM noise.  The only sub-session events
+	// the client needs to see are tool_result events, which are already
+	// emitted by the sseToolWrapper wrapping each tool in wrappedBase.
 	sseProviderFactory := func(subSessionID string) llm.Provider {
-		return &sseProvider{
-			inner: innerProv,
-			send: func(ev any) {
-				if m, ok := ev.(map[string]any); ok {
-					m["sub_session_id"] = subSessionID
-				}
-				sendEvent(ev)
-			},
-		}
+		return innerProv
 	}
 	delegateTool := session.NewDelegateTool(
 		sessID,
