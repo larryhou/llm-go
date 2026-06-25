@@ -24,16 +24,19 @@ github.com/larryhou/llm-go/
 │   ├── provider.go        Registry, Model, Info types, ParseModel()
 │   ├── anthropic/         Anthropic Messages API adapter (anthropic-sdk-go)
 │   └── openai/            OpenAI Chat Completions adapter (openai-go)
-├── tool/        Tool interface, Registry, Truncate, builtin tools
+├── tool/        Tool interface, Registry, Truncate, BuildTruncHint, builtin tools
 ├── store/       Store interface (incl. DeleteSession) + memory/ implementation
 └── session/
-    ├── processor.go   LLM event handler — tool call lifecycle, doom-loop detection
-    ├── context.go     ToModelMessages() — store records → llm.Message[]
-    ├── compaction.go  Context overflow: Select(), Compact(), Prune()
-    ├── prompt.go      RunLoop() — main agentic loop
-    ├── reset_tool.go  session_reset built-in tool
-    ├── system.go      Per-provider system prompt selection (embedded .txt files)
-    └── max-steps.txt  User message injected on the last agentic step (MaxSteps reached)
+    ├── processor.go        LLM event handler — tool call lifecycle, doom-loop detection
+    ├── context.go          ToModelMessages() — store records → llm.Message[]
+    ├── compaction.go       Context overflow: Select(), Compact(), Prune()
+    ├── prompt.go           RunLoop() — main agentic loop
+    ├── reset_tool.go       session_reset built-in tool
+    ├── delegate.go         delegate_task built-in tool (DelegateTool)
+    ├── delegate_summary.go generateDelegateSummary() + extractLastAssistantText()
+    ├── delegate_summary.txt summary prompt template ({goal} placeholder)
+    ├── system.go           Per-provider system prompt selection (embedded .txt files)
+    └── max-steps.txt       User message injected on the last agentic step (MaxSteps reached)
 ```
 
 ### Data Flow
@@ -790,6 +793,7 @@ stateDiagram-v2
 
 | Field | Type | Meaning |
 |---|---|---|
+| `OutputPath` | `string` | Path to full output file written when tool output was truncated at the tool layer (e.g. shell > 100 KB). When non-empty, `d.Output` already contains the `BuildTruncHint` message (line count, byte count, file size, path); `buildToolResult` passes it through verbatim so the LLM can use read/grep to explore. |
 | `Compacted` | `int64` | Unix ms when output was pruned by `Prune()`; 0 = keep. Renders as `[Old tool result content cleared]` |
 | `Omitted` | `int64` | Unix ms when output was omitted after LLM consumed it (OmitConsumedTools); 0 = keep. Renders as `[Tool result omitted]` |
 | `Interrupted` | `bool` | Tool goroutine was cancelled mid-run; unrelated to context pruning |
@@ -799,9 +803,14 @@ Priority chain in `buildToolResult` / `buildAssistantPartsWithOpts`:
 StripToolResults (compaction head)  → "[Tool result omitted]"
 Omitted > 0                         → "[Tool result omitted]"
 Compacted > 0                       → "[Old tool result content cleared]"
-ToolOutputMaxChars exceeded         → output[:N] + "...[truncated to N chars]"
+(OutputPath set)                    → d.Output verbatim (already contains BuildTruncHint)
+ToolOutputMaxChars exceeded         → output[:N] + "...[truncated to N chars. Full output at: <path>]"
 (default)                           → d.Output verbatim
 ```
+
+Note: when `ToolOutputMaxChars` truncates during compaction and `OutputPath` is
+set, the path is preserved in the truncation suffix so the LLM retains access
+to the full file even after the compacted head is summarised.
 
 ### Anthropic extended thinking — signature lifecycle
 
@@ -926,6 +935,206 @@ restart. This is low-probability for in-memory stores.
 
 ---
 
+### `session.DelegateTool` — `session/delegate.go`
+
+`delegate_task` is a built-in tool that lets the main LLM offload a complex,
+multi-step task to an isolated sub-session. The sub-session runs its own full
+agentic loop, and only the final conclusion is returned to the parent session.
+This keeps the parent session context clean — the parent LLM never sees the
+intermediate tool calls of the sub-session.
+
+#### Why it matters
+
+Without delegation, every tool call (search, read, analyse…) injects its
+inputs and outputs into the parent context. A 100-step research task produces
+100 tool-call pairs of noise. With delegation, the parent sees a single
+`delegate_task` result containing a concise structured summary.
+
+#### Architecture
+
+```
+Parent session
+  │
+  ├─ LLM decides to delegate a research task
+  │  → calls delegate_task(goal="...", context="...")
+  │
+  │       ┌─── Sub-session (ephemeral) ───────────────────────┐
+  │       │  SessionID        = newID()                        │
+  │       │  ParentID         = parent session ID              │
+  │       │  Tools            = wrappedBase (no delegate_task)  │
+  │       │  MaxSteps         = 100                            │
+  │       │  OmitConsumedTools= true                           │
+  │       │                                                    │
+  │       │  RunLoopAsync → full agentic loop                  │
+  │       │  [step 1] tool_call ...  result → omitted next step│
+  │       │  [step N] text conclusion                          │
+  │       │                                                    │
+  │       │  → renderExecutionLog() → plain-text log           │
+  │       │  → generateDelegateSummary() LLM call              │
+  │       │  → DeleteSession() — ephemeral, no trace           │
+  │       └────────────────────────────────────────────────────┘
+  │
+  └─ delegate_task returns: structured summary (fixed sections)
+     Parent LLM sees only the summary — no sub-session noise
+```
+
+#### Input schema
+
+| Field | Type | Required | Description |
+|-------|------|:--------:|-------------|
+| `goal` | string | ✓ | Clear task description; sub-agent uses this as its user message |
+| `context` | string | — | Background from the parent session the sub-agent needs |
+
+#### SSE events — `sub_session_id` tagging
+
+Sub-session streaming events are forwarded to the SSE client so the user can
+see progress, but they carry an extra `sub_session_id` field so clients can
+distinguish them from parent session events:
+
+```json
+// parent session event (no sub_session_id)
+{"type": "text", "delta": "I'll research this now..."}
+
+// sub-session events (tagged)
+{"type": "tool_call", "tool": "bash", "input": {...}, "sub_session_id": "abc123"}
+{"type": "tool_result", "tool": "bash", "output": "...", "sub_session_id": "abc123"}
+
+// delegate_task result back in parent (normal tool_result, no sub_session_id)
+{"type": "tool_result", "tool": "delegate_task", "output": "## Conclusion\n..."}
+```
+
+#### OmitConsumedTools in sub-sessions
+
+Sub-sessions always run with `OmitConsumedTools: true`. After each LLM step
+completes, the tool results from the previous step are replaced with
+`[Tool result omitted]` in subsequent LLM context. This keeps the sub-session
+context lean across up to 100 steps without hitting the context window limit.
+
+The summary LLM is **not** affected by `OmitConsumedTools`: `renderExecutionLog()`
+reads raw `ToolPartData.Output` directly from the store, bypassing the
+`buildToolResult` rendering path, so full tool outputs (up to
+`maxToolOutputLogChars = 8000` chars each) are always visible in the log.
+
+#### Summary generation (`session/delegate_summary.go`)
+
+When the sub-session `RunLoop` completes:
+
+1. **`renderExecutionLog()`** walks all sub-session messages and parts, producing
+   a plain-text log:
+   ```
+   USER GOAL: <goal text>
+
+   [Step 1]
+   ASSISTANT: <text if any>
+   TOOL CALL: tool_name({"param":"value"})
+   TOOL RESULT (tool_name): <output, capped at 8000 chars>
+
+   [Step 2]
+   ...
+   ```
+   Skips: compaction boundary messages, synthetic post-compact prompts
+   (`PromptPostCompact`, `PromptContextTooLarge`), reasoning blocks, structural
+   parts (step-start/finish). Tool inputs are JSON-marshalled and capped at 300
+   chars. Assistant text is capped at 2000 runes.
+
+2. The log is injected into the **system prompt** (not as conversation messages):
+   ```
+   SYSTEM: You are an analyst summarising the results of an autonomous AI agent
+           execution. The agent was given a task and ran a series of tool calls
+           to complete it. Below is the complete execution log:
+           <execution_log>
+           ... rendered log ...
+           </execution_log>
+   ```
+
+3. A single **user message** carries the task goal and the fixed output template
+   from `delegate_summary.txt`.
+
+4. The summary LLM responds as an observer, not as a conversation participant.
+   `Context:200_000, Output:8_192`.
+
+5. **Fixed output structure** (`delegate_summary.txt`):
+   ```markdown
+   ## Conclusion
+   One to three sentences directly answering the task goal.
+
+   ## Key Findings
+   - Bullet per distinct fact/result/data point
+
+   ## Details
+   (omit if none — verbatim structured output: code, tables, lists)
+
+   ## Unresolved
+   (omit if none — bullet list of incomplete sub-tasks with reason)
+   ```
+
+**Fallback chain:**
+- Summary LLM fails → `extractLastAssistantText()` returns the last non-summary assistant text
+- That also empty → `tool.Result{}` + error propagated to parent LLM
+
+#### Recursion prevention
+
+By design — not by runtime check. The `tools` argument passed to
+`NewDelegateTool` is the sub-session's tool set, and the canonical wiring
+(`cmd/llm-api/main.go`) passes a tool list that does **not** contain
+`delegate_task` itself. Since `delegate_task` is never advertised to the
+sub-agent, the LLM cannot call it. `DelegateTool.Execute` forwards `d.tools`
+verbatim to `RunLoopAsync` — no filtering, no depth counter, no assertion.
+
+The wiring pattern that guarantees this:
+
+```go
+delegateTool := session.NewDelegateTool(
+    ...,
+    wrappedBase, // base tools only — delegate_task NOT in this slice
+    ...,
+)
+activeTools := append(wrappedBase, &sseToolWrapper{inner: delegateTool, ...})
+// Parent sees wrappedBase + delegateTool; sub-sessions see wrappedBase only.
+```
+
+Callers that re-use `DelegateTool` outside `cmd/llm-api` must follow the same
+discipline: never include the `DelegateTool` (or any wrapper around it) in
+the `tools` argument.
+
+#### Lifecycle
+
+```go
+// Construction (once per request, wired in cmd/llm-api/main.go).
+// All dependencies are resolved up-front and passed in one call — there is
+// no two-phase init.
+delegateTool := session.NewDelegateTool(
+    sessID,             // parentSessionID
+    s.sessionStore,     // shared store — sub-sessions use different SessionID
+    wrappedBase,        // sub-session tool set; does NOT include delegate_task
+    sseProviderFactory, // func(subSessionID string) llm.Provider
+    summaryProv,        // plain innerProv — no SSE middleware
+    model,              // resolved model
+    sessionCfg,         // resolved per-request config
+    session.DelegateConfig{MaxSteps: 100},
+)
+activeTools := append(wrappedBase, &sseToolWrapper{inner: delegateTool, send: sendEvent})
+```
+
+#### `DelegateConfig`
+
+```go
+type DelegateConfig struct {
+    MaxSteps    int      // sub-session step cap; default 100 in cmd/llm-api
+    AgentPrompt string   // replaces per-provider system prompt for sub-session
+    ExtraSystem []string // extra system instructions for sub-session
+}
+```
+
+#### Constants (`session/delegate_summary.go`)
+
+| Constant | Value | Meaning |
+|---|---|---|
+| `maxToolOutputLogChars` | 8,000 | Per-tool-result char cap in execution log |
+| `maxTextLogRunes` | 2,000 | Per-assistant-text rune cap in execution log |
+
+---
+
 ## Development Guide
 
 ### Adding a New Tool
@@ -953,7 +1162,10 @@ func (t *MyTool) Execute(ctx context.Context, input map[string]any) (tool.Result
         return tool.Result{}, tool.Fail("query is required")
     }
     output := doWork(query)
-    // Truncate if large
+    // When output exceeds limits, Truncate writes the full content to a temp
+    // file and returns a hint message (no preview). The LLM uses read/grep to
+    // explore the file. OutputPath must be propagated so the store layer can
+    // surface the path in context even after compaction.
     tr := tool.Truncate(t.Name(), output, nil)
     return tool.Result{Output: tr.Content, Truncated: tr.Truncated, OutputPath: tr.OutputPath}, nil
 }

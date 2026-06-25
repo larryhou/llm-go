@@ -524,38 +524,7 @@ func (s *server) handleChat(w http.ResponseWriter, r *http.Request) {
 		s.sessionCount.Add(1)
 	}
 
-	// Build tool list: per-session knowledge tools (skills + history) + test tools
-	// + session_reset. Allocate a fresh slice to avoid aliasing km.Tools()'s
-	// backing array across requests.
-	kmTools := sess.km.Tools()
-	allTools := make([]tool.Tool, 0, len(kmTools)+len(s.testTools)+1)
-	allTools = append(allTools, kmTools...)
-	allTools = append(allTools, s.testTools...)
-	allTools = append(allTools, sess.resetTool)
-	activeTools := allTools
-	if len(req.Tools) > 0 {
-		allowed := make(map[string]bool, len(req.Tools))
-		for _, name := range req.Tools {
-			allowed[name] = true
-		}
-		activeTools = activeTools[:0:0]
-		for _, t := range allTools {
-			if allowed[t.Name()] {
-				activeTools = append(activeTools, t)
-			}
-		}
-	}
-
-	// Wrap each tool to emit tool_result SSE events after execution.
-	// (The provider stream only carries tool_call events; results are
-	//  produced asynchronously by the processor, so we intercept here.)
-	wrappedTools := make([]tool.Tool, len(activeTools))
-	for i, t := range activeTools {
-		wrappedTools[i] = &sseToolWrapper{inner: t, send: sendEvent}
-	}
-	activeTools = wrappedTools
-
-	// Wrap the provider to intercept streaming events and forward to SSE.
+	// Build the provider first so we can wire it into DelegateTool below.
 	providerID := s.cfg.provider
 	if providerID == "openai" {
 		providerID = "timi"
@@ -596,6 +565,73 @@ func (s *server) handleChat(w http.ResponseWriter, r *http.Request) {
 		APIID:      s.cfg.modelID,
 		Limit:      llm.ModelLimit{Context: contextLimit, Output: 4096},
 	}
+
+	// Build the base tool list: per-session knowledge tools (skills + history)
+	// + test tools + session_reset. delegate_task is appended later, after the
+	// user's req.Tools allow-list is applied to this base set — so the
+	// sub-session inherits exactly the same restricted, SSE-wrapped tools the
+	// parent has, instead of the raw unfiltered list.
+	kmTools := sess.km.Tools()
+	baseTools := make([]tool.Tool, 0, len(kmTools)+len(s.testTools)+1)
+	baseTools = append(baseTools, kmTools...)
+	baseTools = append(baseTools, s.testTools...)
+	baseTools = append(baseTools, sess.resetTool)
+
+	// Apply req.Tools allow-list to base tools (delegate_task is not yet in
+	// the list, so it cannot be filtered out by an empty allow-list; we add
+	// it unconditionally below).
+	filteredBase := baseTools
+	if len(req.Tools) > 0 {
+		allowed := make(map[string]bool, len(req.Tools))
+		for _, name := range req.Tools {
+			allowed[name] = true
+		}
+		filteredBase = make([]tool.Tool, 0, len(baseTools))
+		for _, t := range baseTools {
+			if allowed[t.Name()] {
+				filteredBase = append(filteredBase, t)
+			}
+		}
+	}
+
+	// Wrap each base tool to emit tool_result SSE events after execution.
+	// (The provider stream only carries tool_call events; results are produced
+	// asynchronously by the processor, so we intercept here.)
+	wrappedBase := make([]tool.Tool, len(filteredBase))
+	for i, t := range filteredBase {
+		wrappedBase[i] = &sseToolWrapper{inner: t, send: sendEvent}
+	}
+
+	// DelegateTool spins up an isolated sub-session for multi-step tasks. The
+	// sub-session receives the SAME filtered + SSE-wrapped tools the parent
+	// uses (minus delegate_task itself, filtered internally by Execute) so
+	// req.Tools restrictions and tool_result event emission both carry over.
+	sseProviderFactory := func(subSessionID string) llm.Provider {
+		return &sseProvider{
+			inner: innerProv,
+			send: func(ev any) {
+				if m, ok := ev.(map[string]any); ok {
+					m["sub_session_id"] = subSessionID
+				}
+				sendEvent(ev)
+			},
+		}
+	}
+	delegateTool := session.NewDelegateTool(
+		sessID,
+		s.sessionStore,
+		wrappedBase, // filtered + SSE-wrapped tools shared with sub-sessions
+		sseProviderFactory,
+		summaryProv,
+		model,
+		sessionCfg,
+		session.DelegateConfig{MaxSteps: 100},
+	)
+
+	// Final active tool list = wrapped base tools + wrapped delegate_task.
+	// delegate_task itself is also SSE-wrapped so the parent sees its
+	// (summary) tool_result event when it returns.
+	activeTools := append(wrappedBase, &sseToolWrapper{inner: delegateTool, send: sendEvent})
 
 	// Cancel the previous turn and register the new handle atomically under
 	// s.mu. Holding the lock across Cancel+RunLoopAsync+activeHandle assignment

@@ -1,0 +1,19 @@
+Task goal: {goal}
+
+Based on the execution log above, produce a structured summary using EXACTLY the following format. Do not add, remove, or rename any section. Omit a section only when explicitly marked "(omit if none)".
+
+## Conclusion
+One to three sentences directly answering the task goal. Be specific — state what was found, done, or determined.
+
+## Key Findings
+- A bullet for each distinct fact, result, or data point discovered during execution.
+- Include numbers, names, paths, versions, or other concrete details.
+- Minimum one bullet; add as many as needed.
+
+## Details
+(omit if none)
+Verbatim structured output that supports the findings: code snippets, file contents, command output, tables, lists. Preserve formatting exactly. Omit this section if there is no structured data worth preserving.
+
+## Unresolved
+(omit if none)
+Bullet list of sub-tasks that could not be completed, with a brief reason for each. Omit this section if everything was resolved.
