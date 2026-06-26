@@ -1,0 +1,21 @@
+Task goal: {goal}
+
+NOTE: The agent was interrupted before the task was fully completed. Summarise only what was actually accomplished based on the execution log. Do not imply the task is done.
+
+Based on the execution log above, produce a structured summary using EXACTLY the following format. Do not add, remove, or rename any section. Omit a section only when explicitly marked "(omit if none)".
+
+## Status
+One sentence stating that the task was interrupted and why (timeout / maximum steps reached).
+
+## Accomplished
+- A bullet for each step or sub-task that was fully completed before the interruption.
+- Include concrete details: numbers, names, paths, versions, results.
+- Omit this section only if nothing was accomplished at all.
+
+## Details
+(omit if none)
+Verbatim structured output that supports the findings: code snippets, file contents, command output, tables, lists. Preserve formatting exactly.
+
+## Remaining
+- A bullet for each sub-task that was not yet started or only partially done.
+- Be specific about what still needs to be done to complete the original goal.

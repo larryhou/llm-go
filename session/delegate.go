@@ -17,8 +17,15 @@ import (
 type DelegateConfig struct {
 	// MaxSteps is the maximum number of LLM agentic steps the sub-session may
 	// take. 0 means unlimited (not recommended — use a reasonable cap such as
-	// 100 to prevent runaway sub-sessions).
+	// 30 to prevent runaway sub-sessions). When the limit is reached the
+	// sub-session stops and a partial summary is returned to the parent.
 	MaxSteps int
+
+	// Timeout is the maximum wall-clock duration the sub-session may run.
+	// 0 means no timeout (inherits the parent context deadline, if any).
+	// Recommended: 10*time.Minute for general-purpose delegation. When the
+	// timeout fires the sub-session stops and a partial summary is returned.
+	Timeout time.Duration
 
 	// AgentPrompt, when non-empty, replaces the per-provider system prompt for
 	// the sub-session. Leave empty to inherit the same prompt as the parent.
@@ -146,6 +153,13 @@ func (d *DelegateTool) Execute(ctx context.Context, input map[string]any) (tool.
 		return tool.Result{}, tool.Fail("goal is required and must be non-empty")
 	}
 
+	// Apply sub-session timeout if configured.
+	if d.delegateConfig.Timeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, d.delegateConfig.Timeout)
+		defer cancel()
+	}
+
 	// Combine goal and optional context into the sub-session's user message.
 	userMsg := goal
 	if extra, _ := input["context"].(string); strings.TrimSpace(extra) != "" {
@@ -206,7 +220,37 @@ func (d *DelegateTool) Execute(ctx context.Context, input map[string]any) (tool.
 	}()
 
 	if h.Err != nil {
-		// Sub-session failed with a hard error. Try to salvage a partial result.
+		// Timeout: sub-session was cut short by the configured Timeout.
+		// h.StopReason is set to StopReasonTimeout in this case.
+		// Attempt a partial structured summary; fall back to last assistant text.
+		if h.StopReason == StopReasonTimeout {
+			log.Printf("[delegate_task] sub=%s timed out after %s, summarising partial work", subSessionID, d.delegateConfig.Timeout)
+			summary, sumErr := generateDelegateSummary(
+				context.Background(),
+				subSessionID,
+				goal,
+				d.s,
+				d.summaryProvider,
+				d.model,
+				true,
+			)
+			if sumErr == nil {
+				return tool.Result{
+					Output: summary,
+					Title:  "Task (partial): " + truncateGoal(goal, 60),
+				}, nil
+			}
+			log.Printf("[delegate_task] sub=%s partial summary failed (%v), falling back to last text", subSessionID, sumErr)
+			if fallback := extractLastAssistantText(context.Background(), subSessionID, d.s); fallback != "" {
+				return tool.Result{
+					Output: fallback,
+					Title:  "Task (partial): " + truncateGoal(goal, 60),
+				}, nil
+			}
+			return tool.Result{}, fmt.Errorf("delegate_task: timed out with no recoverable output")
+		}
+
+		// Hard error or user-cancelled parent — do not attempt another LLM call.
 		if fallback := extractLastAssistantText(context.Background(), subSessionID, d.s); fallback != "" {
 			log.Printf("[delegate_task] sub=%s failed (%v), using last assistant text as fallback", subSessionID, h.Err)
 			return tool.Result{
@@ -217,9 +261,17 @@ func (d *DelegateTool) Execute(ctx context.Context, input map[string]any) (tool.
 		return tool.Result{}, fmt.Errorf("delegate_task: sub-session failed: %w", h.Err)
 	}
 
-	// Generate a concise summary of the sub-session's execution log.
-	// Use context.Background() so a cancelled parent ctx does not abort the
-	// summary call (the sub-session has already completed successfully).
+	// Determine if the sub-session completed the task or was interrupted.
+	// StopReasonMaxSteps arrives here with h.Err == nil (MaxSteps returns normally).
+	partial := h.StopReason == StopReasonMaxSteps
+
+	if partial {
+		log.Printf("[delegate_task] sub=%s interrupted (reason=%s), summarising partial work", subSessionID, h.StopReason)
+	}
+
+	// Generate a summary of the sub-session's execution log.
+	// Use context.Background() so the summary LLM call is not cancelled by the
+	// parent session context.
 	summary, err := generateDelegateSummary(
 		context.Background(),
 		subSessionID,
@@ -227,24 +279,29 @@ func (d *DelegateTool) Execute(ctx context.Context, input map[string]any) (tool.
 		d.s,
 		d.summaryProvider,
 		d.model,
+		partial,
 	)
+
+	title := "Task: " + truncateGoal(goal, 60)
+	if partial {
+		title = "Task (partial): " + truncateGoal(goal, 60)
+	}
+
 	if err != nil {
-		// Summary generation failed. Fall back to the sub-session's last
-		// assistant text so the parent LLM gets something useful.
 		log.Printf("[delegate_task] sub=%s summary failed (%v), falling back to last text", subSessionID, err)
 		if fallback := extractLastAssistantText(context.Background(), subSessionID, d.s); fallback != "" {
 			return tool.Result{
 				Output: fallback,
-				Title:  "Task: " + truncateGoal(goal, 60),
+				Title:  title,
 			}, nil
 		}
 		return tool.Result{}, fmt.Errorf("delegate_task: summary failed and no fallback text: %w", err)
 	}
 
-	log.Printf("[delegate_task] sub=%s complete, summary=%d chars", subSessionID, len(summary))
+	log.Printf("[delegate_task] sub=%s done (partial=%v), summary=%d chars", subSessionID, partial, len(summary))
 	return tool.Result{
 		Output: summary,
-		Title:  "Task: " + truncateGoal(goal, 60),
+		Title:  title,
 	}, nil
 }
 

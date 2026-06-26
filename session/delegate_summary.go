@@ -16,6 +16,9 @@ import (
 //go:embed delegate_summary.txt
 var delegateSummaryTemplate string
 
+//go:embed delegate_summary_partial.txt
+var delegateSummaryPartialTemplate string
+
 // maxToolOutputLogChars is the per-tool-result character limit when rendering
 // the execution log for the summary LLM. Larger than ToolOutputMaxCharsCompaction
 // (2000) because the summary LLM needs richer signal to produce a good summary,
@@ -28,6 +31,11 @@ const maxTextLogRunes = 2_000
 
 // generateDelegateSummary calls an LLM to produce a structured summary of a
 // completed sub-session's execution log.
+//
+// When partial is true, the sub-session was interrupted (e.g. by a timeout)
+// before the task finished. The system prompt and user prompt both reflect this
+// so the summary LLM reports what was accomplished rather than implying the
+// task was completed.
 //
 // Design: the sub-session history is rendered as a plain-text execution log
 // (not forwarded as llm.Message conversation turns). This is injected into the
@@ -43,6 +51,7 @@ func generateDelegateSummary(
 	s store.Store,
 	summaryProvider llm.Provider,
 	model llm.Model,
+	partial bool,
 ) (string, error) {
 	msgs, allParts, err := loadMessages(ctx, s, subSessionID)
 	if err != nil {
@@ -57,14 +66,25 @@ func generateDelegateSummary(
 		return "", fmt.Errorf("delegate summary: execution log is empty")
 	}
 
+	systemPreamble := "You are an analyst summarising the results of an autonomous AI agent execution.\n" +
+		"The agent was given a task and ran a series of tool calls to complete it.\n"
+	if partial {
+		systemPreamble += "NOTE: The agent was interrupted before the task was fully completed (e.g. due to a timeout). " +
+			"Summarise only what was actually accomplished. Do not imply the task is done.\n"
+	}
 	system := []string{
-		"You are an analyst summarising the results of an autonomous AI agent execution.\n" +
-			"The agent was given a task and ran a series of tool calls to complete it.\n" +
-			"Below is the complete execution log:\n\n" +
+		systemPreamble +
+			"Below is the execution log so far:\n\n" +
 			"<execution_log>\n" + log + "\n</execution_log>",
 	}
 
-	prompt := strings.ReplaceAll(delegateSummaryTemplate, "{goal}", goal)
+	var promptTemplate string
+	if partial {
+		promptTemplate = delegateSummaryPartialTemplate
+	} else {
+		promptTemplate = delegateSummaryTemplate
+	}
+	prompt := strings.ReplaceAll(promptTemplate, "{goal}", goal)
 
 	summaryModel := model
 	summaryModel.Limit = llm.ModelLimit{Context: 200_000, Output: 8_192}

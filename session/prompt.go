@@ -2,6 +2,7 @@ package session
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"strings"
@@ -21,6 +22,18 @@ const (
 	RunResultStop     RunResult = "stop"
 	RunResultContinue RunResult = "continue"
 )
+
+// StopReason describes why a RunLoop stopped. Only meaningful when
+// RunResult == RunResultStop. When Err != nil the stop was caused by an error;
+// StopReason provides additional classification (e.g. StopReasonTimeout).
+type StopReason string
+
+const (
+	StopReasonNone     StopReason = ""          // normal completion
+	StopReasonMaxSteps StopReason = "max_steps" // MaxSteps limit reached; h.Err == nil
+	StopReasonTimeout  StopReason = "timeout"   // context deadline exceeded; h.Err != nil
+)
+
 
 // RunInput is the input for a new user turn.
 type RunInput struct {
@@ -108,8 +121,9 @@ type RunHandle struct {
 	StoreDone <-chan struct{}
 
 	// Result and Err are set before Done is closed. Read them only after <-Done.
-	Result RunResult
-	Err    error
+	Result     RunResult
+	StopReason StopReason
+	Err        error
 
 	cancel    context.CancelFunc
 	once      sync.Once
@@ -150,6 +164,9 @@ func RunLoopAsync(ctx context.Context, s store.Store, input RunInput) *RunHandle
 		defer cancel()
 		defer h.closeStoreDone() // ensure StoreDone is always closed before Done
 		h.Result, h.Err = runLoopInternal(cancelCtx, s, input, h)
+		if errors.Is(h.Err, context.DeadlineExceeded) {
+			h.StopReason = StopReasonTimeout
+		}
 	}()
 	return h
 }
@@ -662,6 +679,7 @@ func runLoopInternal(ctx context.Context, s store.Store, input RunInput, h *RunH
 
 			// Last step always terminates — the LLM has been asked to summarise.
 			if isLastStep {
+				h.StopReason = StopReasonMaxSteps
 				h.closeStoreDone()
 				return RunResultStop, nil
 			}
