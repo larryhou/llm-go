@@ -65,7 +65,17 @@ type DelegateTool struct {
 	delegateConfig     DelegateConfig
 }
 
-// NewDelegateTool creates a DelegateTool.
+// delegateFocusDirective is injected into every sub-session's system prompt to
+// keep the agent goal-oriented and prevent aimless exploration.
+const delegateFocusDirective = `You are a focused sub-agent executing a single, well-defined task.
+
+Rules:
+- Do only what is necessary to accomplish the stated goal. Avoid tangential exploration.
+- Use the minimum number of tool calls needed. Prefer targeted queries over broad searches.
+- As soon as the goal is achieved, stop and return your findings. Do not continue working after the goal is met.
+- If you reach a point where the goal cannot be achieved with the information available, stop and report what you found and what is missing.`
+
+
 //
 //   - parentSessionID: the ID of the parent session (stored in Session.ParentID
 //     of the sub-session for traceability).
@@ -186,7 +196,9 @@ func (d *DelegateTool) Execute(ctx context.Context, input map[string]any) (tool.
 	subProvider := d.sseProviderFactory(subSessionID)
 
 	// Build system prompt for the sub-session.
-	extraSystem := d.delegateConfig.ExtraSystem
+	// Always prepend the focus directive so the sub-agent stays goal-oriented
+	// regardless of what ExtraSystem the caller provides.
+	extraSystem := append([]string{delegateFocusDirective}, d.delegateConfig.ExtraSystem...)
 
 	h := RunLoopAsync(ctx, d.s, RunInput{
 		SessionID:             subSessionID,
