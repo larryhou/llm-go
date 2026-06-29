@@ -34,6 +34,11 @@ type DelegateConfig struct {
 	// ExtraSystem provides additional system instructions for the sub-session,
 	// appended after the base prompt.
 	ExtraSystem []string
+
+	// Observer, when non-nil, is forwarded to the sub-session RunLoop so its
+	// runtime events are reported with ParentSessionID set to the parent.
+	// Nil is a no-op.
+	Observer RunObserver
 }
 
 // DelegateTool implements tool.Tool. When the main LLM calls "delegate_task",
@@ -191,6 +196,21 @@ func (d *DelegateTool) Execute(ctx context.Context, input map[string]any) (tool.
 	log.Printf("[delegate_task] parent=%s sub=%s goal=%q",
 		d.parentSessionID, subSessionID, truncateGoal(goal, 80))
 
+	// 广播 delegate 子 session 启动。子 session 自身的 turn/tool 事件随后照常
+	// 上报，带同一 ParentSessionID，下游可据此归类到父 session 的当前 turn 下。
+	emitRun(d.delegateConfig.Observer, RunEvent{
+		SessionID:       subSessionID,
+		ParentSessionID: d.parentSessionID,
+		Kind:            RunKindDelegateStart,
+		Tool:            "delegate_task",
+	})
+	defer emitRun(d.delegateConfig.Observer, RunEvent{
+		SessionID:       subSessionID,
+		ParentSessionID: d.parentSessionID,
+		Kind:            RunKindDelegateEnd,
+		Tool:            "delegate_task",
+	})
+
 	// Build the sub-session provider. The factory wraps innerProv so that
 	// streaming events are forwarded to the SSE client tagged with sub_session_id.
 	subProvider := d.sseProviderFactory(subSessionID)
@@ -212,6 +232,8 @@ func (d *DelegateTool) Execute(ctx context.Context, input map[string]any) (tool.
 		AgentPrompt:           d.delegateConfig.AgentPrompt,
 		ExtraSystem:           extraSystem,
 		DisableProviderPrompt: d.delegateConfig.AgentPrompt != "",
+		Observer:              d.delegateConfig.Observer,
+		ParentSessionID:       d.parentSessionID,
 		// Sub-sessions can run many tool calls. OmitConsumedTools keeps context
 		// lean by replacing already-consumed tool results with a placeholder,
 		// allowing longer task sequences without hitting the context limit.

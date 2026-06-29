@@ -92,6 +92,19 @@ type RunInput struct {
 	// This reduces context size for long agentic sessions with many tool calls.
 	// Default false — tool results are kept verbatim.
 	OmitConsumedTools bool
+
+	// Observer, when non-nil, receives runtime lifecycle events for this turn
+	// (and any delegate sub-sessions it spawns) for monitoring / stuck
+	// diagnosis. Nil is a no-op with zero overhead. The implementation must be
+	// concurrency-safe and return quickly — it is called synchronously on the
+	// RunLoop goroutine and must not block.
+	Observer RunObserver
+
+	// ParentSessionID, when non-empty, marks this RunLoop as a delegate
+	// sub-session of the given parent. It is propagated into every RunEvent so
+	// downstream observers can group sub-session events under their parent.
+	// Top-level turns leave this empty.
+	ParentSessionID string
 }
 
 // RunHandle is returned by RunLoopAsync. It allows the caller to cancel the
@@ -167,6 +180,14 @@ func RunLoopAsync(ctx context.Context, s store.Store, input RunInput) *RunHandle
 		if errors.Is(h.Err, context.DeadlineExceeded) {
 			h.StopReason = StopReasonTimeout
 		}
+		// 整轮结束 → 广播 TurnEnd（带最终 StopReason / Err）。纯广播，不持久化。
+		emitRun(input.Observer, RunEvent{
+			SessionID:       input.SessionID,
+			ParentSessionID: input.ParentSessionID,
+			Kind:            RunKindTurnEnd,
+			StopReason:      h.StopReason,
+			Err:             h.Err,
+		})
 	}()
 	return h
 }
@@ -226,6 +247,13 @@ func runLoopInternal(ctx context.Context, s store.Store, input RunInput, h *RunH
 		return RunResultStop, fmt.Errorf("runloop: create user text part: %w", err)
 	}
 
+	// 用户轮次正式开始（user message 已落库）→ 广播 TurnStart。
+	emitRun(input.Observer, RunEvent{
+		SessionID:       input.SessionID,
+		ParentSessionID: input.ParentSessionID,
+		Kind:            RunKindTurnStart,
+	})
+
 	// Load messages once and cache across steps.
 	// Only reloaded after compaction (which restructures history).
 	msgs, allParts, err := loadMessages(ctx, s, input.SessionID)
@@ -254,7 +282,9 @@ func runLoopInternal(ctx context.Context, s store.Store, input RunInput, h *RunH
 	// The most recent assistant message's tool results may not yet have been
 	// consumed by a subsequent LLM call, so they are left intact.
 	if input.OmitConsumedTools {
-		omitHistoricalToolResults(ctx, s, msgs, allParts)
+		if n := omitHistoricalToolResults(ctx, s, msgs, allParts); n > 0 {
+			emitRun(input.Observer, RunEvent{SessionID: input.SessionID, ParentSessionID: input.ParentSessionID, Kind: RunKindToolsOmitted, Detail: fmt.Sprintf("历史工具结果剔除 %d 条", n)})
+		}
 	}
 
 	// tooLongRetries counts consecutive EventError→IsContextOverflow fallbacks
@@ -329,13 +359,15 @@ func runLoopInternal(ctx context.Context, s store.Store, input RunInput, h *RunH
 
 		// Run one LLM turn
 		result, err := processor.Process(ctx, assistantMsgID, ProcessInput{
-			SessionID: input.SessionID,
-			Model:     input.Model,
-			System:    system,
-			Messages:  modelMsgs,
-			Tools:     tools,
-			Provider:  input.Provider,
-			Config:    input.Config,
+			SessionID:       input.SessionID,
+			Model:           input.Model,
+			System:          system,
+			Messages:        modelMsgs,
+			Tools:           tools,
+			Provider:        input.Provider,
+			Config:          input.Config,
+			Observer:        input.Observer,
+			ParentSessionID: input.ParentSessionID,
 		})
 		if err != nil {
 			// Only mark the assistant message as cancelled/interrupted when the
@@ -398,7 +430,9 @@ func runLoopInternal(ctx context.Context, s store.Store, input RunInput, h *RunH
 		// previous step now that the current LLM step has successfully consumed
 		// them. This keeps context lean without losing the tool call record.
 		if input.OmitConsumedTools && previousAssistantMsgID != "" {
-			omitConsumedToolResults(ctx, s, previousAssistantMsgID, allParts)
+			if n := omitConsumedToolResults(ctx, s, previousAssistantMsgID, allParts); n > 0 {
+				emitRun(input.Observer, RunEvent{SessionID: input.SessionID, ParentSessionID: input.ParentSessionID, Kind: RunKindToolsOmitted, Detail: fmt.Sprintf("已消费工具结果剔除 %d 条", n)})
+			}
 		}
 		previousAssistantMsgID = assistantMsgID
 
@@ -535,6 +569,7 @@ func runLoopInternal(ctx context.Context, s store.Store, input RunInput, h *RunH
 
 				tooLongRetries++
 				log.Printf("[session] too-long: replacing tool output in msg %q (retry %d/3)", toolAssistantMsgID, tooLongRetries)
+				emitRun(input.Observer, RunEvent{SessionID: input.SessionID, ParentSessionID: input.ParentSessionID, Kind: RunKindOverflow, Detail: fmt.Sprintf("替换超大工具输出 (重试 %d/3)", tooLongRetries)})
 				d, _ := store.DataAs[*store.ToolPartData](lastToolPart)
 				d.Output = "[Tool output was too large for the context window. Please try a different approach: use more specific parameters, request a smaller result, or use a different tool.]"
 				lastToolPart.Data = d
@@ -555,6 +590,7 @@ func runLoopInternal(ctx context.Context, s store.Store, input RunInput, h *RunH
 				// with a synthetic user message so the LLM resumes the current task
 				// transparently without waiting for the next real user message.
 				log.Printf("[session] compact triggered (predictive): input=%d", lastInputTokens)
+				emitRun(input.Observer, RunEvent{SessionID: input.SessionID, ParentSessionID: input.ParentSessionID, Kind: RunKindCompactStart, Detail: "predictive overflow"})
 				_, err := compactor.Compact(ctx, input.SessionID, ProcessInput{
 					SessionID:       input.SessionID,
 					Model:           input.Model,
@@ -565,8 +601,10 @@ func runLoopInternal(ctx context.Context, s store.Store, input RunInput, h *RunH
 				})
 				if err != nil {
 					log.Printf("[session] compact failed: %v", err)
+					emitRun(input.Observer, RunEvent{SessionID: input.SessionID, ParentSessionID: input.ParentSessionID, Kind: RunKindCompactEnd, Err: err})
 					return RunResultStop, fmt.Errorf("runloop: compaction failed: %w", err)
 				}
+				emitRun(input.Observer, RunEvent{SessionID: input.SessionID, ParentSessionID: input.ParentSessionID, Kind: RunKindCompactEnd})
 				log.Printf("[session] compact done (predictive), injecting resume message")
 
 				// Write a synthetic user message so the next loop iteration has a
@@ -609,6 +647,8 @@ func runLoopInternal(ctx context.Context, s store.Store, input RunInput, h *RunH
 
 			// Path B: reactive overflow (EventError). Run compact then retry.
 			log.Printf("[session] too-long: reactive overflow, compacting before retry")
+			emitRun(input.Observer, RunEvent{SessionID: input.SessionID, ParentSessionID: input.ParentSessionID, Kind: RunKindOverflow, Detail: "reactive overflow, compacting"})
+			emitRun(input.Observer, RunEvent{SessionID: input.SessionID, ParentSessionID: input.ParentSessionID, Kind: RunKindCompactStart, Detail: "reactive overflow"})
 			_, compactErr := compactor.Compact(ctx, input.SessionID, ProcessInput{
 				SessionID:       input.SessionID,
 				Model:           input.Model,
@@ -619,8 +659,10 @@ func runLoopInternal(ctx context.Context, s store.Store, input RunInput, h *RunH
 			})
 			if compactErr != nil {
 				log.Printf("[session] too-long compact failed: %v", compactErr)
+				emitRun(input.Observer, RunEvent{SessionID: input.SessionID, ParentSessionID: input.ParentSessionID, Kind: RunKindCompactEnd, Err: compactErr})
 				return RunResultStop, fmt.Errorf("runloop: too-long compaction failed: %w", compactErr)
 			}
+			emitRun(input.Observer, RunEvent{SessionID: input.SessionID, ParentSessionID: input.ParentSessionID, Kind: RunKindCompactEnd})
 
 			// Reload message cache after compaction (history was restructured).
 			msgs, allParts, err = loadMessages(ctx, s, input.SessionID)
@@ -804,8 +846,8 @@ func markAssistantCancelled(s store.Store, assistantMsgID string) {
 // Called after the following LLM step has successfully consumed the tool results,
 // so they no longer need to occupy context space.
 // Parts that are already omitted or compacted are skipped.
-func omitConsumedToolResults(ctx context.Context, s store.Store, msgID string, allParts map[string][]*store.Part) {
-	omitPartsInMessage(ctx, s, msgID, allParts, time.Now().UnixMilli())
+func omitConsumedToolResults(ctx context.Context, s store.Store, msgID string, allParts map[string][]*store.Part) int {
+	return omitPartsInMessage(ctx, s, msgID, allParts, time.Now().UnixMilli())
 }
 
 // omitHistoricalToolResults omits completed tool results from all historical
@@ -815,7 +857,7 @@ func omitConsumedToolResults(ctx context.Context, s store.Store, msgID string, a
 //
 // The most recent assistant message is skipped: its tool results may not yet
 // have been seen by a subsequent LLM step, so they must be preserved.
-func omitHistoricalToolResults(ctx context.Context, s store.Store, msgs []*store.Message, allParts map[string][]*store.Part) {
+func omitHistoricalToolResults(ctx context.Context, s store.Store, msgs []*store.Message, allParts map[string][]*store.Part) int {
 	// Find the ID of the most recent non-summary assistant message.
 	latestAssistantID := ""
 	for i := len(msgs) - 1; i >= 0; i-- {
@@ -827,6 +869,7 @@ func omitHistoricalToolResults(ctx context.Context, s store.Store, msgs []*store
 	}
 
 	now := time.Now().UnixMilli()
+	total := 0
 	for _, m := range msgs {
 		if m.Role != store.RoleAssistant || m.Summary {
 			continue
@@ -834,13 +877,16 @@ func omitHistoricalToolResults(ctx context.Context, s store.Store, msgs []*store
 		if m.ID == latestAssistantID {
 			continue // preserve the most recent assistant message
 		}
-		omitPartsInMessage(ctx, s, m.ID, allParts, now)
+		total += omitPartsInMessage(ctx, s, m.ID, allParts, now)
 	}
+	return total
 }
 
 // omitPartsInMessage sets Omitted on every eligible completed tool part in msgID.
-// Shared by omitHistoricalToolResults and omitConsumedToolResults.
-func omitPartsInMessage(ctx context.Context, s store.Store, msgID string, allParts map[string][]*store.Part, now int64) {
+// Shared by omitHistoricalToolResults and omitConsumedToolResults. Returns the
+// number of tool results actually omitted (for observability).
+func omitPartsInMessage(ctx context.Context, s store.Store, msgID string, allParts map[string][]*store.Part, now int64) int {
+	n := 0
 	for _, p := range allParts[msgID] {
 		if p.Type != store.PartTypeTool {
 			continue
@@ -856,6 +902,9 @@ func omitPartsInMessage(ctx context.Context, s store.Store, msgID string, allPar
 		p.Data = d
 		if err := s.UpdatePart(ctx, p); err != nil {
 			log.Printf("[session] omit tool result %s: %v", p.ID, err)
+			continue
 		}
+		n++
 	}
+	return n
 }

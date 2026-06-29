@@ -48,6 +48,10 @@ type ProcessInput struct {
 	// OnCompact, when non-nil, is called after each successful Compact().
 	// Passed through from RunInput so the compaction hook reaches Compactor.Compact().
 	OnCompact store.CompactionHook
+
+	// Observer / ParentSessionID forwarded from RunInput for runtime events.
+	Observer        RunObserver
+	ParentSessionID string
 }
 
 // Processor handles one LLM streaming turn, managing the lifecycle of
@@ -102,6 +106,12 @@ func (p *Processor) Process(ctx context.Context, assistantMsgID string, input Pr
 	}
 
 	client := llm.NewClient(input.Provider)
+	// 已向 LLM 发出请求，进入等待响应阶段（每个 agentic step 触发一次）。
+	emitRun(input.Observer, RunEvent{
+		SessionID:       input.SessionID,
+		ParentSessionID: input.ParentSessionID,
+		Kind:            RunKindRequestLLM,
+	})
 	events := client.Stream(ctx, req)
 
 	toolCtx, toolCancel := context.WithCancel(ctx)
@@ -117,6 +127,8 @@ func (p *Processor) Process(ctx context.Context, assistantMsgID string, input Pr
 		// recentCalls shared from Processor so doom-loop detection spans steps
 		sharedRecentCalls:   &p.recentCalls,
 		sharedRecentCallsMu: &p.recentCallsMu,
+		observer:            input.Observer,
+		parentSessionID:     input.ParentSessionID,
 	}
 
 	result := ProcessContinue
@@ -187,6 +199,10 @@ type processorState struct {
 	// token usage accumulation
 	totalUsage llm.TokenUsage
 
+	// observer / parent for runtime events (nil-safe via emitRun)
+	observer        RunObserver
+	parentSessionID string
+
 	// flags
 	needsCompaction bool
 	blocked         bool
@@ -204,6 +220,8 @@ func (s *processorState) handleEvent(ctx context.Context, ev llm.Event) (Process
 	case llm.EventTextStart:
 		s.currentTextStart = nowMS()
 		s.currentTextBuf = ""
+		// LLM 开始输出文本 → 进入生成阶段。
+		emitRun(s.observer, RunEvent{SessionID: s.sessionID, ParentSessionID: s.parentSessionID, Kind: RunKindGenerating})
 		id, err := s.createPart(ctx, store.PartTypeText, &store.TextPartData{
 			TimeStart: s.currentTextStart,
 		})
@@ -229,6 +247,8 @@ func (s *processorState) handleEvent(ctx context.Context, ev llm.Event) (Process
 	case llm.EventReasoningDelta:
 		if s.currentReasoningPartID == "" {
 			s.currentReasoningStart = nowMS()
+			// LLM 开始输出思考 → 进入生成阶段。
+			emitRun(s.observer, RunEvent{SessionID: s.sessionID, ParentSessionID: s.parentSessionID, Kind: RunKindGenerating})
 			id, err := s.createPart(ctx, store.PartTypeReasoning, &store.ReasoningPartData{
 				TimeStart: s.currentReasoningStart,
 			})
@@ -279,6 +299,7 @@ func (s *processorState) handleEvent(ctx context.Context, ev llm.Event) (Process
 		// Doom-loop detection: same tool + same args 3 times in a row
 		if s.checkDoomLoop(ev.ToolName, inputKey) {
 			// Mark as error and stop
+			emitRun(s.observer, RunEvent{SessionID: s.sessionID, ParentSessionID: s.parentSessionID, Kind: RunKindDoomLoop, Tool: ev.ToolName})
 			_ = s.updateToolStatus(ctx, partID, store.ToolStatusError, nil, "Doom loop detected: repeated identical tool call")
 			return ProcessStop, fmt.Errorf("doom loop detected for tool %q", ev.ToolName)
 		}
@@ -309,6 +330,9 @@ func (s *processorState) handleEvent(ctx context.Context, ev llm.Event) (Process
 
 	case llm.EventStepFinish:
 		s.totalUsage = s.totalUsage.Add(ev.Usage)
+
+		// 一个 agentic step 完成（广播，不持久化）。
+		emitRun(s.observer, RunEvent{SessionID: s.sessionID, ParentSessionID: s.parentSessionID, Kind: RunKindStepFinish})
 
 		// Persist step-finish part
 		_, _ = s.createPart(ctx, store.PartTypeStepFinish, &store.StepFinishData{
@@ -345,9 +369,17 @@ func (s *processorState) handleEvent(ctx context.Context, ev llm.Event) (Process
 func (s *processorState) executeTool(ctx context.Context, callID, toolName, partID string, input map[string]any) {
 	defer s.toolWg.Done()
 
+	// 工具开始执行 → 广播 ToolStart（带参数）；任意退出路径 defer 广播 ToolEnd（带输出/错误）。
+	emitRun(s.observer, RunEvent{SessionID: s.sessionID, ParentSessionID: s.parentSessionID, Kind: RunKindToolStart, Tool: toolName, ToolInput: input})
+	var toolErr, toolOut string
+	defer func() {
+		emitRun(s.observer, RunEvent{SessionID: s.sessionID, ParentSessionID: s.parentSessionID, Kind: RunKindToolEnd, Tool: toolName, ToolOutput: toolOut, ToolError: toolErr})
+	}()
+
 	t, ok := s.toolMap[toolName]
 	if !ok {
-		_ = s.updateToolStatus(ctx, partID, store.ToolStatusError, nil, fmt.Sprintf("tool %q not found", toolName))
+		toolErr = fmt.Sprintf("tool %q not found", toolName)
+		_ = s.updateToolStatus(ctx, partID, store.ToolStatusError, nil, toolErr)
 		return
 	}
 
@@ -356,17 +388,21 @@ func (s *processorState) executeTool(ctx context.Context, callID, toolName, part
 	// do not overwrite — cleanup's mark takes precedence because the tool goroutine
 	// outlived the cleanup window and is no longer considered part of the session.
 	if isAlreadyInterrupted(s.store, partID) {
+		toolErr = "interrupted"
 		return
 	}
 	if err != nil {
 		if tf, ok := tool.IsToolFailure(err); ok {
+			toolErr = tf.Message
 			_ = s.updateToolStatus(ctx, partID, store.ToolStatusError, nil, tf.Message)
 		} else {
+			toolErr = err.Error()
 			_ = s.updateToolStatus(ctx, partID, store.ToolStatusError, nil, err.Error())
 		}
 		return
 	}
 
+	toolOut = result.Output
 	_ = s.updateToolCompleted(ctx, partID, toolName, callID, input, result)
 }
 
