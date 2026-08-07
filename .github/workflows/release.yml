@@ -1,0 +1,88 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build and release
+    runs-on: ubuntu-latest
+
+    strategy:
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+          - goos: linux
+            goarch: arm64
+          - goos: darwin
+            goarch: amd64
+          - goos: darwin
+            goarch: arm64
+          - goos: windows
+            goarch: amd64
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Set version variables
+        id: vars
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Build binaries
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: 0
+        run: |
+          VERSION="${{ steps.vars.outputs.version }}"
+          LDFLAGS="-s -w -X main.Version=${VERSION}"
+          SUFFIX=""
+          if [ "$GOOS" = "windows" ]; then SUFFIX=".exe"; fi
+
+          for cmd in llm-api control replay; do
+            OUT="dist/${cmd}-${GOOS}-${GOARCH}${SUFFIX}"
+            go build -trimpath -ldflags "${LDFLAGS}" -o "${OUT}" "./cmd/${cmd}"
+          done
+
+      - name: Create archives
+        run: |
+          GOOS="${{ matrix.goos }}"
+          GOARCH="${{ matrix.goarch }}"
+          SUFFIX=""
+          if [ "$GOOS" = "windows" ]; then SUFFIX=".exe"; fi
+          TAG="${{ steps.vars.outputs.tag }}"
+
+          mkdir -p archives
+          for cmd in llm-api control replay; do
+            BIN="dist/${cmd}-${GOOS}-${GOARCH}${SUFFIX}"
+            ARCHIVE="archives/${cmd}-${TAG}-${GOOS}-${GOARCH}"
+            if [ "$GOOS" = "windows" ]; then
+              zip "${ARCHIVE}.zip" "${BIN}"
+            else
+              tar -czf "${ARCHIVE}.tar.gz" -C dist "${cmd}-${GOOS}-${GOARCH}"
+            fi
+          done
+
+      - name: Upload release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: archives/*
+          generate_release_notes: true
