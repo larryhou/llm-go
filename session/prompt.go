@@ -105,6 +105,16 @@ type RunInput struct {
 	// downstream observers can group sub-session events under their parent.
 	// Top-level turns leave this empty.
 	ParentSessionID string
+
+	// DoomLoop controls whether doom-loop detection is active for this run.
+	// Doom-loop detection stops the run when the same tool is called with
+	// identical arguments DoomLoopThreshold times consecutively.
+	//
+	// nil and true both enable detection (default behaviour).
+	// Set to false to disable when legitimate workflows repeat the same tool
+	// call (e.g. polling, health checks, retries) and detection produces false
+	// positives.
+	DoomLoop *bool
 }
 
 // RunHandle is returned by RunLoopAsync. It allows the caller to cancel the
@@ -368,6 +378,7 @@ func runLoopInternal(ctx context.Context, s store.Store, input RunInput, h *RunH
 			Config:          input.Config,
 			Observer:        input.Observer,
 			ParentSessionID: input.ParentSessionID,
+			DoomLoop:        input.DoomLoop,
 		})
 		if err != nil {
 			// Only mark the assistant message as cancelled/interrupted when the

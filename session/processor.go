@@ -52,6 +52,10 @@ type ProcessInput struct {
 	// Observer / ParentSessionID forwarded from RunInput for runtime events.
 	Observer        RunObserver
 	ParentSessionID string
+
+	// DoomLoop controls doom-loop detection for this processing turn.
+	// Forwarded from RunInput.DoomLoop. nil and true both enable detection.
+	DoomLoop *bool
 }
 
 // Processor handles one LLM streaming turn, managing the lifecycle of
@@ -129,6 +133,7 @@ func (p *Processor) Process(ctx context.Context, assistantMsgID string, input Pr
 		sharedRecentCallsMu: &p.recentCallsMu,
 		observer:            input.Observer,
 		parentSessionID:     input.ParentSessionID,
+		doomLoop:            input.DoomLoop,
 	}
 
 	result := ProcessContinue
@@ -206,6 +211,7 @@ type processorState struct {
 	// flags
 	needsCompaction bool
 	blocked         bool
+	doomLoop        *bool // nil or true → detection enabled; false → disabled
 }
 
 func (s *processorState) handleEvent(ctx context.Context, ev llm.Event) (ProcessResult, error) {
@@ -296,8 +302,10 @@ func (s *processorState) handleEvent(ctx context.Context, ev llm.Event) (Process
 		}
 		inputKey := marshalInput(ev.Input)
 
-		// Doom-loop detection: same tool + same args 3 times in a row
-		if s.checkDoomLoop(ev.ToolName, inputKey) {
+		// Doom-loop detection: same tool + same args 3 times in a row.
+		// Enabled when DoomLoop is nil or true; disabled only when explicitly false.
+		doomLoopEnabled := s.doomLoop == nil || *s.doomLoop
+		if doomLoopEnabled && s.checkDoomLoop(ev.ToolName, inputKey) {
 			// Mark as error and stop
 			emitRun(s.observer, RunEvent{SessionID: s.sessionID, ParentSessionID: s.parentSessionID, Kind: RunKindDoomLoop, Tool: ev.ToolName})
 			_ = s.updateToolStatus(ctx, partID, store.ToolStatusError, nil, "Doom loop detected: repeated identical tool call")
