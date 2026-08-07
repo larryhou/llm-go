@@ -107,7 +107,15 @@ func (t *GlobTool) Execute(ctx context.Context, input map[string]any) (tool.Resu
 	sem := make(chan struct{}, 16)
 	for _, p := range rawPaths {
 		wg.Add(1)
-		sem <- struct{}{}
+		select {
+		case sem <- struct{}{}:
+		case <-ctx.Done():
+			wg.Done()
+			// Wait for already-dispatched goroutines to finish before returning,
+			// so they can safely release the semaphore and write to entries.
+			wg.Wait()
+			return tool.Result{}, tool.Fail(fmt.Sprintf("glob cancelled: %v", ctx.Err()))
+		}
 		go func(p string) {
 			defer wg.Done()
 			defer func() { <-sem }()
@@ -170,9 +178,15 @@ func runRgGlob(ctx context.Context, rgPath, dir, pattern string, maxResults int)
 	cmd := exec.CommandContext(ctx, rgPath, "--files", "--glob", pattern, dir)
 	out, err := cmd.Output()
 	if err != nil {
-		// Exit code 1 means no matches — not a real error.
-		if exitErr, ok := err.(*exec.ExitError); ok && exitErr.ExitCode() == 1 {
-			return nil, nil
+		if exitErr, ok := err.(*exec.ExitError); ok {
+			// Exit code 1 means no matches — not a real error.
+			if exitErr.ExitCode() == 1 {
+				return nil, nil
+			}
+			// Include rg's stderr in the error for diagnosability.
+			if len(exitErr.Stderr) > 0 {
+				return nil, fmt.Errorf("%w: %s", err, strings.TrimSpace(string(exitErr.Stderr)))
+			}
 		}
 		return nil, err
 	}
@@ -189,8 +203,12 @@ func runRgGlob(ctx context.Context, rgPath, dir, pattern string, maxResults int)
 }
 
 // walkGlob is a pure-Go fallback when ripgrep is not available.
+// Supports ** glob patterns by matching against both the full relative path
+// and the base filename. filepath.Match does not handle **, so patterns
+// containing ** are matched with matchDoublestar.
 // If maxResults <= 0, all matching paths are collected.
 func walkGlob(root, pattern string, maxResults int) ([]string, error) {
+	hasDoublestar := strings.Contains(pattern, "**")
 	var paths []string
 	err := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
 		if err != nil || d.IsDir() {
@@ -200,12 +218,18 @@ func walkGlob(root, pattern string, maxResults int) ([]string, error) {
 		if err2 != nil {
 			return nil
 		}
-		matched, err3 := filepath.Match(pattern, rel)
-		if err3 != nil {
-			return err3
-		}
-		if !matched {
-			matched, _ = filepath.Match(pattern, filepath.Base(path))
+		var matched bool
+		if hasDoublestar {
+			matched = matchDoublestar(pattern, filepath.ToSlash(rel))
+		} else {
+			var err3 error
+			matched, err3 = filepath.Match(pattern, rel)
+			if err3 != nil {
+				return err3
+			}
+			if !matched {
+				matched, _ = filepath.Match(pattern, filepath.Base(path))
+			}
 		}
 		if matched {
 			paths = append(paths, path)
@@ -216,4 +240,47 @@ func walkGlob(root, pattern string, maxResults int) ([]string, error) {
 		return nil
 	})
 	return paths, err
+}
+
+// matchDoublestar matches a slash-separated path against a glob pattern that
+// may contain ** (matches zero or more path segments) in addition to the
+// standard * and ? wildcards supported by filepath.Match.
+func matchDoublestar(pattern, path string) bool {
+	// Split on ** and match each segment with filepath.Match on the remainder.
+	parts := strings.SplitN(pattern, "**", 2)
+	if len(parts) == 1 {
+		// No **, fall back to standard match.
+		ok, _ := filepath.Match(pattern, path)
+		return ok
+	}
+	prefix, suffix := parts[0], parts[1]
+	// Remove leading slash from suffix if present.
+	suffix = strings.TrimPrefix(suffix, "/")
+
+	// The prefix must match the beginning of the path.
+	if prefix != "" {
+		prefix = strings.TrimSuffix(prefix, "/")
+		if !strings.HasPrefix(path, prefix+"/") && path != prefix {
+			return false
+		}
+		// Advance past the matched prefix.
+		path = strings.TrimPrefix(path, prefix)
+		path = strings.TrimPrefix(path, "/")
+	}
+
+	if suffix == "" {
+		// ** at the end matches everything.
+		return true
+	}
+
+	// Try matching suffix against every possible tail of path.
+	// e.g. pattern "**/*.go" with suffix "*.go" must match the last segment.
+	segments := strings.Split(path, "/")
+	for i := range segments {
+		tail := strings.Join(segments[i:], "/")
+		if ok, _ := filepath.Match(suffix, tail); ok {
+			return true
+		}
+	}
+	return false
 }

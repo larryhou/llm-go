@@ -220,7 +220,7 @@ func (t *ReadTool) readFile(filePath string, offset, limit int) (tool.Result, er
 		}
 		if len(raw) >= limit {
 			more = true
-			continue
+			break // line limit reached; no need to scan the rest of the file
 		}
 		line := scanner.Text()
 		if len([]rune(line)) > readMaxLineLen {
@@ -242,8 +242,9 @@ func (t *ReadTool) readFile(filePath string, offset, limit int) (tool.Result, er
 		return tool.Result{}, tool.Fail(fmt.Sprintf("read error: %v", err2))
 	}
 
-	// Validate offset.
-	if count < offset-1 && !(count == 0 && offset == 1) {
+	// Validate offset: report out-of-range when offset points past the last
+	// line. offset=1 on an empty file is allowed (returns empty content).
+	if offset > 1 && count < offset {
 		return tool.Result{}, tool.Fail(fmt.Sprintf("Offset %d is out of range for this file (%d lines)", offset, count))
 	}
 
@@ -259,7 +260,9 @@ func (t *ReadTool) readFile(filePath string, offset, limit int) (tool.Result, er
 	if cut {
 		footer = fmt.Sprintf("\n(Output capped at %s. Showing lines %d-%d. Use offset=%d to continue.)", readMaxBytesLabel, offset, last, next)
 	} else if more {
-		footer = fmt.Sprintf("\n(Showing lines %d-%d of %d. Use offset=%d to continue.)", offset, last, count, next)
+		// count reflects lines scanned up to the limit; total line count is
+		// unknown (we stopped early). Omit "of N" to avoid misleading the LLM.
+		footer = fmt.Sprintf("\n(Showing lines %d-%d. Use offset=%d to continue.)", offset, last, next)
 	} else {
 		footer = fmt.Sprintf("\n(End of file - total %d lines)", count)
 	}
@@ -270,12 +273,16 @@ func (t *ReadTool) readFile(filePath string, offset, limit int) (tool.Result, er
 	return tool.Result{Output: output}, nil
 }
 
-func (t *ReadTool) readBinary(f *os.File, filePath, mimeType string, sample []byte) (tool.Result, error) {
-	rest, err := io.ReadAll(f)
+func (t *ReadTool) readBinary(f *os.File, filePath, mimeType string, _ []byte) (tool.Result, error) {
+	// Seek back to start and read the whole file in one allocation, avoiding
+	// the double-allocation that append(sample, rest...) causes.
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		return tool.Result{}, tool.Fail(err.Error())
+	}
+	data, err := io.ReadAll(f)
 	if err != nil {
 		return tool.Result{}, tool.Fail(err.Error())
 	}
-	data := append(sample, rest...)
 	return tool.Result{
 		Output: fmt.Sprintf("<path>%s</path>\n<type>%s</type>", filePath, mimeType),
 		Attachments: []tool.Attachment{

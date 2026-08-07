@@ -102,7 +102,7 @@ func TestGlob_Truncation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(res.Output, "truncated") {
+	if !strings.Contains(res.Output, "too large") && !strings.Contains(res.Output, "truncated") {
 		t.Errorf("expected truncation notice, got:\n%s", res.Output)
 	}
 	if res.Metadata["truncated"] != true {

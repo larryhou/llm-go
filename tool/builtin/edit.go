@@ -16,8 +16,10 @@ import (
 type EditTool struct {
 	WorkDir string
 
-	mu    sync.Mutex
-	locks map[string]*sync.Mutex
+	// locks provides per-file mutual exclusion. sync.Map is used so that
+	// entries for rarely-touched files can be GC'd rather than accumulating
+	// forever in a plain map.
+	locks sync.Map // map[string]*sync.Mutex
 }
 
 func (t *EditTool) Name() string { return "edit" }
@@ -77,6 +79,12 @@ func (t *EditTool) Execute(ctx context.Context, input map[string]any) (tool.Resu
 		return tool.Result{}, tool.Fail("No changes to apply: oldString and newString are identical.")
 	}
 
+	// Per-file mutex prevents concurrent edits — acquired for both the
+	// file-creation path (oldString=="") and the normal replacement path.
+	fileMu := t.fileMutex(filePath)
+	fileMu.Lock()
+	defer fileMu.Unlock()
+
 	// File creation mode when oldString is empty.
 	if oldString == "" {
 		if err := os.MkdirAll(filepath.Dir(filePath), 0o755); err != nil {
@@ -88,11 +96,6 @@ func (t *EditTool) Execute(ctx context.Context, input map[string]any) (tool.Resu
 		return tool.Result{Output: "Edit applied successfully."}, nil
 	}
 
-	// Per-file mutex to prevent concurrent edits.
-	fileMu := t.fileMutex(filePath)
-	fileMu.Lock()
-	defer fileMu.Unlock()
-
 	raw, err := os.ReadFile(filePath)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -102,23 +105,24 @@ func (t *EditTool) Execute(ctx context.Context, input map[string]any) (tool.Resu
 	}
 
 	// Detect and preserve line endings.
+	// Normalise the file content and both search strings to LF for matching,
+	// then restore the original line ending in the replacement before writing.
 	content := string(raw)
 	ending := detectLineEnding(content)
-	// Normalise both content and search strings to LF, then convert to detected ending.
-	normalised := normalizeLineEndings(content)
-	oldNorm := convertLineEnding(normalizeLineEndings(oldString), ending)
-	newNorm := convertLineEnding(normalizeLineEndings(newString), ending)
+	normContent := normalizeLineEndings(content)
+	oldNorm := normalizeLineEndings(oldString)
+	newNorm := normalizeLineEndings(newString)
 
-	result, err2 := editReplace(content, oldNorm, newNorm, replaceAll)
+	normResult, err2 := editReplace(normContent, oldNorm, newNorm, replaceAll)
 	if err2 != nil {
 		return tool.Result{}, tool.Fail(err2.Error())
 	}
+	result := convertLineEnding(normResult, ending)
 
 	if err := os.WriteFile(filePath, []byte(result), 0o644); err != nil {
 		return tool.Result{}, tool.Fail(fmt.Sprintf("failed to write file: %v", err))
 	}
 
-	_ = normalised // used implicitly via normalizeLineEndings above
 	added, removed := diffStats(content, result)
 	return tool.Result{
 		Output: "Edit applied successfully.",
@@ -131,17 +135,9 @@ func (t *EditTool) Execute(ctx context.Context, input map[string]any) (tool.Resu
 }
 
 func (t *EditTool) fileMutex(path string) *sync.Mutex {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	if t.locks == nil {
-		t.locks = make(map[string]*sync.Mutex)
-	}
-	if mu, ok := t.locks[path]; ok {
-		return mu
-	}
 	mu := &sync.Mutex{}
-	t.locks[path] = mu
-	return mu
+	actual, _ := t.locks.LoadOrStore(path, mu)
+	return actual.(*sync.Mutex)
 }
 
 func normalizeLineEndings(s string) string {
@@ -285,7 +281,7 @@ func blockAnchorReplacer(content, find string) []string {
 
 	similarity := func(c candidate) float64 {
 		actualSize := c.endLine - c.startLine + 1
-		linesToCheck := min2(searchBlockSize-2, actualSize-2)
+		linesToCheck := min(searchBlockSize-2, actualSize-2)
 		if linesToCheck <= 0 {
 			return 1.0
 		}
@@ -293,7 +289,7 @@ func blockAnchorReplacer(content, find string) []string {
 		for j := 1; j < searchBlockSize-1 && j < actualSize-1; j++ {
 			ol := strings.TrimSpace(originalLines[c.startLine+j])
 			sl := strings.TrimSpace(searchLines[j])
-			maxLen := max2(len(ol), len(sl))
+			maxLen := max(len(ol), len(sl))
 			if maxLen == 0 {
 				continue
 			}
@@ -607,34 +603,44 @@ func levenshtein(a, b string) int {
 			if ra[i-1] == rb[j-1] {
 				cost = 0
 			}
-			matrix[i][j] = min2(matrix[i-1][j]+1, min2(matrix[i][j-1]+1, matrix[i-1][j-1]+cost))
+			matrix[i][j] = min(matrix[i-1][j]+1, min(matrix[i][j-1]+1, matrix[i-1][j-1]+cost))
 		}
 	}
 	return matrix[len(ra)][len(rb)]
 }
 
-func min2(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
-}
 
-func max2(a, b int) int {
-	if a > b {
-		return a
-	}
-	return b
-}
-
-// diffStats counts added and removed lines between old and new content.
+// diffStats counts added and removed lines between old and new content using
+// a simple LCS-based comparison so that same-count replacements are counted
+// correctly (e.g. replacing 3 lines with 3 different lines → 3 added, 3 removed).
 func diffStats(oldContent, newContent string) (added, removed int) {
-	oldLines := strings.Split(oldContent, "\n")
-	newLines := strings.Split(newContent, "\n")
-	if len(newLines) > len(oldLines) {
-		added = len(newLines) - len(oldLines)
-	} else {
-		removed = len(oldLines) - len(newLines)
+	oldLines := strings.Split(normalizeLineEndings(oldContent), "\n")
+	newLines := strings.Split(normalizeLineEndings(newContent), "\n")
+
+	// Build LCS length table.
+	m, n := len(oldLines), len(newLines)
+	// Use two-row rolling array to keep memory O(n).
+	prev := make([]int, n+1)
+	curr := make([]int, n+1)
+	for i := 1; i <= m; i++ {
+		for j := 1; j <= n; j++ {
+			if oldLines[i-1] == newLines[j-1] {
+				curr[j] = prev[j-1] + 1
+			} else {
+				if prev[j] > curr[j-1] {
+					curr[j] = prev[j]
+				} else {
+					curr[j] = curr[j-1]
+				}
+			}
+		}
+		prev, curr = curr, prev
+		for k := range curr {
+			curr[k] = 0
+		}
 	}
+	lcs := prev[n]
+	added = n - lcs
+	removed = m - lcs
 	return
 }

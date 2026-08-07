@@ -108,13 +108,19 @@ func (t *GrepTool) Execute(ctx context.Context, input map[string]any) (tool.Resu
 	cmd := exec.CommandContext(ctx, rgPath, args...)
 	out, err := cmd.Output()
 	if err != nil {
-		if exitErr, ok := err.(*exec.ExitError); ok && exitErr.ExitCode() == 1 {
-			// No matches — mirrors opencode's `empty` return.
-			return tool.Result{
-				Title:  pattern,
-				Output: "No files found",
-				Metadata: map[string]any{"matches": 0, "truncated": false},
-			}, nil
+		if exitErr, ok := err.(*exec.ExitError); ok {
+			if exitErr.ExitCode() == 1 {
+				// No matches — mirrors opencode's `empty` return.
+				return tool.Result{
+					Title:  pattern,
+					Output: "No files found",
+					Metadata: map[string]any{"matches": 0, "truncated": false},
+				}, nil
+			}
+			// Include rg's stderr for diagnosability (e.g. invalid regex).
+			if len(exitErr.Stderr) > 0 {
+				return tool.Result{}, tool.Fail(fmt.Sprintf("grep failed: %s", strings.TrimSpace(string(exitErr.Stderr))))
+			}
 		}
 		return tool.Result{}, tool.Fail(fmt.Sprintf("grep failed: %v", err))
 	}
@@ -139,27 +145,25 @@ func (t *GrepTool) Execute(ctx context.Context, input map[string]any) (tool.Resu
 	}
 
 	total := len(matches)
-	truncated := total > grepMaxResults
-	final := matches
-	if truncated {
-		final = matches[:grepMaxResults]
-	}
 
-	// Also enforce a byte cap: drop trailing matches that would push the
-	// rendered output over grepMaxBytes.
+	// Apply both caps independently: whichever is hit first wins.
+	// The line cap and byte cap are AND constraints, not OR.
+	final := matches
 	bytesCapped := false
-	if !truncated {
-		totalBytes := 0
-		for i, m := range final {
-			totalBytes += len(m.file) + len(m.text) + 20 // approx per-line overhead
-			if totalBytes > grepMaxBytes {
-				final = final[:i]
-				truncated = true
-				bytesCapped = true
-				break
-			}
+	totalBytes := 0
+	for i, m := range final {
+		if i >= grepMaxResults {
+			final = final[:i]
+			break
+		}
+		totalBytes += len(m.file) + len(m.text) + 20 // approx per-line overhead
+		if totalBytes > grepMaxBytes {
+			final = final[:i]
+			bytesCapped = true
+			break
 		}
 	}
+	truncated := len(final) < total || bytesCapped
 
 	// Fetch mtime per unique file.
 	mtimes := make(map[string]int64)
@@ -167,13 +171,21 @@ func (t *GrepTool) Execute(ctx context.Context, input map[string]any) (tool.Resu
 	var mtimeWg sync.WaitGroup
 	sem := make(chan struct{}, 16)
 	seen := make(map[string]bool)
+	var ctxErr error
 	for _, m := range final {
 		if seen[m.file] {
 			continue
 		}
 		seen[m.file] = true
 		mtimeWg.Add(1)
-		sem <- struct{}{}
+		select {
+		case sem <- struct{}{}:
+		case <-ctx.Done():
+			mtimeWg.Done()
+			ctxErr = ctx.Err()
+			mtimeWg.Wait()
+			goto doneStats
+		}
 		go func(f string) {
 			defer mtimeWg.Done()
 			defer func() { <-sem }()
@@ -187,6 +199,10 @@ func (t *GrepTool) Execute(ctx context.Context, input map[string]any) (tool.Resu
 		}(m.file)
 	}
 	mtimeWg.Wait()
+doneStats:
+	if ctxErr != nil {
+		return tool.Result{}, tool.Fail(fmt.Sprintf("grep cancelled: %v", ctxErr))
+	}
 
 	// Sort by mtime descending.
 	sort.SliceStable(final, func(i, j int) bool {
@@ -196,7 +212,7 @@ func (t *GrepTool) Execute(ctx context.Context, input map[string]any) (tool.Resu
 	// Build output — mirrors opencode grep.ts output assembly.
 	lines := []string{fmt.Sprintf("Found %d matches%s", total, func() string {
 		if truncated {
-			return fmt.Sprintf(" (showing first %d)", grepMaxResults)
+			return fmt.Sprintf(" (showing first %d)", len(final))
 		}
 		return ""
 	}())}
@@ -215,17 +231,10 @@ func (t *GrepTool) Execute(ctx context.Context, input map[string]any) (tool.Resu
 
 	if truncated {
 		lines = append(lines, "")
-		if bytesCapped {
-			lines = append(lines, fmt.Sprintf(
-				"(Results truncated: output exceeded %d KB limit (showing %d of %d matches). Consider using a more specific path or pattern.)",
-				grepMaxBytes/1024, len(final), total,
-			))
-		} else {
-			lines = append(lines, fmt.Sprintf(
-				"(Results truncated: showing %d of %d matches (%d hidden). Consider using a more specific path or pattern.)",
-				grepMaxResults, total, total-grepMaxResults,
-			))
-		}
+		lines = append(lines, fmt.Sprintf(
+			"(Results truncated: showing %d of %d matches (%d hidden). Consider using a more specific path or pattern.)",
+			len(final), total, total-len(final),
+		))
 	}
 
 	return tool.Result{

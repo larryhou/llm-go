@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/larryhou/llm-go/tool"
@@ -15,8 +16,9 @@ import (
 
 const (
 	shellDefaultTimeout = 120 * time.Second
-	shellMaxBytes       = 20 * 1024 // 20 KB tail buffer (~5000 tokens)
+	shellMaxBytes       = 20 * 1024  // 20 KB tail buffer (~5000 tokens)
 	shellMaxLines       = 500
+	shellHardLimit      = 10 * 1024 * 1024 // 10 MB in-memory cap to prevent OOM
 )
 
 // ShellTool executes shell commands (bash on Unix/macOS, cmd/powershell on Windows).
@@ -27,6 +29,11 @@ type ShellTool struct {
 	WorkDir string
 	// Shell overrides the shell binary (e.g. "/bin/bash"). Auto-detected if empty.
 	Shell string
+
+	// Cached shell resolution — LookPath is only run once.
+	shellOnce sync.Once
+	shellBin  string
+	shellFlag string
 }
 
 func (t *ShellTool) Name() string { return "bash" }
@@ -113,12 +120,15 @@ func (t *ShellTool) Execute(ctx context.Context, input map[string]any) (tool.Res
 	cmd.Dir = workdir
 	cmd.Stdin = nil // non-interactive
 
-	var buf strings.Builder
-	cmd.Stdout = &buf
-	cmd.Stderr = &buf
+	// limitWriter caps in-memory buffering to shellHardLimit bytes to prevent
+	// OOM on commands that produce huge output (e.g. find /, cat large-file).
+	// Bytes beyond the limit are discarded; the writer records whether it cut.
+	lw := &limitWriter{limit: shellHardLimit}
+	cmd.Stdout = lw
+	cmd.Stderr = lw
 
 	runErr := cmd.Run()
-	rawOutput := buf.String()
+	rawOutput := lw.String()
 
 	// Determine exit code.
 	exitCode := 0
@@ -138,13 +148,13 @@ func (t *ShellTool) Execute(ctx context.Context, input map[string]any) (tool.Res
 	// Truncate output (tail-biased like opencode's shell.ts tail()).
 	tailResult := tailOutput(rawOutput, shellMaxLines, shellMaxBytes)
 	output := tailResult.text
-	truncated := tailResult.cut
+	truncated := tailResult.cut || lw.cut
 
 	if output == "" {
 		output = "(no output)"
 	}
 
-	// Append metadata block — mirrors opencode's <shell_metadata> block.
+	// Build shell_metadata block — mirrors opencode's <shell_metadata> block.
 	var meta []string
 	if timedOut {
 		meta = append(meta, fmt.Sprintf(
@@ -155,15 +165,20 @@ func (t *ShellTool) Execute(ctx context.Context, input map[string]any) (tool.Res
 	if aborted {
 		meta = append(meta, "User aborted the command")
 	}
-	if len(meta) > 0 {
-		output += "\n\n<shell_metadata>\n" + strings.Join(meta, "\n") + "\n</shell_metadata>"
-	}
 
+	// When output is truncated, write the full content to a file and append
+	// a hint to the tail output so the LLM can see both the most recent lines
+	// and the path to the full output. The hint is appended rather than
+	// replacing the tail so the LLM always has immediate context.
 	var outputPath string
 	if truncated && rawOutput != "" {
 		outputPath = writeTruncationFile("bash", rawOutput)
 		lineCount := strings.Count(rawOutput, "\n") + 1
-		output = tool.BuildTruncHint(outputPath, lineCount, len(rawOutput))
+		output += "\n" + tool.BuildTruncHint(outputPath, lineCount, len(rawOutput))
+	}
+
+	if len(meta) > 0 {
+		output += "\n\n<shell_metadata>\n" + strings.Join(meta, "\n") + "\n</shell_metadata>"
 	}
 
 	return tool.Result{
@@ -180,22 +195,67 @@ func (t *ShellTool) Execute(ctx context.Context, input map[string]any) (tool.Res
 }
 
 // resolveShell returns the shell binary and arguments for the current platform.
+// The shell binary is looked up once and cached for the lifetime of the tool.
 func (t *ShellTool) resolveShell(command string) (string, []string) {
 	if t.Shell != "" {
 		return t.Shell, []string{"-c", command}
 	}
-	if runtime.GOOS == "windows" {
-		// Prefer PowerShell 7+ if available, then cmd.
-		if pwsh, err := exec.LookPath("pwsh"); err == nil {
-			return pwsh, []string{"-NoLogo", "-NoProfile", "-NonInteractive", "-Command", command}
+	t.shellOnce.Do(func() {
+		if runtime.GOOS == "windows" {
+			if pwsh, err := exec.LookPath("pwsh"); err == nil {
+				t.shellBin = pwsh
+				t.shellFlag = "-Command"
+				return
+			}
+			t.shellBin = "cmd.exe"
+			t.shellFlag = "/C"
+			return
 		}
-		return "cmd.exe", []string{"/C", command}
+		if bash, err := exec.LookPath("bash"); err == nil {
+			t.shellBin = bash
+		} else {
+			t.shellBin = "/bin/sh"
+		}
+		t.shellFlag = "-c"
+	})
+	if runtime.GOOS == "windows" && t.shellFlag == "-Command" {
+		return t.shellBin, []string{"-NoLogo", "-NoProfile", "-NonInteractive", t.shellFlag, command}
 	}
-	// Unix: prefer bash, fallback to sh.
-	if bash, err := exec.LookPath("bash"); err == nil {
-		return bash, []string{"-c", command}
+	return t.shellBin, []string{t.shellFlag, command}
+}
+
+// limitWriter is an io.Writer that accepts at most limit bytes.
+// Bytes beyond the limit are silently discarded; cut is set to true.
+// cmd.Stdout and cmd.Stderr both point to the same instance; the mutex makes
+// concurrent writes from the two pipes safe.
+type limitWriter struct {
+	mu    sync.Mutex
+	buf   strings.Builder
+	limit int
+	cut   bool
+}
+
+func (lw *limitWriter) Write(p []byte) (int, error) {
+	lw.mu.Lock()
+	defer lw.mu.Unlock()
+	remaining := lw.limit - lw.buf.Len()
+	if remaining <= 0 {
+		lw.cut = true
+		return len(p), nil // discard; report success so cmd does not error
 	}
-	return "/bin/sh", []string{"-c", command}
+	if len(p) > remaining {
+		lw.buf.Write(p[:remaining])
+		lw.cut = true
+		return len(p), nil
+	}
+	lw.buf.Write(p)
+	return len(p), nil
+}
+
+func (lw *limitWriter) String() string {
+	lw.mu.Lock()
+	defer lw.mu.Unlock()
+	return lw.buf.String()
 }
 
 type tailResult struct {
@@ -242,8 +302,4 @@ func tailOutput(s string, maxLines, maxBytes int) tailResult {
 // writeTruncationFile delegates to the shared helper in truncate.go (same package).
 func writeTruncationFile(toolName, content string) string {
 	return tool.WriteTruncFile(toolName, content)
-}
-
-func init() {
-	_ = os.MkdirAll(filepath.Join(os.TempDir(), "opencode-tool-output"), 0o750)
 }
