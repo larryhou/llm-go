@@ -14,42 +14,76 @@ import (
 
 // SummaryTemplate is the prompt used to generate compaction summaries.
 // Aligned with packages/opencode/src/session/compaction.ts SUMMARY_TEMPLATE.
-const SummaryTemplate = `Summarise the conversation history above into a compact context block.
-The goal is to keep the assistant focused on the current task — omit anything that is no longer
-directly relevant, and do not let historical detail distract from what needs to happen next.
+const SummaryTemplate = `Output exactly the Markdown structure shown inside <template> and keep the section order unchanged. Do not include the <template> tags in your response.
+<template>
+## Objective
+- [one or two brief sentences describing what the user is trying to accomplish]
 
-Rules:
-- Be concise. Prefer short phrases over full sentences.
-- Omit completed subtasks whose details are no longer needed.
-- Do NOT reproduce raw tool outputs, file contents, or command results verbatim.
-  Describe outcomes in one line ("file X created", "test Y passed", etc.).
-- Drop any context that would shift focus away from the active task.
+## Important Details
+- [constraints/preferences, decisions and why, important facts/assumptions, exact context needed to continue, or "(none)"]
 
-Format your response in Markdown with these sections:
+## Work State
+### Completed
+- [finished work, verified facts, or changes made; otherwise "(none)"]
 
-## Current Task
-What the user is actively working on right now. One or two sentences maximum.
+### Active
+- [current work, partial changes, or investigation state; otherwise "(none)"]
 
-## Key Constraints
-Hard requirements or preferences that must be respected going forward. Omit if none.
+### Blocked
+- [blockers, failing commands, or unknowns; otherwise "(none)"]
 
-## In Progress
-The specific step currently being worked on, and any immediate blockers.
-
-## Completed (relevant only)
-Only completed steps whose outcomes are still needed to continue. Skip the rest.
-
-## Next Steps
-The immediate next actions to take.
+## Next Move
+1. [immediate concrete action, or "(none)"]
+2. [next action if known, or "(none)"]
 
 ## Relevant Files
-Only files that will likely be touched in the next steps.`
+- [file or directory path: why it matters, or "(none)"]
+</template>
+
+Rules:
+- Keep every section, even when empty.
+- Use terse bullets, not prose paragraphs.
+- Preserve exact file paths, symbols, commands, error strings, URLs, and identifiers when known.
+- Do not mention the summary process or that context was compacted.`
+
+// SummaryUpdateInstructions is appended to the compaction prompt when a prior
+// summary exists, instructing the LLM to merge rather than re-summarise.
+// Aligned with packages/opencode/src/session/compaction.ts SUMMARY_UPDATE_INSTRUCTIONS.
+const SummaryUpdateInstructions = `The <prior-summary> summarizes everything that happened before the <conversation>. Construct a new summary that combines both. The <prior-summary> is discarded after this: anything you do not carry into the new summary is lost.
+
+When combining:
+- Carry forward objectives, constraints, user directives, decisions, and parallel workstreams from the <prior-summary> even when the <conversation> does not mention them. Drop only what is finished and no longer needed.
+- The <conversation> is more recent than the <prior-summary>. Where they conflict, the conversation wins: state the corrected fact and drop the old claim.
+- Add new progress, decisions, constraints, and context from the conversation.
+- Move completed work from "Active" to "Completed".
+- If a blocker has been resolved, update the summary to reflect that while keeping any details still needed to continue the work.
+- Update "Objective" and "Next Move" to reflect the current work state.`
 
 // Compaction constants, aligned with packages/opencode/src/session/compaction.ts.
 // PruneMinimum and PruneProtect are defined in llm package; use llm.PruneMinimum / llm.PruneProtect.
 const (
 	DefaultTailTurns = 2
 )
+
+// buildCompactionPrompt constructs the final user message for the summary LLM call,
+// aligned with packages/opencode/src/session/compaction.ts buildPrompt().
+//
+// - First round (previousSummary == ""): instructs the LLM to create a new summary.
+// - Update round (previousSummary != ""): injects the prior summary and SummaryUpdateInstructions
+//   so the LLM merges the two rather than re-summarising from scratch.
+func buildCompactionPrompt(previousSummary string) string {
+	if previousSummary == "" {
+		return strings.Join([]string{
+			"Create a new anchored summary from the conversation history above so another coding agent can continue the work.",
+			SummaryTemplate,
+		}, "\n\n")
+	}
+	return strings.Join([]string{
+		"Here is the summary of the conversation history before the messages above:\n\n<prior-summary>\n" + previousSummary + "\n</prior-summary>",
+		SummaryUpdateInstructions,
+		SummaryTemplate,
+	}, "\n\n")
+}
 
 // Turn represents a contiguous block of messages for one user turn.
 type Turn struct {
@@ -307,7 +341,8 @@ func (c *Compactor) Compact(ctx context.Context, sessionID string, input Process
 
 	// Build model messages for the head (with stripped media + truncated tool output).
 	// StripSummaryPair removes the previous boundary+summary pair from the head —
-	// the summary text is injected into the system prompt below instead.
+	// the summary text is extracted into previousSummary and injected inline in the
+	// user prompt via buildCompactionPrompt (aligned with opencode buildPrompt).
 	// StripToolResults replaces tool result content with a placeholder so the
 	// summary LLM focuses on the semantic conversation rather than raw outputs.
 	headMsgs, err := ToModelMessagesWithOptions(sel.Head, allParts, ToModelOptions{
@@ -320,10 +355,10 @@ func (c *Compactor) Compact(ctx context.Context, sessionID string, input Process
 		return "", fmt.Errorf("compaction: build head messages: %w", err)
 	}
 
-	// If a previous compaction round exists, extract its summary text and inject
-	// it into the system prompt so the summary LLM can update it incrementally
-	// rather than re-summarising it from scratch.
+	// If a previous compaction round exists, extract its summary text so we can
+	// inject it inline into the user prompt (aligned with opencode buildPrompt).
 	summarySystem := []string{"You are a helpful assistant that summarises conversation history concisely and accurately."}
+	var previousSummary string
 	for _, m := range sel.Head {
 		if !m.Summary {
 			continue
@@ -336,12 +371,7 @@ func (c *Compactor) Compact(ctx context.Context, sessionID string, input Process
 				}
 			}
 		}
-		if text := strings.TrimSpace(sb.String()); text != "" {
-			summarySystem = append(summarySystem,
-				"Below is the summary from the previous compaction round. "+
-					"Use it as a reference, but feel free to drop sections that are no longer relevant to the current task. "+
-					"The new summary should be more focused, not a superset of the old one:\n\n"+text)
-		}
+		previousSummary = strings.TrimSpace(sb.String())
 		break
 	}
 
@@ -396,7 +426,7 @@ func (c *Compactor) Compact(ctx context.Context, sessionID string, input Process
 		SessionID: sessionID,
 		Model:     summaryModel,
 		System:    summarySystem,
-		Messages:  append(headMsgs, llm.NewUserMessage(SummaryTemplate)),
+		Messages:  append(headMsgs, llm.NewUserMessage(buildCompactionPrompt(previousSummary))),
 		Tools:     nil,
 		Provider:  summaryProvider,
 		Config:    input.Config,
@@ -582,7 +612,8 @@ func ToModelMessagesWithOptions(msgs []*store.Message, parts map[string][]*store
 		switch m.Role {
 		case store.RoleUser:
 			// StripSummaryPair: skip the previous compaction boundary user message —
-			// the previous summary text is injected into the system prompt instead.
+			// its summary text is extracted and injected inline into the user prompt
+			// via buildCompactionPrompt (aligned with opencode buildPrompt).
 			if opts.StripSummaryPair && hasPartType(ps, store.PartTypeCompaction) {
 				continue
 			}
@@ -601,7 +632,8 @@ func ToModelMessagesWithOptions(msgs []*store.Message, parts map[string][]*store
 
 		case store.RoleAssistant:
 			// StripSummaryPair: skip the previous round's summary assistant message —
-			// its text is injected into the system prompt by Compact() instead.
+			// its text is extracted and injected inline into the user prompt by Compact()
+			// via buildCompactionPrompt instead of being passed as a live assistant turn.
 			if opts.StripSummaryPair && m.Summary {
 				continue
 			}
