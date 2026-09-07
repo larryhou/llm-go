@@ -71,7 +71,7 @@ func TestOverflow_EndToEnd(t *testing.T) {
 		return
 	}
 
-	prov := openaiProv.New(apiKey, baseURL, "timi", nil)
+	prov := openaiProv.New(apiKey, baseURL, "timi", nil, 0, 0)
 	model := llm.Model{
 		ID:         modelID,
 		ProviderID: "timi",

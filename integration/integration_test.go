@@ -69,7 +69,7 @@ func setup(t *testing.T) (llm.Provider, llm.Model) {
 	}
 	resp.Body.Close()
 
-	prov := openaiProv.New(apiKey, baseURL, "timi", nil)
+	prov := openaiProv.New(apiKey, baseURL, "timi", nil, 0, 0)
 	model := llm.Model{
 		ID:         modelID,
 		ProviderID: "timi",
@@ -304,7 +304,7 @@ func TestIntegration_ErrorClassification(t *testing.T) {
 	}
 
 	baseURL := defaultBaseURL
-	badProv := openaiProv.New("invalid-key", baseURL, "timi-bad", nil)
+	badProv := openaiProv.New("invalid-key", baseURL, "timi-bad", nil, 0, 0)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()

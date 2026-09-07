@@ -11,6 +11,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"time"
 
 	"github.com/anthropics/anthropic-sdk-go"
 	"github.com/anthropics/anthropic-sdk-go/option"
@@ -26,14 +27,25 @@ const ProviderID = "anthropic"
 // EnvVars lists the environment variables checked for the Anthropic API key.
 var EnvVars = []string{"ANTHROPIC_API_KEY"}
 
+// DefaultTimeout is the default total request timeout (5 minutes), matching
+// opencode's DEFAULT_BUFFER / headerTimeout defaults.
+const DefaultTimeout = 5 * time.Minute
+
+// DefaultChunkTimeout is the default per-chunk idle timeout (5 minutes).
+// If no SSE chunk arrives within this window the stream is aborted.
+const DefaultChunkTimeout = 5 * time.Minute
+
 // Provider implements llm.Provider for Anthropic.
 type Provider struct {
-	client anthropic.Client
+	client       anthropic.Client
+	chunkTimeout time.Duration // 0 = disabled
 }
 
 // New creates an Anthropic provider.
 // baseURL is optional (empty = use default https://api.anthropic.com/).
-func New(apiKey, baseURL string, extraHeaders map[string]string) *Provider {
+// timeout is the total request timeout (0 = use DefaultTimeout, -1 = disabled).
+// chunkTimeout is the per-chunk idle timeout (0 = use DefaultChunkTimeout, -1 = disabled).
+func New(apiKey, baseURL string, extraHeaders map[string]string, timeout, chunkTimeout time.Duration) *Provider {
 	opts := []option.RequestOption{
 		option.WithAPIKey(apiKey),
 	}
@@ -43,13 +55,29 @@ func New(apiKey, baseURL string, extraHeaders map[string]string) *Provider {
 	for k, v := range extraHeaders {
 		opts = append(opts, option.WithHeader(k, v))
 	}
-	return &Provider{client: anthropic.NewClient(opts...)}
+	// Apply total request timeout. -1 disables it; 0 uses the default.
+	t := timeout
+	if t == 0 {
+		t = DefaultTimeout
+	}
+	if t > 0 {
+		opts = append(opts, option.WithRequestTimeout(t))
+	}
+	ct := chunkTimeout
+	if ct == 0 {
+		ct = DefaultChunkTimeout
+	}
+	if ct < 0 {
+		ct = 0
+	}
+	return &Provider{client: anthropic.NewClient(opts...), chunkTimeout: ct}
 }
 
 // NewFromConfig builds a Provider from config + auth store.
 func NewFromConfig(cfg *config.ProviderInfo, authStore *auth.Store) (*Provider, error) {
 	apiKey, _ := auth.ResolveKey(ProviderID, EnvVars, authStore)
 	baseURL := ""
+	var timeout, chunkTimeout time.Duration
 
 	if cfg != nil {
 		if cfg.Options != nil {
@@ -58,6 +86,21 @@ func NewFromConfig(cfg *config.ProviderInfo, authStore *auth.Store) (*Provider, 
 			}
 			if cfg.Options.BaseURL != "" {
 				baseURL = cfg.Options.BaseURL
+			}
+			if cfg.Options.Timeout != nil {
+				switch *cfg.Options.Timeout {
+				case -1:
+					timeout = -1 // disabled
+				case 0:
+					// use default
+				default:
+					timeout = time.Duration(*cfg.Options.Timeout) * time.Millisecond
+				}
+			}
+			if cfg.Options.ChunkTimeout > 0 {
+				chunkTimeout = time.Duration(cfg.Options.ChunkTimeout) * time.Millisecond
+			} else if cfg.Options.ChunkTimeout < 0 {
+				chunkTimeout = -1 // disabled
 			}
 		}
 		if cfg.API != "" {
@@ -72,7 +115,7 @@ func NewFromConfig(cfg *config.ProviderInfo, authStore *auth.Store) (*Provider, 
 	extraHeaders := map[string]string{
 		"anthropic-beta": "interleaved-thinking-2025-05-14",
 	}
-	return New(apiKey, baseURL, extraHeaders), nil
+	return New(apiKey, baseURL, extraHeaders, timeout, chunkTimeout), nil
 }
 
 func (p *Provider) ID() string { return ProviderID }
@@ -94,7 +137,7 @@ func (p *Provider) Stream(ctx context.Context, req llm.Request) (<-chan llm.Even
 	ch := make(chan llm.Event, 32)
 	go func() {
 		defer close(ch)
-		runStream(ctx, stream, ch)
+		runStream(ctx, stream, ch, p.chunkTimeout)
 	}()
 	return ch, nil
 }
@@ -274,7 +317,8 @@ func assistantBlocks(parts []llm.ContentPart) ([]anthropic.ContentBlockParamUnio
 }
 
 // runStream processes the Anthropic streaming response and emits canonical events.
-func runStream(ctx context.Context, stream *ssestream.Stream[anthropic.MessageStreamEventUnion], out chan<- llm.Event) {
+// chunkTimeout is the maximum idle time between consecutive SSE chunks; 0 disables it.
+func runStream(ctx context.Context, stream *ssestream.Stream[anthropic.MessageStreamEventUnion], out chan<- llm.Event, chunkTimeout time.Duration) {
 	defer stream.Close()
 
 	out <- llm.Event{Type: llm.EventRequestStart}
@@ -287,7 +331,20 @@ func runStream(ctx context.Context, stream *ssestream.Stream[anthropic.MessageSt
 	inReasoning := false
 	reasoningSignature := ""
 
+	// Per-chunk idle timeout: if no SSE chunk arrives within chunkTimeout the
+	// stream is force-closed, causing stream.Next() to return false and
+	// stream.Err() to return a non-nil error that is reported as EventError.
+	// This mirrors opencode's wrapSSE / setTimeout-per-pull mechanism.
+	var idleTimer *time.Timer
+	if chunkTimeout > 0 {
+		idleTimer = time.AfterFunc(chunkTimeout, func() { stream.Close() })
+		defer idleTimer.Stop()
+	}
+
 	for stream.Next() {
+		if idleTimer != nil {
+			idleTimer.Reset(chunkTimeout)
+		}
 		raw := stream.Current()
 		switch ev := raw.AsAny().(type) {
 		case anthropic.MessageStartEvent:

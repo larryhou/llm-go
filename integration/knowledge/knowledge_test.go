@@ -310,7 +310,7 @@ func TestLLM_UsesKnowledgeTools(t *testing.T) {
 	}
 
 	km := newKnowledgeManager(idx)
-	prov := openaiProv.New(defaultAPIKey, defaultBaseURL, "timi", nil)
+	prov := openaiProv.New(defaultAPIKey, defaultBaseURL, "timi", nil, 0, 0)
 	model := llm.Model{
 		ID: defaultModel, ProviderID: "timi", APIID: defaultModel,
 		Limit: llm.ModelLimit{Context: 200_000, Output: 4096},

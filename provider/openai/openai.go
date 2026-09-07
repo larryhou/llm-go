@@ -11,6 +11,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"time"
 
 	"github.com/openai/openai-go"
 	"github.com/openai/openai-go/option"
@@ -26,14 +27,23 @@ const ProviderID = "openai"
 // EnvVars lists the environment variables checked for the OpenAI API key.
 var EnvVars = []string{"OPENAI_API_KEY"}
 
+// DefaultTimeout is the default total request timeout (5 minutes).
+const DefaultTimeout = 5 * time.Minute
+
+// DefaultChunkTimeout is the default per-chunk idle timeout (5 minutes).
+const DefaultChunkTimeout = 5 * time.Minute
+
 // Provider implements llm.Provider for OpenAI and OpenAI-compatible endpoints.
 type Provider struct {
-	client     openai.Client
-	providerID string
+	client       openai.Client
+	providerID   string
+	chunkTimeout time.Duration // 0 = disabled
 }
 
 // New creates an OpenAI provider.
-func New(apiKey, baseURL, providerID string, extraHeaders map[string]string) *Provider {
+// timeout is the total request timeout (0 = use DefaultTimeout, -1 = disabled).
+// chunkTimeout is the per-chunk idle timeout (0 = use DefaultChunkTimeout, -1 = disabled).
+func New(apiKey, baseURL, providerID string, extraHeaders map[string]string, timeout, chunkTimeout time.Duration) *Provider {
 	opts := []option.RequestOption{
 		option.WithAPIKey(apiKey),
 	}
@@ -43,11 +53,25 @@ func New(apiKey, baseURL, providerID string, extraHeaders map[string]string) *Pr
 	for k, v := range extraHeaders {
 		opts = append(opts, option.WithHeader(k, v))
 	}
+	t := timeout
+	if t == 0 {
+		t = DefaultTimeout
+	}
+	if t > 0 {
+		opts = append(opts, option.WithRequestTimeout(t))
+	}
+	ct := chunkTimeout
+	if ct == 0 {
+		ct = DefaultChunkTimeout
+	}
+	if ct < 0 {
+		ct = 0
+	}
 	pid := providerID
 	if pid == "" {
 		pid = ProviderID
 	}
-	return &Provider{client: openai.NewClient(opts...), providerID: pid}
+	return &Provider{client: openai.NewClient(opts...), providerID: pid, chunkTimeout: ct}
 }
 
 // NewFromConfig builds a Provider from config + auth store.
@@ -58,6 +82,7 @@ func NewFromConfig(pid string, envVars []string, cfg *config.ProviderInfo, authS
 	apiKey, _ := auth.ResolveKey(pid, envVars, authStore)
 	baseURL := ""
 	var extraHeaders map[string]string
+	var timeout, chunkTimeout time.Duration
 
 	if cfg != nil {
 		if cfg.Options != nil {
@@ -66,6 +91,21 @@ func NewFromConfig(pid string, envVars []string, cfg *config.ProviderInfo, authS
 			}
 			if cfg.Options.BaseURL != "" {
 				baseURL = cfg.Options.BaseURL
+			}
+			if cfg.Options.Timeout != nil {
+				switch *cfg.Options.Timeout {
+				case -1:
+					timeout = -1 // disabled
+				case 0:
+					// use default
+				default:
+					timeout = time.Duration(*cfg.Options.Timeout) * time.Millisecond
+				}
+			}
+			if cfg.Options.ChunkTimeout > 0 {
+				chunkTimeout = time.Duration(cfg.Options.ChunkTimeout) * time.Millisecond
+			} else if cfg.Options.ChunkTimeout < 0 {
+				chunkTimeout = -1 // disabled
 			}
 		}
 		if cfg.API != "" {
@@ -84,7 +124,7 @@ func NewFromConfig(pid string, envVars []string, cfg *config.ProviderInfo, authS
 	if apiKey == "" {
 		return nil, fmt.Errorf("%s: no API key found", pid)
 	}
-	return New(apiKey, baseURL, pid, extraHeaders), nil
+	return New(apiKey, baseURL, pid, extraHeaders, timeout, chunkTimeout), nil
 }
 
 func (p *Provider) ID() string { return p.providerID }
@@ -122,7 +162,7 @@ func (p *Provider) Stream(ctx context.Context, req llm.Request) (<-chan llm.Even
 	ch := make(chan llm.Event, 32)
 	go func() {
 		defer close(ch)
-		runStream(ctx, p.providerID, stream, ch)
+		runStream(ctx, p.providerID, stream, ch, p.chunkTimeout)
 	}()
 	return ch, nil
 }
@@ -350,7 +390,9 @@ func encodeBase64(data []byte) string {
 // a final chunk with choices=[] and usage={...} AFTER the finish_reason chunk.
 // We defer EventStepFinish until we've seen that usage chunk (or the stream ends),
 // so that usage is always populated when the event is emitted.
-func runStream(ctx context.Context, providerID string, stream *ssestream.Stream[openai.ChatCompletionChunk], out chan<- llm.Event) {
+//
+// chunkTimeout is the maximum idle time between consecutive SSE chunks; 0 disables it.
+func runStream(ctx context.Context, providerID string, stream *ssestream.Stream[openai.ChatCompletionChunk], out chan<- llm.Event, chunkTimeout time.Duration) {
 	defer stream.Close()
 
 	out <- llm.Event{Type: llm.EventRequestStart}
@@ -379,7 +421,17 @@ func runStream(ctx context.Context, providerID string, stream *ssestream.Stream[
 		}
 	}
 
+	// Per-chunk idle timeout: mirrors opencode's wrapSSE mechanism.
+	var idleTimer *time.Timer
+	if chunkTimeout > 0 {
+		idleTimer = time.AfterFunc(chunkTimeout, func() { stream.Close() })
+		defer idleTimer.Stop()
+	}
+
 	for stream.Next() {
+		if idleTimer != nil {
+			idleTimer.Reset(chunkTimeout)
+		}
 		chunk := stream.Current()
 
 		// Usage-only chunk (choices=[]) — sent by providers after the finish chunk

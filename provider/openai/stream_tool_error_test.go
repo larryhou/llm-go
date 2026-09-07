@@ -76,7 +76,7 @@ func TestStream_InvalidToolArgs_EmitsEventToolError(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	prov := New("test-key", srv.URL+"/v1", "openai", nil)
+	prov := New("test-key", srv.URL+"/v1", "openai", nil, 0, 0)
 	events := drainEvents(t, prov, minimalRequest(srv.URL))
 
 	// Must have at least one EventToolError.
@@ -123,7 +123,7 @@ func TestStream_ValidToolArgs_EmitsEventToolCall(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	prov := New("test-key", srv.URL+"/v1", "openai", nil)
+	prov := New("test-key", srv.URL+"/v1", "openai", nil, 0, 0)
 	events := drainEvents(t, prov, minimalRequest(srv.URL))
 
 	var toolCalls []llm.Event
