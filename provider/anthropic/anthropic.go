@@ -403,12 +403,18 @@ func runStream(ctx context.Context, stream *ssestream.Stream[anthropic.MessageSt
 
 func mapStopReason(reason string) llm.FinishReason {
 	switch reason {
-	case "end_turn":
+	case "end_turn", "stop_sequence":
 		return llm.FinishReasonStop
 	case "tool_use":
 		return llm.FinishReasonToolCalls
-	case "max_tokens":
+	case "max_tokens", "model_context_window_exceeded":
+		// model_context_window_exceeded added in anthropic-sdk-go v1.60.0:
+		// the model's context window was exceeded during generation.
 		return llm.FinishReasonLength
+	case "pause_turn":
+		// pause_turn is an Anthropic extension for adaptive thinking pauses;
+		// treat like stop so the loop continues normally.
+		return llm.FinishReasonStop
 	}
 	return llm.FinishReasonOther
 }
