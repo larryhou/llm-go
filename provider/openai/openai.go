@@ -102,10 +102,15 @@ func NewFromConfig(pid string, envVars []string, cfg *config.ProviderInfo, authS
 					timeout = time.Duration(*cfg.Options.Timeout) * time.Millisecond
 				}
 			}
-			if cfg.Options.ChunkTimeout > 0 {
-				chunkTimeout = time.Duration(cfg.Options.ChunkTimeout) * time.Millisecond
-			} else if cfg.Options.ChunkTimeout < 0 {
-				chunkTimeout = -1 // disabled
+			if cfg.Options.ChunkTimeout != nil {
+				switch *cfg.Options.ChunkTimeout {
+				case -1:
+					chunkTimeout = -1 // disabled
+				case 0:
+					// use default
+				default:
+					chunkTimeout = time.Duration(*cfg.Options.ChunkTimeout) * time.Millisecond
+				}
 			}
 		}
 		if cfg.API != "" {
@@ -430,6 +435,13 @@ func runStream(ctx context.Context, providerID string, stream *ssestream.Stream[
 
 	for stream.Next() {
 		if idleTimer != nil {
+			// Stop the timer before resetting to avoid a race where the timer fires
+			// concurrently with Reset. For AfterFunc timers, Stop returning false
+			// means the callback (stream.Close) has already fired; stream.Next()
+			// will return false on the next iteration so we break early here.
+			if !idleTimer.Stop() {
+				break
+			}
 			idleTimer.Reset(chunkTimeout)
 		}
 		chunk := stream.Current()

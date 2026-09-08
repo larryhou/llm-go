@@ -57,7 +57,8 @@ type ProviderOptions struct {
 	SetCacheKey   bool           `json:"setCacheKey,omitempty"`
 	// Timeout in ms; nil = default 300000; pointer to -1 = disabled
 	Timeout       *int           `json:"timeout,omitempty"`
-	ChunkTimeout  int            `json:"chunkTimeout,omitempty"`
+	// ChunkTimeout in ms; nil = default 300000; pointer to -1 = disabled
+	ChunkTimeout  *int           `json:"chunkTimeout,omitempty"`
 	Extra         map[string]any `json:"-"` // catch-all provider-specific options
 }
 
