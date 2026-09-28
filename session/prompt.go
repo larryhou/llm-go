@@ -115,6 +115,21 @@ type RunInput struct {
 	// call (e.g. polling, health checks, retries) and detection produces false
 	// positives.
 	DoomLoop *bool
+
+	// ToolsFunc, when non-nil, is called before each LLM step to obtain the
+	// current tool list. Its return value overrides Tools for that step.
+	// Use this when the available tool set may change mid-turn (e.g. after a
+	// mode switch triggered by a tool call in the same turn).
+	// Nil means Tools is used for every step (default behaviour).
+	ToolsFunc func() []tool.Tool
+
+	// AgentPromptFunc, when non-nil, is called before each LLM step to obtain
+	// the current system prompt. Its return value overrides AgentPrompt for
+	// that step, while DisableProviderPrompt and ExtraSystem still apply.
+	// Use this when the system prompt may change mid-turn (e.g. after a mode
+	// switch triggered by a tool call in the same turn).
+	// Nil means AgentPrompt is used for every step (default behaviour).
+	AgentPromptFunc func() string
 }
 
 // RunHandle is returned by RunLoopAsync. It allows the caller to cancel the
@@ -340,7 +355,11 @@ func runLoopInternal(ctx context.Context, s store.Store, input RunInput, h *RunH
 			modelMsgs = append(modelMsgs, llm.NewUserMessage(PromptMaxSteps))
 		}
 
-		// Build system prompt
+		// Build system prompt — refresh dynamically if AgentPromptFunc is set
+		// (supports mid-turn mode switches where the prompt changes after a tool call).
+		if input.AgentPromptFunc != nil {
+			input.AgentPrompt = input.AgentPromptFunc()
+		}
 		system := buildSystem(input)
 
 		// Create assistant message placeholder
@@ -362,9 +381,14 @@ func runLoopInternal(ctx context.Context, s store.Store, input RunInput, h *RunH
 		allParts[assistantMsgID] = nil // placeholder; filled below after the LLM call
 
 		// On the last step, disable tools so the LLM is forced to respond in text.
-		tools := input.Tools
-		if isLastStep {
-			tools = nil
+		// Refresh dynamically if ToolsFunc is set (supports mid-turn mode switches).
+		var tools []tool.Tool
+		if !isLastStep {
+			if input.ToolsFunc != nil {
+				tools = input.ToolsFunc()
+			} else {
+				tools = input.Tools
+			}
 		}
 
 		// Run one LLM turn
