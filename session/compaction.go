@@ -708,9 +708,9 @@ func buildAssistantPartsWithOpts(m *store.Message, ps []*store.Part, opts ToMode
 
 			output := d.Output
 			if opts.StripToolResults {
-				output = "[Tool result omitted]"
+				output = toolResultStripped
 			} else if d.Omitted > 0 {
-				output = "[Tool result omitted]"
+				output = toolResultOmitted
 			} else if d.Compacted > 0 {
 				output = "[Old tool result content cleared]"
 			} else if opts.ToolOutputMaxChars > 0 && len(output) > opts.ToolOutputMaxChars {

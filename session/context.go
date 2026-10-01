@@ -7,6 +7,18 @@ import (
 	"github.com/larryhou/llm-go/store"
 )
 
+const (
+	// toolResultOmitted is the placeholder shown to the LLM when a tool result
+	// has been omitted after the LLM consumed it (OmitConsumedTools path).
+	// The wording reminds the LLM to extract key information from tool results
+	// before they are removed from the context window.
+	toolResultOmitted = "[Tool result omitted after consumed — extract key information before it disappears]"
+
+	// toolResultStripped is the placeholder shown when a tool result was
+	// stripped during compaction (StripToolResults path).
+	toolResultStripped = "[Tool result omitted]"
+)
+
 // ToModelMessages converts stored messages and their parts into the canonical
 // llm.Message slice to be sent to the provider.
 // Aligned with packages/opencode/src/session/message-v2.ts toModelMessagesEffect().
@@ -327,7 +339,7 @@ func buildToolResult(d *store.ToolPartData) *llm.ToolResult {
 	case store.ToolStatusCompleted:
 		output := d.Output
 		if d.Omitted > 0 {
-			output = "[Tool result omitted]"
+			output = toolResultOmitted
 		} else if d.Compacted > 0 {
 			output = "[Old tool result content cleared]"
 		}
