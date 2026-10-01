@@ -93,6 +93,17 @@ type RunInput struct {
 	// Default false — tool results are kept verbatim.
 	OmitConsumedTools bool
 
+	// OmitToolsFilter, when non-nil, restricts OmitConsumedTools to only the
+	// tools whose names are present in the map (value is ignored; use struct{}).
+	// When nil (default), all tool results are subject to omission whenever
+	// OmitConsumedTools is true — preserving the existing behaviour.
+	//
+	// Typical use: omit only high-volume exploration tools (file_read, grep,
+	// dir_list, …) that produce large outputs but whose results are not needed
+	// after the LLM has processed them, while retaining results from action
+	// tools (feedback_submit, exec_script, …) for auditability.
+	OmitToolsFilter map[string]struct{}
+
 	// Observer, when non-nil, receives runtime lifecycle events for this turn
 	// (and any delegate sub-sessions it spawns) for monitoring / stuck
 	// diagnosis. Nil is a no-op with zero overhead. The implementation must be
@@ -307,7 +318,7 @@ func runLoopInternal(ctx context.Context, s store.Store, input RunInput, h *RunH
 	// The most recent assistant message's tool results may not yet have been
 	// consumed by a subsequent LLM call, so they are left intact.
 	if input.OmitConsumedTools {
-		if n := omitHistoricalToolResults(ctx, s, msgs, allParts); n > 0 {
+		if n := omitHistoricalToolResults(ctx, s, msgs, allParts, input.OmitToolsFilter); n > 0 {
 			emitRun(input.Observer, RunEvent{SessionID: input.SessionID, ParentSessionID: input.ParentSessionID, Kind: RunKindToolsOmitted, Detail: fmt.Sprintf("历史工具结果剔除 %d 条", n)})
 		}
 	}
@@ -465,7 +476,7 @@ func runLoopInternal(ctx context.Context, s store.Store, input RunInput, h *RunH
 		// previous step now that the current LLM step has successfully consumed
 		// them. This keeps context lean without losing the tool call record.
 		if input.OmitConsumedTools && previousAssistantMsgID != "" {
-			if n := omitConsumedToolResults(ctx, s, previousAssistantMsgID, allParts); n > 0 {
+			if n := omitConsumedToolResults(ctx, s, previousAssistantMsgID, allParts, input.OmitToolsFilter); n > 0 {
 				emitRun(input.Observer, RunEvent{SessionID: input.SessionID, ParentSessionID: input.ParentSessionID, Kind: RunKindToolsOmitted, Detail: fmt.Sprintf("已消费工具结果剔除 %d 条", n)})
 			}
 		}
@@ -881,8 +892,9 @@ func markAssistantCancelled(s store.Store, assistantMsgID string) {
 // Called after the following LLM step has successfully consumed the tool results,
 // so they no longer need to occupy context space.
 // Parts that are already omitted or compacted are skipped.
-func omitConsumedToolResults(ctx context.Context, s store.Store, msgID string, allParts map[string][]*store.Part) int {
-	return omitPartsInMessage(ctx, s, msgID, allParts, time.Now().UnixMilli())
+// filter, when non-nil, restricts omission to tools whose names appear in the map.
+func omitConsumedToolResults(ctx context.Context, s store.Store, msgID string, allParts map[string][]*store.Part, filter map[string]struct{}) int {
+	return omitPartsInMessage(ctx, s, msgID, allParts, time.Now().UnixMilli(), filter)
 }
 
 // omitHistoricalToolResults omits completed tool results from all historical
@@ -892,7 +904,8 @@ func omitConsumedToolResults(ctx context.Context, s store.Store, msgID string, a
 //
 // The most recent assistant message is skipped: its tool results may not yet
 // have been seen by a subsequent LLM step, so they must be preserved.
-func omitHistoricalToolResults(ctx context.Context, s store.Store, msgs []*store.Message, allParts map[string][]*store.Part) int {
+// filter, when non-nil, restricts omission to tools whose names appear in the map.
+func omitHistoricalToolResults(ctx context.Context, s store.Store, msgs []*store.Message, allParts map[string][]*store.Part, filter map[string]struct{}) int {
 	// Find the ID of the most recent non-summary assistant message.
 	latestAssistantID := ""
 	for i := len(msgs) - 1; i >= 0; i-- {
@@ -912,7 +925,7 @@ func omitHistoricalToolResults(ctx context.Context, s store.Store, msgs []*store
 		if m.ID == latestAssistantID {
 			continue // preserve the most recent assistant message
 		}
-		total += omitPartsInMessage(ctx, s, m.ID, allParts, now)
+		total += omitPartsInMessage(ctx, s, m.ID, allParts, now, filter)
 	}
 	return total
 }
@@ -920,7 +933,9 @@ func omitHistoricalToolResults(ctx context.Context, s store.Store, msgs []*store
 // omitPartsInMessage sets Omitted on every eligible completed tool part in msgID.
 // Shared by omitHistoricalToolResults and omitConsumedToolResults. Returns the
 // number of tool results actually omitted (for observability).
-func omitPartsInMessage(ctx context.Context, s store.Store, msgID string, allParts map[string][]*store.Part, now int64) int {
+// filter, when non-nil, restricts omission to tools whose names appear in the map;
+// nil means all completed tool results are eligible (original behaviour).
+func omitPartsInMessage(ctx context.Context, s store.Store, msgID string, allParts map[string][]*store.Part, now int64, filter map[string]struct{}) int {
 	n := 0
 	for _, p := range allParts[msgID] {
 		if p.Type != store.PartTypeTool {
@@ -932,6 +947,11 @@ func omitPartsInMessage(ctx context.Context, s store.Store, msgID string, allPar
 		}
 		if d.Omitted > 0 || d.Compacted > 0 {
 			continue
+		}
+		if filter != nil {
+			if _, inFilter := filter[d.Tool]; !inFilter {
+				continue // tool not in whitelist — keep result
+			}
 		}
 		d.Omitted = now
 		p.Data = d
