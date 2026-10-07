@@ -1,6 +1,7 @@
 package llm
 
 import (
+	"encoding/json"
 	"math"
 
 	"github.com/larryhou/llm-go/config"
@@ -14,7 +15,7 @@ const (
 	PruneProtect                = 40_000
 	ToolOutputMaxCharsCompaction = 2_000
 	MinPreserveRecentTokens     = config.DefaultCompactionMinPreserveTokens // 2_000
-	MaxPreserveRecentTokens     = config.DefaultCompactionMaxPreserveTokens // 8_000
+	MaxPreserveRecentTokens     = config.DefaultCompactionMaxPreserveTokens // 15_000
 )
 
 // Model describes a provider model's limits and capabilities.
@@ -106,7 +107,7 @@ func IsOverflow(usage TokenUsage, m Model, cfg *config.Info) bool {
 // PreserveRecentBudget returns the token budget for preserving recent turns verbatim.
 // Aligned with packages/opencode/src/session/compaction.ts preserveRecentBudget().
 //
-//	cfg.preserve_recent_tokens ?? min(8000, max(2000, floor(usable * 0.25)))
+//	cfg.preserve_recent_tokens ?? min(15000, max(2000, floor(usable * 0.25)))
 func PreserveRecentBudget(m Model, cfg *config.Info) int {
 	if cfg != nil && cfg.Compaction != nil && cfg.Compaction.PreserveRecentTokens != nil {
 		return *cfg.Compaction.PreserveRecentTokens
@@ -116,6 +117,55 @@ func PreserveRecentBudget(m Model, cfg *config.Info) int {
 	budget = max(budget, MinPreserveRecentTokens)
 	budget = min(budget, MaxPreserveRecentTokens)
 	return budget
+}
+
+// EstimateRequestTokens estimates the number of tokens in a request by JSON-serialising
+// the system, messages, and tool definitions and dividing by 4 (chars-per-token heuristic).
+//
+// Aligned with packages/core/src/session/compaction.ts compactIfNeeded():
+//
+//	estimate({ system: request.system, messages: request.messages, tools: request.tools })
+//	where Token.estimate(text) = text.length / 4
+//
+// Used by IsRequestOverflow to detect overflow before sending the request,
+// catching cases that IsOverflow (usage-based) misses:
+//   - large system prompts or tool schema additions mid-session
+//   - growing tool outputs that haven't triggered a step-finish yet
+func EstimateRequestTokens(system []string, messages []Message, tools any) int {
+	payload := struct {
+		System   []string  `json:"system"`
+		Messages []Message `json:"messages"`
+		Tools    any       `json:"tools,omitempty"`
+	}{
+		System:   system,
+		Messages: messages,
+		Tools:    tools,
+	}
+	b, err := json.Marshal(payload)
+	if err != nil {
+		return 0
+	}
+	return len(b) / 4
+}
+
+// IsRequestOverflow returns true if the estimated request body token count
+// reaches or exceeds the usable context limit.
+//
+// Aligned with packages/core/src/session/compaction.ts compactIfNeeded():
+//
+//	estimate({system, messages, tools}) >= context - max(output, buffer)
+//
+// This is a pre-send check that catches overflow before the LLM call, avoiding
+// a round-trip to the provider that would return an error anyway.
+func IsRequestOverflow(system []string, messages []Message, tools any, m Model, cfg *config.Info) bool {
+	if cfg != nil && cfg.Compaction != nil && cfg.Compaction.Auto != nil && !*cfg.Compaction.Auto {
+		return false
+	}
+	if m.Limit.Context == 0 {
+		return false
+	}
+	estimated := EstimateRequestTokens(system, messages, tools)
+	return estimated >= Usable(m, cfg)
 }
 
 

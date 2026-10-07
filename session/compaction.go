@@ -65,7 +65,13 @@ const (
 	DefaultTailTurns = 2
 )
 
-// buildCompactionPrompt constructs the final user message for the summary LLM call,
+// CompactionSystemPrompt is the system prompt for the summary LLM call.
+// Aligned with packages/opencode/src/agent/prompt/compaction.txt.
+const CompactionSystemPrompt = `You are a context summarization agent. You are given a conversation between a user and an agent. Your goal is to produce a structured summary matching the format specified so another coding agent can continue the work.
+
+Always follow the exact output structure requested by the user prompt. Keep every section, preserve exact file paths and identifiers when known, and prefer terse bullets over paragraphs.
+
+Do not continue the conversation. Do not respond to any questions in the conversation. Only output the structured summary in the exact format requested by the user prompt. Respond in the same language as the conversation.`
 // aligned with packages/opencode/src/session/compaction.ts buildPrompt().
 //
 // - First round (previousSummary == ""): instructs the LLM to create a new summary.
@@ -79,7 +85,7 @@ func buildCompactionPrompt(previousSummary string) string {
 		}, "\n\n")
 	}
 	return strings.Join([]string{
-		"Here is the summary of the conversation history before the messages above:\n\n<prior-summary>\n" + previousSummary + "\n</prior-summary>",
+		"Here is the summary of the conversation before the messages above:\n\n<prior-summary>\n" + previousSummary + "\n</prior-summary>",
 		SummaryUpdateInstructions,
 		SummaryTemplate,
 	}, "\n\n")
@@ -105,13 +111,37 @@ type SelectResult struct {
 	RecentHead []*store.Message
 }
 
+// splitTurn attempts to find a sub-slice of a single turn (starting from the
+// second message, i.e. skipping the user message itself) that fits within
+// budget. Returns the index into msgs where the kept slice begins, or -1 if
+// the turn cannot be partially retained.
+//
+// Aligned with packages/opencode/src/session/compaction.ts splitTurn():
+// scan forward from turn.StartIdx+1 to find the first sub-slice that fits.
+func splitTurn(t Turn, msgs []*store.Message, budget int) int {
+	if budget <= 0 {
+		return -1
+	}
+	if t.EndIdx-t.StartIdx <= 1 {
+		return -1 // single-message turn; cannot split further
+	}
+	for start := t.StartIdx + 1; start < t.EndIdx; start++ {
+		size := estimateTurnTokens(msgs[start:t.EndIdx])
+		if size <= budget {
+			return start
+		}
+	}
+	return -1
+}
+
 // Select splits a message list into head (to summarise) and tail (to keep verbatim).
 // Aligned with packages/opencode/src/session/compaction.ts select().
 //
 // Algorithm:
 //  1. Walk backwards through user turns
 //  2. Keep the most recent tailTurns turns that fit within the preserve budget
-//  3. Everything before the kept turns is the head to summarise
+//  3. If a turn doesn't fully fit, try splitTurn() to retain the tail end of it
+//  4. Everything before the kept turns is the head to summarise
 //
 // allParts is used to identify compaction boundary user messages (those that
 // contain a PartTypeCompaction part) so they are skipped, consistent with
@@ -180,7 +210,36 @@ func Select(msgs []*store.Message, allParts map[string][]*store.Part, model llm.
 		if totalTokens+size <= budget {
 			totalTokens += size
 		} else {
-			// This turn doesn't fit; tail starts at the next turn.
+			// This turn doesn't fit whole. Try splitting it to retain the tail end.
+			// Aligned with opencode splitTurn(): scan forward within the turn to find
+			// a sub-slice that fits in the remaining budget.
+			remaining := budget - totalTokens
+			splitIdx := splitTurn(t, msgs, remaining)
+			if splitIdx >= 0 {
+				// Found a partial retain point inside this turn.
+				// The tail starts at splitIdx (a message within the turn, not at the
+				// user message boundary).
+				tailMsgIdx := splitIdx
+				// The turn being split has absolute index splitTurnAbsIdx in turns[].
+				// recentHead covers the last ≤2 turns *before* this one in the head,
+				// consistent with how the non-split path computes recentHead.
+				splitTurnAbsIdx := len(turns) - tailTurns + i
+				var recentHead []*store.Message
+				if splitTurnAbsIdx >= 1 {
+					recentTurnIdx := splitTurnAbsIdx - 2
+					if recentTurnIdx < 0 {
+						recentTurnIdx = 0
+					}
+					recentStartIdx := turns[recentTurnIdx].StartIdx
+					recentHead = msgs[recentStartIdx:tailMsgIdx]
+				}
+				return SelectResult{
+					Head:        msgs[:tailMsgIdx],
+					TailStartID: msgs[tailMsgIdx].ID,
+					RecentHead:  recentHead,
+				}
+			}
+			// Turn doesn't fit and can't be split; tail starts at the next turn.
 			tailStartTurnIdx = len(turns) - tailTurns + i + 1
 			break
 		}
@@ -357,7 +416,7 @@ func (c *Compactor) Compact(ctx context.Context, sessionID string, input Process
 
 	// If a previous compaction round exists, extract its summary text so we can
 	// inject it inline into the user prompt (aligned with opencode buildPrompt).
-	summarySystem := []string{"You are a helpful assistant that summarises conversation history concisely and accurately."}
+	summarySystem := []string{CompactionSystemPrompt}
 	var previousSummary string
 	for _, m := range sel.Head {
 		if !m.Summary {
@@ -607,7 +666,8 @@ type ToModelOptions struct {
 // summary LLM (e.g. an assistant tool-call with no matching tool-result).
 func ToModelMessagesWithOptions(msgs []*store.Message, parts map[string][]*store.Part, opts ToModelOptions) ([]llm.Message, error) {
 	var out []llm.Message
-	for _, m := range msgs {
+	for i := 0; i < len(msgs); i++ {
+		m := msgs[i]
 		ps := parts[m.ID]
 		switch m.Role {
 		case store.RoleUser:
@@ -615,6 +675,21 @@ func ToModelMessagesWithOptions(msgs []*store.Message, parts map[string][]*store
 			// its summary text is extracted and injected inline into the user prompt
 			// via buildCompactionPrompt (aligned with opencode buildPrompt).
 			if opts.StripSummaryPair && hasPartType(ps, store.PartTypeCompaction) {
+				continue
+			}
+			// Non-strip path: boundary+summary → <conversation-checkpoint> (same as ToModelMessages).
+			if !opts.StripSummaryPair && hasPartType(ps, store.PartTypeCompaction) {
+				checkpointText := buildCheckpointText(m, msgs, i, parts)
+				if len(out) > 0 && out[len(out)-1].Role == llm.RoleUser {
+					out = append(out, llm.Message{
+						Role:    llm.RoleAssistant,
+						Content: []llm.ContentPart{llm.NewTextPart(" ")},
+					})
+				}
+				out = append(out, llm.Message{ID: m.ID, Role: llm.RoleUser, Content: []llm.ContentPart{llm.NewTextPart(checkpointText)}})
+				if i+1 < len(msgs) && msgs[i+1].Role == store.RoleAssistant && msgs[i+1].Summary {
+					i++
+				}
 				continue
 			}
 			userParts := buildUserParts(ps, opts)

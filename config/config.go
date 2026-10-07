@@ -248,7 +248,7 @@ const (
 
 	DefaultCompactionTailTurns         = 2
 	DefaultCompactionMinPreserveTokens = 2_000
-	DefaultCompactionMaxPreserveTokens = 8_000
+	DefaultCompactionMaxPreserveTokens = 15_000 // raised from 8_000 to match opencode v1 (packages/opencode/src/session/compaction.ts MAX_PRESERVE_RECENT_TOKENS)
 	DefaultCompactionBuffer            = 20_000
 	DefaultCompactionMinKeepRatio      = 0.1 // minimum verbatim-tail token fraction of total session tokens
 	DefaultProviderTimeout             = 300_000 // 5 minutes in ms

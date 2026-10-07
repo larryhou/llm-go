@@ -342,5 +342,95 @@ func TestTokenUsage_Add(t *testing.T) {
 func init() {
 	_ = llm.CompactionBuffer        // 20_000
 	_ = llm.MinPreserveRecentTokens // 2_000
-	_ = llm.MaxPreserveRecentTokens // 8_000
+	_ = llm.MaxPreserveRecentTokens // 15_000
+}
+
+// --- EstimateRequestTokens / IsRequestOverflow ---
+
+func TestEstimateRequestTokens_nonZero(t *testing.T) {
+	// Any non-trivial input must produce a positive estimate.
+	msgs := []llm.Message{
+		{Role: llm.RoleUser, Content: []llm.ContentPart{llm.NewTextPart("hello world")}},
+	}
+	got := llm.EstimateRequestTokens([]string{"system"}, msgs, nil)
+	if got <= 0 {
+		t.Errorf("EstimateRequestTokens = %d, want > 0", got)
+	}
+}
+
+func TestEstimateRequestTokens_empty(t *testing.T) {
+	// Empty inputs should return 0 or a negligible value from the JSON envelope.
+	got := llm.EstimateRequestTokens(nil, nil, nil)
+	// {"system":null,"messages":null} ≈ 27 chars / 4 ≈ 6 tokens
+	if got < 0 {
+		t.Errorf("EstimateRequestTokens(empty) = %d, want ≥ 0", got)
+	}
+}
+
+func TestEstimateRequestTokens_scalesWithContent(t *testing.T) {
+	// A larger message should produce a larger estimate.
+	small := []llm.Message{
+		{Role: llm.RoleUser, Content: []llm.ContentPart{llm.NewTextPart("hi")}},
+	}
+	large := []llm.Message{
+		{Role: llm.RoleUser, Content: []llm.ContentPart{llm.NewTextPart(strings.Repeat("a", 4000))}},
+	}
+	smallEst := llm.EstimateRequestTokens(nil, small, nil)
+	largeEst := llm.EstimateRequestTokens(nil, large, nil)
+	if largeEst <= smallEst {
+		t.Errorf("larger message should produce larger estimate: small=%d large=%d", smallEst, largeEst)
+	}
+}
+
+func TestIsRequestOverflow_belowLimit(t *testing.T) {
+	// context=10000, output=1000 → usable=9000
+	// tiny request → well below limit → no overflow
+	m := llm.Model{Limit: llm.ModelLimit{Context: 10_000, Output: 1_000}}
+	msgs := []llm.Message{
+		{Role: llm.RoleUser, Content: []llm.ContentPart{llm.NewTextPart("hi")}},
+	}
+	if llm.IsRequestOverflow([]string{"sys"}, msgs, nil, m, nil) {
+		t.Error("small request should not trigger overflow")
+	}
+}
+
+func TestIsRequestOverflow_aboveLimit(t *testing.T) {
+	// context=100, output=10 → usable=90 → tiny limit
+	// large serialised payload will exceed it
+	m := llm.Model{Limit: llm.ModelLimit{Context: 100, Output: 10}}
+	msgs := []llm.Message{
+		{Role: llm.RoleUser, Content: []llm.ContentPart{
+			llm.NewTextPart(strings.Repeat("x", 1000)),
+		}},
+	}
+	if !llm.IsRequestOverflow(nil, msgs, nil, m, nil) {
+		t.Error("large request against tiny context should trigger overflow")
+	}
+}
+
+func TestIsRequestOverflow_zeroContext(t *testing.T) {
+	// Model with no context limit configured → never overflows (same as IsOverflow).
+	m := llm.Model{Limit: llm.ModelLimit{Context: 0, Output: 8_192}}
+	msgs := []llm.Message{
+		{Role: llm.RoleUser, Content: []llm.ContentPart{
+			llm.NewTextPart(strings.Repeat("x", 100_000)),
+		}},
+	}
+	if llm.IsRequestOverflow(nil, msgs, nil, m, nil) {
+		t.Error("zero context should never trigger overflow")
+	}
+}
+
+func TestIsRequestOverflow_autoDisabled(t *testing.T) {
+	m := llm.Model{Limit: llm.ModelLimit{Context: 100, Output: 10}}
+	msgs := []llm.Message{
+		{Role: llm.RoleUser, Content: []llm.ContentPart{
+			llm.NewTextPart(strings.Repeat("x", 1000)),
+		}},
+	}
+	autoFalse := false
+	cfg := &config.Info{Compaction: &config.CompactionConfig{Auto: &autoFalse}}
+	if llm.IsRequestOverflow(nil, msgs, nil, m, cfg) {
+		t.Error("IsRequestOverflow should be false when compaction.auto=false")
+	}
 }

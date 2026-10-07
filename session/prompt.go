@@ -402,6 +402,74 @@ func runLoopInternal(ctx context.Context, s store.Store, input RunInput, h *RunH
 			}
 		}
 
+		// Pre-send compaction check: estimate the actual serialised request size
+		// before calling the LLM. This catches overflow cases that IsOverflow
+		// (usage-based, fires on EventStepFinish) misses, such as large system
+		// prompts or tool schema growth mid-session.
+		//
+		// Aligned with packages/core/src/session/compaction.ts compactIfNeeded():
+		//   if (estimate({system, messages, tools}) > context - max(output, buffer))
+		//     compact and continue.
+		//
+		// On overflow: discard the empty assistant placeholder (no content yet),
+		// trigger compaction, and restart the loop — same as Path A.
+		if llm.IsRequestOverflow(system, modelMsgs, tools, input.Model, input.Config) {
+			// Discard the placeholder — it has no content and would corrupt history.
+			// On failure, abort rather than proceeding: Compact() would see the
+			// orphaned placeholder and include it in the next turn's history.
+			if delErr := s.DeleteMessagesByIDs(ctx, input.SessionID, []string{assistantMsgID}); delErr != nil {
+				return RunResultStop, fmt.Errorf("runloop: pre-send compaction: delete placeholder: %w", delErr)
+			}
+			msgs = msgs[:len(msgs)-1]
+			delete(allParts, assistantMsgID)
+			_, compactErr := compactor.Compact(ctx, input.SessionID, ProcessInput{
+				SessionID:       input.SessionID,
+				Model:           input.Model,
+				System:          system,
+				Provider:        input.Provider,
+				SummaryProvider: input.SummaryProvider,
+				Config:          input.Config,
+				OnCompact:       input.OnCompact,
+			})
+			if compactErr != nil {
+				return RunResultStop, fmt.Errorf("runloop: pre-send compaction failed: %w", compactErr)
+			}
+			msgs, allParts, err = loadMessages(ctx, s, input.SessionID)
+			if err != nil {
+				return RunResultStop, err
+			}
+			injectedPostCompact := store.Message{
+				ID:        newID(),
+				SessionID: input.SessionID,
+				Role:      store.RoleUser,
+				CreatedAt: time.Now(),
+				UpdatedAt: time.Now(),
+			}
+			if err := s.CreateMessage(ctx, &injectedPostCompact); err != nil {
+				return RunResultStop, fmt.Errorf("runloop: post-compact-presend user msg: %w", err)
+			}
+			postPart := &store.Part{
+				ID:        newID(),
+				MessageID: injectedPostCompact.ID,
+				SessionID: input.SessionID,
+				Type:      store.PartTypeText,
+				CreatedAt: time.Now(),
+				UpdatedAt: time.Now(),
+				Data:      &store.TextPartData{Text: PromptPostCompact},
+			}
+			if err := s.CreatePart(ctx, postPart); err != nil {
+				return RunResultStop, fmt.Errorf("runloop: post-compact-presend part: %w", err)
+			}
+			msgs, allParts, err = loadMessages(ctx, s, input.SessionID)
+			if err != nil {
+				return RunResultStop, err
+			}
+			// Pre-send compaction is transparent to the step budget: the LLM was
+			// never actually called this iteration, so undo the step increment.
+			step--
+			continue
+		}
+
 		// Run one LLM turn
 		result, err := processor.Process(ctx, assistantMsgID, ProcessInput{
 			SessionID:       input.SessionID,
