@@ -239,6 +239,12 @@ func RunLoop(ctx context.Context, s store.Store, input RunInput) (RunResult, err
 // runLoopInternal is the main agentic loop implementation.
 // Aligned with packages/opencode/src/session/prompt.ts runLoop().
 func runLoopInternal(ctx context.Context, s store.Store, input RunInput, h *RunHandle) (RunResult, error) {
+	// Config.Compaction.OmitConsumedTools overrides RunInput.OmitConsumedTools when set.
+	// This allows callers to control the feature via config without modifying each call site.
+	if input.Config != nil && input.Config.Compaction != nil && input.Config.Compaction.OmitConsumedTools != nil {
+		input.OmitConsumedTools = *input.Config.Compaction.OmitConsumedTools
+	}
+
 	processor := NewProcessor(s)
 	compactor := NewCompactor(s, processor)
 

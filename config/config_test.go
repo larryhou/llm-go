@@ -49,6 +49,41 @@ func TestCompactionOverrides(t *testing.T) {
 	}
 }
 
+func TestCompactionOmitConsumedTools(t *testing.T) {
+	// nil (unset) — caller decides
+	cfg := &config.Info{Compaction: &config.CompactionConfig{}}
+	if cfg.Compaction.OmitConsumedTools != nil {
+		t.Error("OmitConsumedTools default should be nil")
+	}
+
+	// explicitly true
+	trueVal := true
+	cfg.Compaction.OmitConsumedTools = &trueVal
+	if !*cfg.Compaction.OmitConsumedTools {
+		t.Error("OmitConsumedTools should be true")
+	}
+
+	// explicitly false
+	falseVal := false
+	cfg.Compaction.OmitConsumedTools = &falseVal
+	if *cfg.Compaction.OmitConsumedTools {
+		t.Error("OmitConsumedTools should be false")
+	}
+
+	// round-trip through JSON
+	data, err := json.Marshal(cfg.Compaction)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var out config.CompactionConfig
+	if err := json.Unmarshal(data, &out); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if out.OmitConsumedTools == nil || *out.OmitConsumedTools != false {
+		t.Error("OmitConsumedTools JSON round-trip failed")
+	}
+}
+
 func TestToolOutputOverrides(t *testing.T) {
 	maxLines := 500
 	maxBytes := 10240

@@ -199,6 +199,7 @@ type CompactionConfig struct {
 	PreserveRecentTokens *int     `json:"preserve_recent_tokens,omitempty"`
 	Reserved             *int     `json:"reserved,omitempty"`
 	MinKeepRatio         *float64 `json:"min_keep_ratio,omitempty"`         // default 0.1; minimum verbatim-tail token fraction of total session tokens
+	OmitConsumedTools    *bool    `json:"omit_consumed_tools,omitempty"`    // default nil (caller decides); when set, overrides RunInput.OmitConsumedTools
 }
 
 // ExperimentalConfig holds experimental feature flags.
