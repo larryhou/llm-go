@@ -750,7 +750,7 @@ func TestFindSeqByDocID_sessionIsolation(t *testing.T) {
 func newHistSrc(t *testing.T, st *sqlite.Store, sessID string, maxL1, maxL0 int) *store.SessionHistorySource {
 	t.Helper()
 	ps := sqlite.NewHistorySource(st, sessID, 0)
-	src, err := store.NewSessionHistorySource(sessID, maxL1, maxL0, 0, ps)
+	src, err := store.NewSessionHistorySource(sessID, maxL1, maxL0, knowledge.TierHistory, ps)
 	if err != nil {
 		t.Fatalf("NewSessionHistorySource: %v", err)
 	}
@@ -847,7 +847,7 @@ func TestSessionHistorySource_l0Eviction(t *testing.T) {
 	sessID := "sess-evict"
 
 	// maxL1=2, maxL0=3
-	src, err := store.NewSessionHistorySource(sessID, 2, 3, 0, sqlite.NewHistorySource(s, sessID, 0))
+	src, err := store.NewSessionHistorySource(sessID, 2, 3, knowledge.TierHistory, sqlite.NewHistorySource(s, sessID, 0))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -911,7 +911,7 @@ func TestSessionHistorySource_restoreFromSQLite(t *testing.T) {
 
 	// First "process": write 5 seqs via Hook.
 	st1, _ := sqlite.Open(path)
-	src1, _ := store.NewSessionHistorySource(sessID, 2, 4, sqlite.NewHistorySource(st1, sessID, 0))
+	src1, _ := store.NewSessionHistorySource(sessID, 2, 4, knowledge.TierHistory, sqlite.NewHistorySource(st1, sessID, 0))
 	hook1 := src1.Hook()
 	for seq := 1; seq <= 5; seq++ {
 		msgs := []*store.Message{{
@@ -937,7 +937,7 @@ func TestSessionHistorySource_restoreFromSQLite(t *testing.T) {
 	defer st2.Close()
 
 	// maxL0=4 means only 4 most recent seqs are in compactionDocs at startup.
-	src2, err := store.NewSessionHistorySource(sessID, 2, 4, sqlite.NewHistorySource(st2, sessID, 0))
+	src2, err := store.NewSessionHistorySource(sessID, 2, 4, knowledge.TierHistory, sqlite.NewHistorySource(st2, sessID, 0))
 	if err != nil {
 		t.Fatal(err)
 	}

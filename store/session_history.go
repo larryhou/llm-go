@@ -130,7 +130,7 @@ type SessionHistorySource struct {
 //
 // maxCompactions: L1 (Bleve) cap; 0 → DefaultMaxCompactions.
 // maxIndexedSeqs: L0 (compactionDocs) cap; 0 → DefaultMaxIndexedSeqs.
-// priority: value returned by Priority(); 0 → DefaultHistoryPriority.
+// priority: value returned by Priority(); use knowledge.TierHistory for the default.
 // ps: persistent backend; nil → pure-memory (history lost on restart).
 func NewSessionHistorySource(sessionID string, maxCompactions, maxIndexedSeqs, priority int, ps PersistStore) (*SessionHistorySource, error) {
 	if maxCompactions <= 0 {
@@ -141,9 +141,6 @@ func NewSessionHistorySource(sessionID string, maxCompactions, maxIndexedSeqs, p
 	}
 	if maxIndexedSeqs < maxCompactions {
 		maxIndexedSeqs = maxCompactions
-	}
-	if priority <= 0 {
-		priority = knowledge.PriorityHistory
 	}
 
 	m, err := buildIndexMapping()

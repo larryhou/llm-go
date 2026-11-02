@@ -26,6 +26,7 @@ import (
 
 	"github.com/larryhou/llm-go/llm"
 	openaiProv "github.com/larryhou/llm-go/provider/openai"
+	"github.com/larryhou/llm-go/knowledge"
 	"github.com/larryhou/llm-go/session"
 	"github.com/larryhou/llm-go/store"
 	"github.com/larryhou/llm-go/store/memory"
@@ -252,7 +253,7 @@ func main() {
 		usable)
 
 	// ── compact hook ──────────────────────────────────────────────────────────
-	historySrc, err := store.NewSessionHistorySource(sessID, 0, 0, 0, nil)
+	historySrc, err := store.NewSessionHistorySource(sessID, 0, 0, knowledge.TierHistory, nil)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "history source: %v\n", err)
 		os.Exit(1)

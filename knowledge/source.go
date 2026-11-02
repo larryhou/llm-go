@@ -85,19 +85,23 @@ type Source interface {
 	Fetch(ctx context.Context, q Query) ([]Result, error)
 }
 
-// Well-known priority levels for built-in knowledge sources.
-// Lower value = higher priority. Sources sharing the same value run concurrently.
+// Knowledge source priority tiers.
+// Lower value = higher priority. Sources in the same tier run concurrently.
 //
-// Ordering rationale:
+// Each tier spans 1000 units, leaving room for intra-tier fine-tuning
+// (e.g. TierKnowledge+1 for a higher-confidence remote source).
+// All tiers start from 1000 so that the zero value of an int field is never
+// silently interpreted as a valid (highest-priority) tier.
 //
-//	SOP (1)       — team-wide authoritative playbooks; checked first.
-//	Knowledge (4) — externally-registered MCP knowledge sources.
-//	Memory (5)    — personal notes; checked after Knowledge.
-//	History (8)   — session compaction summaries; lowest priority because the
-//	                raw conversation is already in the model's context window.
+// Tier ordering rationale:
+//
+//	TierSOP (1000)       — team-wide authoritative playbooks; verified, always checked first.
+//	TierKnowledge (2000) — externally-registered MCP sources; supplements SOP.
+//	TierMemory (3000)    — personal notes; useful but unverified.
+//	TierHistory (4000)   — session compaction summaries; unverified, already in context window.
 const (
-	PrioritySOP       = 1
-	PriorityKnowledge = 4
-	PriorityMemory    = 5
-	PriorityHistory   = 8
+	TierSOP       = 1000
+	TierKnowledge = 2000
+	TierMemory    = 3000
+	TierHistory   = 4000
 )

@@ -599,7 +599,7 @@ func TestSoftReset_softAfterRefresh(t *testing.T) {
 // fires the Hook with the given messages, and returns the source.
 func buildHistorySrc(t *testing.T, sessID string, head []*store.Message, parts map[string][]*store.Part) *store.SessionHistorySource {
 	t.Helper()
-	src, err := store.NewSessionHistorySource(sessID, 0, 0, nil)
+	src, err := store.NewSessionHistorySource(sessID, 0, 0, knowledge.TierHistory, nil)
 	if err != nil {
 		t.Fatalf("NewSessionHistorySource: %v", err)
 	}
@@ -683,7 +683,7 @@ func TestRollbackTo_noOrphanAfterRecompact(t *testing.T) {
 // TestRollbackTo_emptyIDs is a no-op and must not panic.
 func TestRollbackTo_emptyIDs(t *testing.T) {
 	ctx := context.Background()
-	src, _ := store.NewSessionHistorySource("sess-empty", 0, 0, nil)
+	src, _ := store.NewSessionHistorySource("sess-empty", 0, 0, knowledge.TierHistory, nil)
 	src.RollbackTo(ctx, nil)
 	src.RollbackTo(ctx, []string{})
 }
@@ -699,7 +699,7 @@ func TestRollbackTo_coldPath(t *testing.T) {
 
 	// maxCompactions=1, maxIndexedSeqs=1 → seq 1 will be evicted from L0
 	// as soon as seq 2 is indexed.
-	src, err := store.NewSessionHistorySource(sessID, 1, 1, ps)
+	src, err := store.NewSessionHistorySource(sessID, 1, 1, knowledge.TierHistory, ps)
 	if err != nil {
 		t.Fatalf("NewSessionHistorySource: %v", err)
 	}

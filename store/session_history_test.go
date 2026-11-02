@@ -268,7 +268,7 @@ const testSessID = "test-session"
 
 func newPureMemSrc(t *testing.T, maxL1, maxL0 int) *store.SessionHistorySource {
 	t.Helper()
-	src, err := store.NewSessionHistorySource(testSessID, maxL1, maxL0, 0, nil)
+	src, err := store.NewSessionHistorySource(testSessID, maxL1, maxL0, knowledge.TierHistory, nil)
 	if err != nil {
 		t.Fatalf("NewSessionHistorySource: %v", err)
 	}
@@ -277,7 +277,7 @@ func newPureMemSrc(t *testing.T, maxL1, maxL0 int) *store.SessionHistorySource {
 
 func newSrcWithPS(t *testing.T, maxL1, maxL0 int, ps store.PersistStore) *store.SessionHistorySource {
 	t.Helper()
-	src, err := store.NewSessionHistorySource(testSessID, maxL1, maxL0, 0, ps)
+	src, err := store.NewSessionHistorySource(testSessID, maxL1, maxL0, knowledge.TierHistory, ps)
 	if err != nil {
 		t.Fatalf("NewSessionHistorySource: %v", err)
 	}
