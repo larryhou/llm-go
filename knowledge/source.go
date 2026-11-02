@@ -90,14 +90,14 @@ type Source interface {
 //
 // Ordering rationale:
 //
-//	SOP (1) — team-wide authoritative playbooks; checked first.
-//	Memory (5) — personal notes; checked after SOP.
-//	History (8) — session compaction summaries; lowest priority because the
-//	              raw conversation is already in the model's context window.
-//	Remote (10) — default for externally-registered MCP sources.
+//	SOP (1)       — team-wide authoritative playbooks; checked first.
+//	Knowledge (4) — externally-registered MCP knowledge sources.
+//	Memory (5)    — personal notes; checked after Knowledge.
+//	History (8)   — session compaction summaries; lowest priority because the
+//	                raw conversation is already in the model's context window.
 const (
-	PrioritySOP     = 1
-	PriorityMemory  = 5
-	PriorityHistory = 8
-	PriorityRemote  = 10
+	PrioritySOP       = 1
+	PriorityKnowledge = 4
+	PriorityMemory    = 5
+	PriorityHistory   = 8
 )
