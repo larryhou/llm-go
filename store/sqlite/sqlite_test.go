@@ -750,7 +750,7 @@ func TestFindSeqByDocID_sessionIsolation(t *testing.T) {
 func newHistSrc(t *testing.T, st *sqlite.Store, sessID string, maxL1, maxL0 int) *store.SessionHistorySource {
 	t.Helper()
 	ps := sqlite.NewHistorySource(st, sessID, 0)
-	src, err := store.NewSessionHistorySource(sessID, maxL1, maxL0, ps)
+	src, err := store.NewSessionHistorySource(sessID, maxL1, maxL0, 0, ps)
 	if err != nil {
 		t.Fatalf("NewSessionHistorySource: %v", err)
 	}
@@ -847,7 +847,7 @@ func TestSessionHistorySource_l0Eviction(t *testing.T) {
 	sessID := "sess-evict"
 
 	// maxL1=2, maxL0=3
-	src, err := store.NewSessionHistorySource(sessID, 2, 3, sqlite.NewHistorySource(s, sessID, 0))
+	src, err := store.NewSessionHistorySource(sessID, 2, 3, 0, sqlite.NewHistorySource(s, sessID, 0))
 	if err != nil {
 		t.Fatal(err)
 	}

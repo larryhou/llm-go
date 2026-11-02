@@ -84,3 +84,20 @@ type Source interface {
 	// the LLM tool result.
 	Fetch(ctx context.Context, q Query) ([]Result, error)
 }
+
+// Well-known priority levels for built-in knowledge sources.
+// Lower value = higher priority. Sources sharing the same value run concurrently.
+//
+// Ordering rationale:
+//
+//	SOP (1) — team-wide authoritative playbooks; checked first.
+//	Memory (5) — personal notes; checked after SOP.
+//	History (8) — session compaction summaries; lowest priority because the
+//	              raw conversation is already in the model's context window.
+//	Remote (10) — default for externally-registered MCP sources.
+const (
+	PrioritySOP     = 1
+	PriorityMemory  = 5
+	PriorityHistory = 8
+	PriorityRemote  = 10
+)

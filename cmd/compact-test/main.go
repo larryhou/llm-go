@@ -252,7 +252,7 @@ func main() {
 		usable)
 
 	// ── compact hook ──────────────────────────────────────────────────────────
-	historySrc, err := store.NewSessionHistorySource(sessID, 0, 0, nil)
+	historySrc, err := store.NewSessionHistorySource(sessID, 0, 0, 0, nil)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "history source: %v\n", err)
 		os.Exit(1)

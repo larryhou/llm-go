@@ -120,6 +120,9 @@ type SessionHistorySource struct {
 	// L2 persistent backend; nil = pure-memory mode.
 	persistStore PersistStore
 
+	// priority is returned by Priority(). Default is DefaultHistoryPriority.
+	priority int
+
 	mu sync.Mutex
 }
 
@@ -127,8 +130,9 @@ type SessionHistorySource struct {
 //
 // maxCompactions: L1 (Bleve) cap; 0 → DefaultMaxCompactions.
 // maxIndexedSeqs: L0 (compactionDocs) cap; 0 → DefaultMaxIndexedSeqs.
+// priority: value returned by Priority(); 0 → DefaultHistoryPriority.
 // ps: persistent backend; nil → pure-memory (history lost on restart).
-func NewSessionHistorySource(sessionID string, maxCompactions, maxIndexedSeqs int, ps PersistStore) (*SessionHistorySource, error) {
+func NewSessionHistorySource(sessionID string, maxCompactions, maxIndexedSeqs, priority int, ps PersistStore) (*SessionHistorySource, error) {
 	if maxCompactions <= 0 {
 		maxCompactions = DefaultMaxCompactions
 	}
@@ -137,6 +141,9 @@ func NewSessionHistorySource(sessionID string, maxCompactions, maxIndexedSeqs in
 	}
 	if maxIndexedSeqs < maxCompactions {
 		maxIndexedSeqs = maxCompactions
+	}
+	if priority <= 0 {
+		priority = knowledge.PriorityHistory
 	}
 
 	m, err := buildIndexMapping()
@@ -157,6 +164,7 @@ func NewSessionHistorySource(sessionID string, maxCompactions, maxIndexedSeqs in
 		docIndex:       make(map[string]int),
 		loadedSeqs:     make(map[int]struct{}),
 		persistStore:   ps,
+		priority:       priority,
 	}
 
 	// Restore L0 from SQLite: load only the most recent maxIndexedSeqs seqs.
@@ -188,8 +196,8 @@ func NewSessionHistorySource(sessionID string, maxCompactions, maxIndexedSeqs in
 // ID implements knowledge.Source.
 func (s *SessionHistorySource) ID() string { return sessionHistorySourceID }
 
-// Priority implements knowledge.Source. Returns 8.
-func (s *SessionHistorySource) Priority() int { return 8 }
+// Priority implements knowledge.Source.
+func (s *SessionHistorySource) Priority() int { return s.priority }
 
 // Accepts implements knowledge.Source.
 func (s *SessionHistorySource) Accepts(q knowledge.Query) bool {

@@ -450,7 +450,7 @@ func (s *server) handleChat(w http.ResponseWriter, r *http.Request) {
 			ps = p
 		}
 
-		historySrc, histErr := store.NewSessionHistorySource(sessID, store.DefaultMaxCompactions, store.DefaultMaxIndexedSeqs, ps)
+		historySrc, histErr := store.NewSessionHistorySource(sessID, store.DefaultMaxCompactions, store.DefaultMaxIndexedSeqs, 0, ps)
 		if histErr != nil {
 			s.mu.Unlock()
 			sendEvent(map[string]any{"type": "error", "error": "create history source: " + histErr.Error()})

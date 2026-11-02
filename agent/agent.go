@@ -216,6 +216,7 @@ func New(cfg Config) (*Client, error) {
 		sessionID,
 		store.DefaultMaxCompactions,
 		store.DefaultMaxIndexedSeqs,
+		0,
 		ps,
 	)
 	if err != nil {
