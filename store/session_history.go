@@ -188,8 +188,8 @@ func NewSessionHistorySource(sessionID string, maxCompactions, maxIndexedSeqs in
 // ID implements knowledge.Source.
 func (s *SessionHistorySource) ID() string { return sessionHistorySourceID }
 
-// Priority implements knowledge.Source. Returns 0 (highest priority).
-func (s *SessionHistorySource) Priority() int { return 0 }
+// Priority implements knowledge.Source. Returns 8.
+func (s *SessionHistorySource) Priority() int { return 8 }
 
 // Accepts implements knowledge.Source.
 func (s *SessionHistorySource) Accepts(q knowledge.Query) bool {
