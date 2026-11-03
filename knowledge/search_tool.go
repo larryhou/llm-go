@@ -120,9 +120,7 @@ func (t *searchTool) Execute(ctx context.Context, input map[string]any) (tool.Re
 func sourceKind(sourceID string) (kind, caveat string) {
 	switch sourceID {
 	case "session-history":
-		return "session history", "This result comes from previous conversation turns in this session. " +
-			"It reflects what was discussed or attempted before, not independently verified knowledge. " +
-			"Treat it as context, not as confirmed fact or best practice."
+		return "session history", "prior conversation — unverified, use as context only"
 	case "sop":
 		return "SOP", ""
 	default:
