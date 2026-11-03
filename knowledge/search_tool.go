@@ -37,6 +37,18 @@ func (t *searchTool) InputSchema() map[string]any {
 				"minimum":     1,
 				"maximum":     20,
 			},
+			"cut_score": map[string]any{
+				"type":        "number",
+				"description": fmt.Sprintf("Minimum relevance score threshold (0–1). Results below this score are discarded. Default: %.2f. Pass a negative value to disable filtering.", DefaultCutScore),
+				"minimum":     -1,
+				"maximum":     1,
+			},
+			"hit_score": map[string]any{
+				"type":        "number",
+				"description": fmt.Sprintf("'Good enough' score threshold (0–1). When at least one result reaches this score and max_results is satisfied, lower-priority sources are skipped. Default: %.2f. Pass a negative value to disable early stopping.", DefaultHitScore),
+				"minimum":     -1,
+				"maximum":     1,
+			},
 			"filters": map[string]any{
 				"type":                 "object",
 				"description":          "Optional key-value filters passed to the source (field names depend on the backend).",
@@ -62,6 +74,18 @@ func (t *searchTool) Execute(ctx context.Context, input map[string]any) (tool.Re
 		}
 	}
 
+	// cut_score: 0 → default; negative → disable
+	cutScore := 0.0
+	if v, ok := input["cut_score"].(float64); ok {
+		cutScore = v
+	}
+
+	// hit_score: 0 → default; negative → disable
+	hitScore := 0.0
+	if v, ok := input["hit_score"].(float64); ok {
+		hitScore = v
+	}
+
 	var filters map[string]any
 	if f, ok := input["filters"].(map[string]any); ok {
 		filters = f
@@ -72,6 +96,8 @@ func (t *searchTool) Execute(ctx context.Context, input map[string]any) (tool.Re
 		Input:      queryStr,
 		Filters:    filters,
 		MaxResults: maxResults,
+		CutScore:   cutScore,
+		HitScore:   hitScore,
 	}
 
 	results, err := t.mgr.peek(ctx, q)

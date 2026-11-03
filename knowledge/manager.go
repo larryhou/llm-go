@@ -109,6 +109,16 @@ func (m *Manager) peek(ctx context.Context, q Query) ([]Result, error) {
 	sources := append([]Source(nil), m.sources...)
 	m.mu.RUnlock()
 
+	// Resolve effective cut/hit thresholds (zero value → use defaults).
+	cutScore := q.CutScore
+	if cutScore == 0 {
+		cutScore = DefaultCutScore
+	}
+	hitScore := q.HitScore
+	if hitScore == 0 {
+		hitScore = DefaultHitScore
+	}
+
 	groups := groupByPriority(sources, q)
 	var accumulated []Result
 
@@ -117,16 +127,38 @@ func (m *Manager) peek(ctx context.Context, q Query) ([]Result, error) {
 		if err != nil && !m.cfg.AllowPartialFailure {
 			return nil, err
 		}
-		// Truncate snippets before accumulating
+
+		// Apply cut_score filter and truncate snippets.
 		for i := range results {
 			results[i].Snippet = truncateStr(results[i].Snippet, m.cfg.SnippetMaxChars)
 		}
+		if cutScore >= 0 {
+			filtered := results[:0]
+			for _, r := range results {
+				if r.Score < 0 || r.Score >= cutScore {
+					filtered = append(filtered, r)
+				}
+			}
+			results = filtered
+		}
+
 		accumulated = append(accumulated, results...)
+
+		// Stop descending when either condition is met:
+		//   1. Accumulated results have reached MaxResults (quantity satisfied).
+		//   2. At least one result has Score >= hitScore (quality satisfied early).
 		if m.cfg.MaxResults > 0 && len(accumulated) >= m.cfg.MaxResults {
 			break
 		}
+		if hitScore >= 0 {
+			for _, r := range accumulated {
+				if r.Score >= hitScore {
+					goto done
+				}
+			}
+		}
 	}
-
+done:
 	if m.cfg.MaxResults > 0 && len(accumulated) > m.cfg.MaxResults {
 		accumulated = accumulated[:m.cfg.MaxResults]
 	}
