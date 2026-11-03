@@ -17,10 +17,15 @@ type searchTool struct{ mgr *Manager }
 func (t *searchTool) Name() string { return "knowledge_search" }
 
 func (t *searchTool) Description() string {
-	return "检索知识库，涵盖个人记忆（memory）、个人待办（todo）、团队SOP经验（sop）以及压缩后的会话历史（history）等来源。" +
-		"返回摘要列表，每条结果包含 ref_id、来源（source）和内容摘要。" +
-		"需要完整内容时，用结果中的 ref_id 调用 knowledge_fetch。" +
-		"**必须主动调用的场景**：回答涉及用户个人背景的问题前；用户询问待办清单时；回答技术/工具/流程类问题前。"
+	return "Search the knowledge base. " +
+		"Sources include: personal memory (memory), personal todos (todo), team SOP / best practices (sop), " +
+		"project-specific knowledge bases (knowledge base), and compressed conversation history (session history). " +
+		"Returns a list of snippets; each result includes ref_id, source kind, score, and an excerpt. " +
+		"Use knowledge_fetch with the ref_id to retrieve the full content. " +
+		"WHEN TO CALL: (1) before answering any technical, tool, process, or domain-specific question — " +
+		"search first, answer after; (2) whenever you are uncertain or lack confidence — searching is cheap, " +
+		"guessing is costly; (3) when the user asks about their personal context, todos, or past discussions. " +
+		"Bias toward calling this tool. A search that returns nothing is still useful: it confirms the knowledge base has no relevant entry."
 }
 
 func (t *searchTool) InputSchema() map[string]any {

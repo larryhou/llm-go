@@ -16,9 +16,9 @@ type fetchTool struct{ mgr *Manager }
 func (t *fetchTool) Name() string { return "knowledge_fetch" }
 
 func (t *fetchTool) Description() string {
-	return "根据 knowledge_search 返回的 ref_id 获取知识条目的完整内容。" +
-		"ref_id 格式为 source_id:内部编号（如 sop:42、memory_larryhou:7）。" +
-		"当 knowledge_search 的摘要不足以回答问题时调用此工具。"
+	return "Retrieve the full content of a knowledge entry by its ref_id (returned by knowledge_search). " +
+		"ref_id format: source_id:internal-key (e.g. sop:42, memory_larryhou:7, j3turbo:argo#§2). " +
+		"Call this when the snippet from knowledge_search is not enough to answer the question fully."
 }
 
 func (t *fetchTool) InputSchema() map[string]any {
