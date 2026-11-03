@@ -115,6 +115,24 @@ func (t *searchTool) Execute(ctx context.Context, input map[string]any) (tool.Re
 	}, nil
 }
 
+// sourceKind classifies a source ID into a human-readable kind label and an
+// optional caveat that the LLM should be aware of.
+func sourceKind(sourceID string) (kind, caveat string) {
+	switch sourceID {
+	case "session-history":
+		return "session history", "This result comes from previous conversation turns in this session. " +
+			"It reflects what was discussed or attempted before, not independently verified knowledge. " +
+			"Treat it as context, not as confirmed fact or best practice."
+	case "sop":
+		return "SOP", ""
+	default:
+		if strings.HasPrefix(sourceID, "memory_") {
+			return "memory", ""
+		}
+		return "knowledge base", ""
+	}
+}
+
 // formatSearchResults renders results as a Markdown list for the LLM.
 // Each entry shows the title, ref_id (for follow-up fetch), source, score,
 // and snippet.  The format is intentionally compact to minimise context growth.
@@ -125,11 +143,15 @@ func formatSearchResults(results []Result) string {
 	var sb strings.Builder
 	fmt.Fprintf(&sb, "## Search Results (%d)\n\n", len(results))
 	for i, r := range results {
+		kind, caveat := sourceKind(r.Source)
 		fmt.Fprintf(&sb, "### %d. %s\n", i+1, r.Title)
 		fmt.Fprintf(&sb, "- **ref_id**: `%s`\n", r.RefID)
-		fmt.Fprintf(&sb, "- **source**: %s\n", r.Source)
+		fmt.Fprintf(&sb, "- **source**: %s (%s)\n", r.Source, kind)
 		if r.Score >= 0 {
 			fmt.Fprintf(&sb, "- **score**: %.2f\n", r.Score)
+		}
+		if caveat != "" {
+			fmt.Fprintf(&sb, "- **note**: %s\n", caveat)
 		}
 		if r.Snippet != "" {
 			fmt.Fprintf(&sb, "\n> %s\n", strings.ReplaceAll(r.Snippet, "\n", "\n> "))
