@@ -53,33 +53,19 @@ type Query struct {
 	// Only meaningful for Peek; Fetch always returns a single item.
 	MaxResults int
 
-	// CutScore is the minimum relevance score threshold for Peek results.
-	// Results with Score < CutScore are discarded after each priority group.
+	// Score is the minimum relevance score threshold for Peek results.
+	// Results with Score < Score are discarded after each priority group.
 	// The Manager also forwards this value to remote sources (e.g. via the
 	// ks_search "score" parameter) so they can apply the same filter server-side.
-	// 0 means "use the default" (DefaultCutScore = 0.75).
+	// 0 means "use the default" (DefaultCutScore = 0.5).
 	// Set to a negative value to disable filtering entirely.
-	CutScore float64
-
-	// HitScore is the "good enough" threshold.
-	// When at least one result with Score >= HitScore has been accumulated
-	// and the total count has reached MaxResults, the Manager stops descending
-	// into lower-priority groups.
-	// 0 means "use the default" (DefaultHitScore = 0.95).
-	// Set to a negative value to disable early stopping entirely.
-	HitScore float64
+	Score float64
 }
 
 const (
 	// DefaultCutScore is the default minimum score threshold applied when
-	// Query.CutScore is zero (unset). Results below this score are discarded.
+	// Query.Score is zero (unset). Results below this score are discarded.
 	DefaultCutScore = 0.5
-
-	// DefaultHitScore is the default "good enough" threshold applied when
-	// Query.HitScore is zero (unset). When accumulated results include at
-	// least one result at or above this score and MaxResults is reached,
-	// lower-priority groups are skipped.
-	DefaultHitScore = 0.95
 )
 
 // Result is a single knowledge item.  Peek and Fetch share this struct;
