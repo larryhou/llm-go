@@ -74,6 +74,8 @@ Measured with timi proxy + `claude-sonnet-4.6`, `Output=4096`:
 
 Use `context_limit=5500` for all `/chat` calls.
 
+> **Summary budget at this window:** the summary call's `max_tokens` is `summaryMaxTokens(5500)` = `5500 × 50%` = **2,750** (the 50% cap applies below 64K), no longer a fixed 8,192. If a run fails with `compaction: context overflow during summary generation`, the summary was likely truncated (`FinishReasonLength` → `ProcessCompact`) rather than the head being too large; raise `context_limit` or shorten the turns. Its input budget is still `max(5500, 200K)` = 200K, so the head is never rejected as overflow.
+
 ---
 
 ## Steps

@@ -132,7 +132,7 @@ flowchart TD
     NothingToSummarise -- Yes --> CompactFail["Compact() returns error\nRunLoop returns error"]
     NothingToSummarise -- No --> BuildHead["Build head messages\nStripMedia=true, StripToolResults=true\nStripSummaryPair=true\ntoolOutputMaxChars=2000"]
 
-    BuildHead --> SummaryLLM["LLM call (summaryModel)\ncontext=200000, output=8192\nSummaryTemplate prompt\n+ prev summary injected into system (if exists)"]
+    BuildHead --> SummaryLLM["LLM call (summaryModel)\nLimit=summaryModelLimit(main), MaxTokens=summaryMaxTokens(main)\nSummaryTemplate prompt\n+ prev summary injected into system (if exists)"]
     SummaryLLM --> SummaryMsg["store.Message\nsummary=true"]
 
     Select --> Tail["Tail messages (TailStartID != '')\n~25% of Usable\nmin 2000 / max 8000 tokens\n≥ 1 user turn always kept\nOR empty tail when all msgs summarised"]
@@ -204,6 +204,33 @@ MaxOutputTokens = 8192
 reserved        = min(20000, 8192) = 8192
 Usable          = 128000 - 8192   = 119,808  ← compact triggers here
 ```
+
+#### Summary call budget (`session/compaction.go`)
+
+The summary LLM call used by `Compact()` and `generateDelegateSummary()` does **not** use the main model's `Limit` or a fixed value. Two helpers derive it from the main model:
+
+```go
+func summaryMaxTokens(m llm.Model) int   // max output tokens → ProcessInput.MaxTokens
+func summaryModelLimit(m llm.Model) llm.ModelLimit // limit used by IsOverflow on the summary call
+```
+
+**Output (`summaryMaxTokens`)** = `min( max(Context × 10%, 32_000), Context × 50% )`; no cap when `Context == 0`.
+
+| Main Context | Summary max_tokens |
+|---|---|
+| 2K / 16K / 32K | 1K / 8K / 16K (50% cap) |
+| 40K | 20K (50% cap) |
+| 64K – 320K | 32K (floor) |
+| 1M | 100K (10%) |
+
+- Sent via `ProcessInput.MaxTokens` → `llm.GenerationOptions.MaxTokens`, which both providers prefer over `llm.MaxOutputTokens`. This is why values above the 32K `MaxOutputTokens` cap take effect.
+- `ProcessInput.MaxTokens == 0` (all non-summary calls) keeps the old behaviour.
+
+**Input (`summaryModelLimit`)**: `Context = max(main Context, 200_000) + 32_000`, `Output = 32_000`, so `Usable()` on the summary call equals `max(main Context, 200K)`. It tracks the main window so a large configured window never makes the head look like overflow; the 200K floor keeps tiny test windows (2000, 5500, 10000) from rejecting the head.
+
+Gotchas:
+- A summary cut off by `max_tokens` finishes with `FinishReasonLength`; `processorState.handleEvent` turns that into `ProcessCompact`, and `Compact()` then fails with `context overflow during summary generation`. With small windows (50% cap) this is reachable — keep `context_limit` large enough in tests that need a real summary.
+- `max_tokens` is not reduced by the head's actual size. Providers that reject `prompt + max_tokens > window` (e.g. Anthropic) can fail when the head is near the window.
 
 #### Pre-send token estimation (`llm.EstimateRequestTokens`, `llm.IsRequestOverflow`)
 
@@ -1123,7 +1150,9 @@ When the sub-session `RunLoop` completes:
    from `delegate_summary.txt`.
 
 4. The summary LLM responds as an observer, not as a conversation participant.
-   `Context:200_000, Output:8_192`.
+   Limit and max output are derived from the main model by the same helpers as
+   `Compact()` (`summaryModelLimit` / `summaryMaxTokens`, see
+   "Summary call budget" under Context Compaction), not a fixed 200K/8K.
 
 5. **Fixed output structure** (`delegate_summary.txt`):
    ```markdown
@@ -1324,6 +1353,10 @@ These are all aligned with opencode's `overflow.ts` and `compaction.ts`:
 | `config.DefaultCompactionMinKeepRatio` | 0.1 | tail must be ≥ 10% of total session tokens after compaction |
 | `session.DoomLoopThreshold` | 3 | identical tool+args calls before doom-loop |
 | `session.DefaultTailTurns` | 2 | user turns to keep in tail |
+| `session.CompactionSummaryMaxOutput` | 32,000 tokens | floor of summary max output; also the `Output` in `summaryModelLimit` |
+| `compactionSummaryOutputRatio` | 0.10 | summary max output as fraction of main Context (when above the floor) |
+| `compactionSummaryMaxWindowRatio` | 0.50 | cap on summary max output as fraction of main Context |
+| `compactionSummaryMinContext` | 200,000 tokens | floor of the summary call's input budget |
 | `tool.DefaultMaxLines` | 2,000 lines | tool output line limit |
 | `tool.DefaultMaxBytes` | 51,200 bytes | tool output byte limit |
 

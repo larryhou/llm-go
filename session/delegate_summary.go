@@ -87,7 +87,7 @@ func generateDelegateSummary(
 	prompt := strings.ReplaceAll(promptTemplate, "{goal}", goal)
 
 	summaryModel := model
-	summaryModel.Limit = llm.ModelLimit{Context: 200_000, Output: 8_192}
+	summaryModel.Limit = summaryModelLimit(model)
 
 	now := time.Now()
 	summaryMsgID := newID()
@@ -111,6 +111,7 @@ func generateDelegateSummary(
 		Messages:  []llm.Message{llm.NewUserMessage(prompt)},
 		Tools:     nil,
 		Provider:  summaryProvider,
+		MaxTokens: summaryMaxTokens(model),
 	})
 	if err != nil {
 		return "", fmt.Errorf("delegate summary: LLM call failed: %w", err)

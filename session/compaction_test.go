@@ -272,3 +272,49 @@ func TestSelect_splitTurnRecentHead_correctTurns(t *testing.T) {
 		t.Errorf("RecentHead last ID = %q, want %q", sel.RecentHead[len(sel.RecentHead)-1].ID, "u3")
 	}
 }
+
+func TestSummaryModelLimit_AdaptsToMainContext(t *testing.T) {
+	cases := []struct {
+		name    string
+		context int
+		wantIn  int // expected usable input budget
+	}{
+		{"tiny test model floors at min", 2_000, 200_000},
+		{"default 128k floors at min", 128_000, 200_000},
+		{"large 1M follows main", 1_000_000, 1_000_000},
+	}
+	for _, c := range cases {
+		m := llm.Model{Limit: llm.ModelLimit{Context: c.context, Output: 4_096}}
+		m.Limit = summaryModelLimit(m)
+		if m.Limit.Output != CompactionSummaryMaxOutput {
+			t.Errorf("%s: output=%d, want %d", c.name, m.Limit.Output, CompactionSummaryMaxOutput)
+		}
+		if got := llm.Usable(m, nil); got != c.wantIn {
+			t.Errorf("%s: usable=%d, want %d", c.name, got, c.wantIn)
+		}
+	}
+}
+
+func TestSummaryMaxTokens_Dynamic(t *testing.T) {
+	cases := []struct {
+		context int
+		want    int
+	}{
+		{0, 32_000}, // unknown window: no cap
+		{2_000, 1_000},
+		{16_000, 8_000},
+		{31_999, 15_999},
+		{32_000, 16_000},
+		{40_000, 20_000},
+		{64_000, 32_000},
+		{128_000, 32_000},
+		{320_000, 32_000},
+		{1_000_000, 100_000},
+	}
+	for _, c := range cases {
+		m := llm.Model{Limit: llm.ModelLimit{Context: c.context}}
+		if got := summaryMaxTokens(m); got != c.want {
+			t.Errorf("context=%d: summaryMaxTokens=%d, want %d", c.context, got, c.want)
+		}
+	}
+}

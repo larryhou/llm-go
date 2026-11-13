@@ -56,6 +56,10 @@ type ProcessInput struct {
 	// DoomLoop controls doom-loop detection for this processing turn.
 	// Forwarded from RunInput.DoomLoop. nil and true both enable detection.
 	DoomLoop *bool
+
+	// MaxTokens, when > 0, overrides the request's max output tokens
+	// (llm.GenerationOptions.MaxTokens), bypassing the llm.MaxOutputTokens cap.
+	MaxTokens int
 }
 
 // Processor handles one LLM streaming turn, managing the lifecycle of
@@ -91,7 +95,7 @@ func (p *Processor) Process(ctx context.Context, assistantMsgID string, input Pr
 		Model:    input.Model,
 		System:   input.System,
 		Messages: input.Messages,
-		Options:  llm.GenerationOptions{},
+		Options:  llm.GenerationOptions{MaxTokens: input.MaxTokens},
 	}
 
 	// Add tool definitions to request

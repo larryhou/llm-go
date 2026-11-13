@@ -63,7 +63,54 @@ When combining:
 // PruneMinimum and PruneProtect are defined in llm package; use llm.PruneMinimum / llm.PruneProtect.
 const (
 	DefaultTailTurns = 2
+
+	// CompactionSummaryMaxOutput is the floor for the summary LLM call's max
+	// output tokens. The actual value scales with the main context window,
+	// see summaryMaxTokens.
+	CompactionSummaryMaxOutput = 32_000
+
+	// compactionSummaryOutputRatio is the fraction of the main context window
+	// used as summary max output when that exceeds CompactionSummaryMaxOutput.
+	compactionSummaryOutputRatio = 0.10
+
+	// compactionSummaryMaxWindowRatio caps the summary max output at this
+	// fraction of the main context window.
+	compactionSummaryMaxWindowRatio = 0.50
+
+	// compactionSummaryMinContext is the floor for the summary call's input
+	// budget, so models with a tiny/artificial limit never reject the head.
+	compactionSummaryMinContext = 200_000
 )
+
+// summaryMaxTokens returns the max output tokens for the summary LLM call:
+// max(10% of the main context window, CompactionSummaryMaxOutput), capped at
+// 50% of the main context window. For windows below CompactionSummaryMaxOutput
+// that means exactly 50%; the cap keeps the summary from filling the window
+// (which providers reject, and which would re-trigger compaction at once).
+// A larger window holds more history, which needs a larger summary to stay faithful.
+// It is passed via ProcessInput.MaxTokens, bypassing the llm.MaxOutputTokens cap.
+func summaryMaxTokens(m llm.Model) int {
+	v := max(int(float64(m.Limit.Context)*compactionSummaryOutputRatio), CompactionSummaryMaxOutput)
+	if m.Limit.Context > 0 {
+		v = min(v, int(float64(m.Limit.Context)*compactionSummaryMaxWindowRatio))
+	}
+	return v
+}
+
+// summaryModelLimit derives the limit used for the summary LLM call from the
+// main model. The head being summarised came out of the main model's window,
+// so the input budget must be at least that large; otherwise IsOverflow would
+// reject the summary request when the context is configured large.
+// Context includes the output reserve so that Usable() == input budget.
+// Output stays at CompactionSummaryMaxOutput (the cap llm.MaxOutputTokens
+// applies in Usable) so the input budget is independent of summaryMaxTokens.
+func summaryModelLimit(m llm.Model) llm.ModelLimit {
+	inputBudget := max(m.Limit.Context, compactionSummaryMinContext)
+	return llm.ModelLimit{
+		Context: inputBudget + CompactionSummaryMaxOutput,
+		Output:  CompactionSummaryMaxOutput,
+	}
+}
 
 // CompactionSystemPrompt is the system prompt for the summary LLM call.
 // Aligned with packages/opencode/src/agent/prompt/compaction.txt.
@@ -476,10 +523,10 @@ func (c *Compactor) Compact(ctx context.Context, sessionID string, input Process
 	if input.SummaryProvider != nil {
 		summaryProvider = input.SummaryProvider
 	}
-	// Use a large context limit for the summary model so the head is never
-	// rejected as overflow (the test model has an artificially small limit).
+	// Size the summary model's limit from the main model so the head is never
+	// rejected as overflow, regardless of the configured context size.
 	summaryModel := input.Model
-	summaryModel.Limit = llm.ModelLimit{Context: 200_000, Output: 8_192}
+	summaryModel.Limit = summaryModelLimit(input.Model)
 
 	summaryInput := ProcessInput{
 		SessionID: sessionID,
@@ -489,6 +536,7 @@ func (c *Compactor) Compact(ctx context.Context, sessionID string, input Process
 		Tools:     nil,
 		Provider:  summaryProvider,
 		Config:    input.Config,
+		MaxTokens: summaryMaxTokens(input.Model),
 	}
 
 	result, err := c.processor.Process(ctx, summaryMsgID, summaryInput)
